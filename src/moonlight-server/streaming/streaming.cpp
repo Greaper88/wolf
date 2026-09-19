@@ -370,12 +370,55 @@ static void configure_appsink(GstElement *appsink, UDPSink *udp_sink) {
 /**
  * Start VIDEO pipeline
  */
-void start_streaming_video(immer::box<events::VideoSession> video_session,
-                           const std::shared_ptr<events::EventBusType> &event_bus,
-                           std::string client_ip,
-                           unsigned short client_port,
-                           std::shared_ptr<immer::atom<gst_video_context::gst_context_ptr>> video_context,
-                           std::shared_ptr<udp::socket> video_socket) {
+// Encoder epochs keep a retiring stream from changing the accounting of its resumed stream.
+struct EncoderActivity {
+  std::shared_ptr<wolf::gpu::Admission::Reservation> reservation;
+  std::uint64_t epoch;
+  bool handoff = false;
+  std::optional<std::chrono::steady_clock::time_point> first_buffer;
+  explicit EncoderActivity(std::shared_ptr<wolf::gpu::Admission::Reservation> r)
+      : reservation(std::move(r)), epoch(reservation->begin_encoder()) {}
+  ~EncoderActivity() {
+    reservation->end_encoder(epoch, handoff);
+  }
+};
+static GstPadProbeReturn encoder_buffer(GstPad *, GstPadProbeInfo *, gpointer data) {
+  auto activity = static_cast<std::shared_ptr<EncoderActivity> *>(data)->get();
+  auto now = std::chrono::steady_clock::now();
+  if (!activity->first_buffer)
+    activity->first_buffer = now;
+  // Account as pending until encoded output has been flowing for a telemetry settling interval.
+  if (now - *activity->first_buffer >= std::chrono::seconds(1))
+    activity->reservation->encoder_active(activity->epoch);
+  return GST_PAD_PROBE_OK;
+}
+
+static void stream_video_once(immer::box<events::VideoSession> video_session,
+                              const std::shared_ptr<events::EventBusType> &event_bus,
+                              std::string client_ip,
+                              unsigned short client_port,
+                              std::shared_ptr<immer::atom<gst_video_context::gst_context_ptr>> video_context,
+                              std::shared_ptr<udp::socket> video_socket,
+                              std::array<uint32_t, 2> &sequence,
+                              const std::string &producer,
+                              const std::function<bool()> &interrupted) {
+  auto launch = video_session->gpu_launch.get();
+  if (launch && !launch->reservation->valid())
+    return;
+  auto activity = launch ? std::make_shared<EncoderActivity>(launch->reservation) : nullptr;
+  if (activity && !activity->epoch)
+    return; // A retained app must pass resume admission; duplicate streams cannot steal its encoder.
+  auto expected_end = std::make_shared<std::atomic_bool>(false);
+  auto pause_watch = event_bus->register_handler<immer::box<events::PauseStreamEvent>>(
+      [expected_end, id = video_session->session_id](const immer::box<events::PauseStreamEvent> &ev) {
+        if (ev->session_id == id)
+          expected_end->store(true);
+      });
+  auto stop_watch = event_bus->register_handler<immer::box<events::StopStreamEvent>>(
+      [expected_end, id = video_session->session_id](const immer::box<events::StopStreamEvent> &ev) {
+        if (ev->session_id == id)
+          expected_end->store(true);
+      });
   auto [color_range, color_space] = get_color_params(video_session);
 
   auto pipeline = fmt::format(
@@ -395,6 +438,11 @@ void start_streaming_video(immer::box<events::VideoSession> video_session,
       fmt::arg("color_space", color_space),
       fmt::arg("color_range", color_range),
       fmt::arg("host_port", video_session->port));
+  if (!producer.empty()) {
+    auto source = "listen-to=" + std::to_string(video_session->session_id) + "_video";
+    if (auto pos = pipeline.find(source); pos != std::string::npos)
+      pipeline.replace(pos, source.size(), "listen-to=" + producer + "_video");
+  }
   logs::log(logs::debug, "Starting video pipeline: \n{}", pipeline);
 
   bool enable_pacing = utils::get_env("WOLF_ENABLE_VIDEO_PACING", "TRUE") == std::string("TRUE");
@@ -409,90 +457,198 @@ void start_streaming_video(immer::box<events::VideoSession> video_session,
       }});
   std::shared_ptr<NeedContextData> ctx_data_ptr = std::make_shared<NeedContextData>(
       NeedContextData{.device_path = video_session->render_node, .gst_context = video_context});
-  run_pipeline(pipeline, [video_session, event_bus, udp_sink, ctx_data_ptr](auto pipeline) {
-    if (auto app_sink_el = gst_bin_get_by_name(GST_BIN(pipeline.get()), "wolf_udp_sink")) {
-      logs::log(logs::debug, "Setting up wolf_udp_sink");
-      g_assert(GST_IS_APP_SINK(app_sink_el));
-      configure_appsink(app_sink_el, udp_sink.get());
-      gst_object_unref(app_sink_el);
+  run_pipeline(
+      pipeline,
+      [video_session, event_bus, udp_sink, ctx_data_ptr, activity, &sequence](auto pipeline) {
+        if (activity) {
+          auto pay = gst_bin_get_by_name(GST_BIN(pipeline.get()), "moonlight_pay");
+          if (!pay)
+            throw std::runtime_error("Verified session pipeline is missing moonlight_pay");
+          auto packetizer = gst_rtp_moonlight_pay_video(pay);
+          packetizer->cur_seq_number = sequence[0];
+          packetizer->frame_num = sequence[1];
+          auto pad = gst_element_get_static_pad(pay, "sink");
+          gst_object_unref(pay);
+          if (!pad)
+            throw std::runtime_error("Verified session pipeline has no encoded input pad");
+          gst_pad_add_probe(pad,
+                            GST_PAD_PROBE_TYPE_BUFFER,
+                            encoder_buffer,
+                            new std::shared_ptr<EncoderActivity>(activity),
+                            [](gpointer p) { delete static_cast<std::shared_ptr<EncoderActivity> *>(p); });
+          gst_object_unref(pad);
+        }
+        if (auto app_sink_el = gst_bin_get_by_name(GST_BIN(pipeline.get()), "wolf_udp_sink")) {
+          logs::log(logs::debug, "Setting up wolf_udp_sink");
+          g_assert(GST_IS_APP_SINK(app_sink_el));
+          configure_appsink(app_sink_el, udp_sink.get());
+          gst_object_unref(app_sink_el);
+        }
+
+        auto bus = gst_pipeline_get_bus(GST_PIPELINE(pipeline.get()));
+        gst_bus_set_sync_handler(bus, bus_sync_handler, ctx_data_ptr.get(), nullptr);
+        gst_object_unref(bus);
+
+        /*
+         * The force IDR event will be triggered by the control stream.
+         * We have to pass this back into the gstreamer pipeline
+         * in order to force the encoder to produce a new IDR packet
+         */
+        auto idr_handler = event_bus->register_handler<immer::box<events::IDRRequestEvent>>(
+            [sess_id = video_session->session_id, pipeline](const immer::box<events::IDRRequestEvent> &ctrl_ev) {
+              if (ctrl_ev->session_id == sess_id) {
+                logs::log(logs::debug, "[GSTREAMER] Forcing IDR");
+                // Force IDR event, see: https://github.com/centricular/gstwebrtc-demos/issues/186
+                // https://gstreamer.freedesktop.org/documentation/additional/design/keyframe-force.html?gi-language=c
+                wolf::core::gstreamer::send_message(
+                    pipeline.get(),
+                    gst_structure_new("GstForceKeyUnit", "all-headers", G_TYPE_BOOLEAN, TRUE, NULL));
+              }
+            });
+
+        auto pause_handler = event_bus->register_handler<immer::box<events::PauseStreamEvent>>(
+            [sess_id = video_session->session_id, pipeline](const immer::box<events::PauseStreamEvent> &ev) {
+              if (ev->session_id == sess_id) {
+                logs::log(logs::debug, "[GSTREAMER] Pausing pipeline: {}", sess_id);
+
+                /**
+                 * Unfortunately here we can't just pause the pipeline,
+                 * when a pipeline will be resumed there are a lot of breaking changes
+                 * like:
+                 *  - Client IP:PORT
+                 *  - AES key and IV for encrypted payloads
+                 *  - Client resolution, framerate, and encoding
+                 *
+                 *  The only solution is to kill the pipeline and re-create it again
+                 * when a resume happens
+                 */
+
+                gst_element_send_event(pipeline.get(), gst_event_new_eos());
+              }
+            });
+
+        auto switch_producer_handler = event_bus->register_handler<immer::box<events::SwitchStreamProducerEvents>>(
+            [sess_id = video_session->session_id, automatic = video_session->gpu_route.get() != nullptr, pipeline](
+                const immer::box<events::SwitchStreamProducerEvents> &switch_ev) {
+              if (switch_ev->session_id == sess_id) {
+                if (automatic)
+                  return; // The route interrupt rebuilds only this viewer's encoder.
+                logs::log(logs::debug,
+                          "[GSTREAMER] Switching video producer pipeline for {} to {}",
+                          sess_id,
+                          switch_ev->interpipe_src_id);
+                /* Grab a reference to the interpipesrc */
+                auto pipe_name = fmt::format("interpipesrc_{}_video", sess_id);
+                if (auto src = gst_bin_get_by_name(GST_BIN(pipeline.get()), pipe_name.c_str())) {
+                  /* Perform the switch */
+                  auto video_interpipe = fmt::format("{}_video", switch_ev->interpipe_src_id);
+                  g_object_set(src, "listen-to", video_interpipe.c_str(), nullptr);
+                  gst_object_unref(src);
+                } else {
+                  logs::log(logs::error, "[GSTREAMER] Failed to get video interpipesrc for {}", sess_id);
+                }
+              }
+            });
+
+        auto stop_handler = event_bus->register_handler<immer::box<events::StopStreamEvent>>(
+            [sess_id = video_session->session_id, pipeline](const immer::box<events::StopStreamEvent> &ev) {
+              if (ev->session_id == sess_id) {
+                logs::log(logs::debug, "[GSTREAMER] Stopping pipeline: {}", sess_id);
+                gst_element_send_event(pipeline.get(), gst_event_new_eos());
+              }
+            });
+
+        return immer::array<immer::box<events::EventBusHandlers>>{std::move(idr_handler),
+                                                                  std::move(pause_handler),
+                                                                  std::move(switch_producer_handler),
+                                                                  std::move(stop_handler)};
+      },
+      launch != nullptr,
+      [&](auto pipeline) {
+        if (auto pay = gst_bin_get_by_name(GST_BIN(pipeline.get()), "moonlight_pay")) {
+          auto packetizer = gst_rtp_moonlight_pay_video(pay);
+          sequence = {packetizer->cur_seq_number, packetizer->frame_num};
+          gst_object_unref(pay);
+        }
+      },
+      interrupted);
+  // Replacing an existing encoder is not admission of another stream. Keep its slot
+  // while switching producers on this exact reservation, even if the app now loads the GPU.
+  // A disconnect, failed stream, or move to another GPU still releases encoder demand.
+  if (activity && !expected_end->load() && interrupted()) {
+    auto route = video_session->gpu_route.get();
+    activity->handoff = route && route->target.load()->launch->reservation == launch->reservation;
+  }
+  pause_watch.unregister();
+  stop_watch.unregister();
+  if (launch && launch->reservation->valid() && !expected_end->load() && !interrupted()) {
+    launch->reservation->fail("GPU encoder could not start or continue; it may be too busy. Wait and retry, "
+                              "or force-close the app and restart it (unsaved data may be lost).");
+    event_bus->fire_event(
+        immer::box<events::PauseStreamEvent>(events::PauseStreamEvent{.session_id = video_session->session_id}));
+  }
+}
+
+void start_streaming_video(immer::box<events::VideoSession> initial,
+                           const std::shared_ptr<events::EventBusType> &event_bus,
+                           std::string client_ip,
+                           unsigned short client_port,
+                           std::shared_ptr<immer::atom<gst_video_context::gst_context_ptr>> context,
+                           std::shared_ptr<udp::socket> socket) {
+  std::array<uint32_t, 2> sequence{};
+  auto route = initial->gpu_route.get();
+  if (!route) {
+    stream_video_once(initial, event_bus, client_ip, client_port, context, socket, sequence, "", [] { return false; });
+    return;
+  }
+  if (route->streaming.exchange(true))
+    return; // Ignore duplicate starts while the existing viewer encoder is running or retiring.
+  auto stopped = std::make_shared<std::atomic_bool>(false);
+  auto pause = event_bus->register_handler<immer::box<events::PauseStreamEvent>>(
+      [stopped, id = initial->session_id](const immer::box<events::PauseStreamEvent> &ev) {
+        if (ev->session_id == id)
+          stopped->store(true);
+      });
+  auto stop = event_bus->register_handler<immer::box<events::StopStreamEvent>>(
+      [stopped, id = initial->session_id](const immer::box<events::StopStreamEvent> &ev) {
+        if (ev->session_id == id)
+          stopped->store(true);
+      });
+  struct RouteActivity {
+    std::shared_ptr<events::GpuStreamRoute> route;
+    ~RouteActivity() {
+      route->streaming.store(false);
+      route->target.load()->launch->reservation->pause();
     }
-
-    auto bus = gst_pipeline_get_bus(GST_PIPELINE(pipeline.get()));
-    gst_bus_set_sync_handler(bus, bus_sync_handler, ctx_data_ptr.get(), nullptr);
-    gst_object_unref(bus);
-
-    /*
-     * The force IDR event will be triggered by the control stream.
-     * We have to pass this back into the gstreamer pipeline
-     * in order to force the encoder to produce a new IDR packet
-     */
-    auto idr_handler = event_bus->register_handler<immer::box<events::IDRRequestEvent>>(
-        [sess_id = video_session->session_id, pipeline](const immer::box<events::IDRRequestEvent> &ctrl_ev) {
-          if (ctrl_ev->session_id == sess_id) {
-            logs::log(logs::debug, "[GSTREAMER] Forcing IDR");
-            // Force IDR event, see: https://github.com/centricular/gstwebrtc-demos/issues/186
-            // https://gstreamer.freedesktop.org/documentation/additional/design/keyframe-force.html?gi-language=c
-            wolf::core::gstreamer::send_message(
-                pipeline.get(),
-                gst_structure_new("GstForceKeyUnit", "all-headers", G_TYPE_BOOLEAN, TRUE, NULL));
-          }
-        });
-
-    auto pause_handler = event_bus->register_handler<immer::box<events::PauseStreamEvent>>(
-        [sess_id = video_session->session_id, pipeline](const immer::box<events::PauseStreamEvent> &ev) {
-          if (ev->session_id == sess_id) {
-            logs::log(logs::debug, "[GSTREAMER] Pausing pipeline: {}", sess_id);
-
-            /**
-             * Unfortunately here we can't just pause the pipeline,
-             * when a pipeline will be resumed there are a lot of breaking changes
-             * like:
-             *  - Client IP:PORT
-             *  - AES key and IV for encrypted payloads
-             *  - Client resolution, framerate, and encoding
-             *
-             *  The only solution is to kill the pipeline and re-create it again
-             * when a resume happens
-             */
-
-            gst_element_send_event(pipeline.get(), gst_event_new_eos());
-          }
-        });
-
-    auto switch_producer_handler = event_bus->register_handler<immer::box<events::SwitchStreamProducerEvents>>(
-        [sess_id = video_session->session_id,
-         pipeline](const immer::box<events::SwitchStreamProducerEvents> &switch_ev) {
-          if (switch_ev->session_id == sess_id) {
-            logs::log(logs::debug,
-                      "[GSTREAMER] Switching video producer pipeline for {} to {}",
-                      sess_id,
-                      switch_ev->interpipe_src_id);
-            /* Grab a reference to the interpipesrc */
-            auto pipe_name = fmt::format("interpipesrc_{}_video", sess_id);
-            if (auto src = gst_bin_get_by_name(GST_BIN(pipeline.get()), pipe_name.c_str())) {
-              /* Perform the switch */
-              auto video_interpipe = fmt::format("{}_video", switch_ev->interpipe_src_id);
-              g_object_set(src, "listen-to", video_interpipe.c_str(), nullptr);
-              gst_object_unref(src);
-            } else {
-              logs::log(logs::error, "[GSTREAMER] Failed to get video interpipesrc for {}", sess_id);
-            }
-          }
-        });
-
-    auto stop_handler = event_bus->register_handler<immer::box<events::StopStreamEvent>>(
-        [sess_id = video_session->session_id, pipeline](const immer::box<events::StopStreamEvent> &ev) {
-          if (ev->session_id == sess_id) {
-            logs::log(logs::debug, "[GSTREAMER] Stopping pipeline: {}", sess_id);
-            gst_element_send_event(pipeline.get(), gst_event_new_eos());
-          }
-        });
-
-    return immer::array<immer::box<events::EventBusHandlers>>{std::move(idr_handler),
-                                                              std::move(pause_handler),
-                                                              std::move(switch_producer_handler),
-                                                              std::move(stop_handler)};
-  });
+  } activity{route};
+  while (!stopped->load() && route->home->launch->reservation->valid()) {
+    auto target = route->target.load();
+    auto error = route->runtime->resume(*target->launch);
+    if (!error.empty()) {
+      target->launch->reservation->fail(error);
+      event_bus->fire_event(immer::box<events::PauseStreamEvent>{events::PauseStreamEvent{initial->session_id}});
+      break;
+    }
+    auto video = *initial;
+    video.gpu_launch = target->launch;
+    video.video_context = target->context;
+    video.gst_pipeline = target->pipelines[route->codec.load()];
+    video.render_node = target->launch->device.render_node;
+    auto interrupted = [route, target, stopped] { return stopped->load() || route->target.load() != target; };
+    stream_video_once(immer::box<events::VideoSession>(video),
+                      event_bus,
+                      client_ip,
+                      client_port,
+                      target->context,
+                      socket,
+                      sequence,
+                      target->producer,
+                      interrupted);
+    if (!interrupted())
+      break;
+  }
+  pause.unregister();
+  stop.unregister();
 }
 
 /**

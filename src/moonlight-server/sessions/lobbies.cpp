@@ -16,7 +16,23 @@ namespace wolf::core::sessions {
  */
 void leave_lobby(const std::shared_ptr<events::EventBusType> &ev_bus,
                  const events::Lobby &lobby,
-                 const events::StreamSession &session) {
+                 const events::StreamSession &session,
+                 bool disconnected = false) {
+  if (session.gpu_route) {
+    auto route = session.gpu_route;
+    auto current = route->target.load();
+    if (!disconnected && current->launch->device.id != route->home->launch->device.id) {
+      auto error = route->runtime->resume(*route->home->launch);
+      if (!error.empty()) {
+        current->launch->reservation->fail(error);
+        ev_bus->fire_event(immer::box<events::PauseStreamEvent>{events::PauseStreamEvent{session.session_id}});
+        return;
+      }
+    }
+    route->target.store(route->home);
+    if (disconnected)
+      route->home->launch->reservation->pause();
+  }
   logs::log(logs::info, "[LOBBY] Session {} leaving lobby {}", session.session_id, lobby.id);
   // Remove the current session from the lobby list
   lobby.connected_sessions->update([session](const immer::vector<immer::box<std::string>> &connected_sessions) {
@@ -80,6 +96,8 @@ setup_lobbies_handlers(const immer::box<state::AppState> &app_state,
             events::Lobby{.id = lobby_settings->id,
                           .name = lobby_settings->name,
                           .started_by_profile_id = lobby_settings->profile_id,
+                          .runner_state_folder = lobby_settings->runner_state_folder,
+                          .gpu_target = lobby_settings->gpu_target.get(),
                           .icon_png_path = lobby_settings->icon_png_path,
                           .multi_user = lobby_settings->multi_user,
                           .pin = lobby_settings->pin,
@@ -94,7 +112,11 @@ setup_lobbies_handlers(const immer::box<state::AppState> &app_state,
           std::shared_ptr<boost::promise<streaming::WaylandDisplayReady>> on_ready =
               std::make_shared<boost::promise<streaming::WaylandDisplayReady>>();
 
-          std::thread([lobby, lobby_settings, ev_bus, on_ready, gst_context = app_state->gst_context]() {
+          std::thread([lobby,
+                       lobby_settings,
+                       ev_bus,
+                       on_ready,
+                       gst_context = lobby->gpu_target ? lobby->gpu_target->context : app_state->gst_context]() {
             streaming::start_video_producer(lobby->id,
                                             lobby_settings->video_settings.video_producer_buffer_caps,
                                             lobby_settings->video_settings.wayland_render_node,
@@ -109,6 +131,8 @@ setup_lobbies_handlers(const immer::box<state::AppState> &app_state,
           auto w_display_ready = on_ready->get_future().then(
               [lobby, runtime_dir, ev_bus, audio_server, lobby_settings, host = app_state->host](auto fut) {
                 streaming::WaylandDisplayReady ready = fut.get();
+                if (lobby->gpu_target && !lobby->gpu_target->launch->reservation->valid())
+                  return;
 
                 auto wl_state =
                     virtual_display::create_wayland_display(ready.wayland_plugin, ready.wayland_socket_name);
@@ -131,6 +155,19 @@ setup_lobbies_handlers(const immer::box<state::AppState> &app_state,
                   std::filesystem::create_directories(full_path);
 
                   std::thread([=]() {
+                    if (lobby->gpu_target && !lobby->gpu_target->launch->reservation->valid())
+                      return;
+                    std::jthread cancellation;
+                    if (lobby->gpu_target) {
+                      cancellation = std::jthread([lobby, ev_bus](std::stop_token stop) {
+                        while (!stop.stop_requested()) {
+                          if (!lobby->gpu_target->launch->reservation->valid())
+                            ev_bus->fire_event(
+                                immer::box<events::StopLobbyEvent>{events::StopLobbyEvent{.lobby_id = lobby->id}});
+                          std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                        }
+                      });
+                    }
                     start_runner(lobby->runner,
                                  lobby->plugged_devices_queue,
                                  immer::box<RunnerArgs>{RunnerArgs{
@@ -184,6 +221,7 @@ setup_lobbies_handlers(const immer::box<state::AppState> &app_state,
   // When a Moonlight client joins a lobby
   handlers.push_back(app_state->event_bus->register_handler<immer::box<events::JoinLobbyEvent>>(
       [=](const immer::box<events::JoinLobbyEvent> &join_lobby_event) {
+        std::lock_guard transition(*app_state->gpu_transitions);
         auto lobbies = app_state->lobbies->load();
         auto lobby = state::get_lobby_by_id(lobbies.get(), join_lobby_event->lobby_id);
         auto sessions = app_state->running_sessions->load();
@@ -197,12 +235,66 @@ setup_lobbies_handlers(const immer::box<state::AppState> &app_state,
           join_lobby_event->error_message.get()->set_value("Lobby or session not found");
           return;
         }
+        std::shared_ptr<const events::GpuStreamTarget> next_target;
+        if (session->gpu_route || lobby->gpu_target) {
+          auto fail = [&](const std::string &error) { join_lobby_event->error_message.get()->set_value(error); };
+          if (!session->gpu_route || !lobby->gpu_target || lobby->multi_user) {
+            fail("This development build supports single-user automatic GPU apps only");
+            return;
+          }
+          if (!lobby->gpu_target->launch->reservation->valid() ||
+              !session->gpu_route->home->launch->reservation->valid()) {
+            fail("The app or launcher is closing; wait and retry");
+            return;
+          }
+          if (!join_lobby_event->profile_id || *join_lobby_event->profile_id != lobby->started_by_profile_id) {
+            fail("Select the profile that owns this app before reconnecting");
+            return;
+          }
+          if (auto existing =
+                  state::get_lobby_by_connected_session(lobbies.get(), std::to_string(session->session_id))) {
+            fail(existing->id == lobby->id ? "" : "Return to Wolf UI before switching apps");
+            return;
+          }
+          if (!lobby->connected_sessions->load()->empty()) {
+            fail("This app is in use on another device; disconnect that device first");
+            return;
+          }
+          auto route = session->gpu_route;
+          auto current = route->target.load();
+          if (lobby->gpu_target->pipelines[route->codec.load()].empty()) {
+            fail("The app GPU cannot encode this stream's codec. Reconnect Moonlight using H.264 or HEVC");
+            return;
+          }
+          auto launch = current->launch;
+          if (launch->device.id != lobby->gpu_target->launch->device.id) {
+            auto admitted = app_state->gpu_runtime->prepare(
+                "viewer:" + std::to_string(session->session_id) + ":" + lobby->id,
+                lobby->gpu_target->launch->device.id);
+            if (!admitted.launch) {
+              fail("GPU too busy or unavailable. Wait and retry, or force-close the app and restart it "
+                   "(unsaved data may be lost). " +
+                   admitted.error);
+              return;
+            }
+            launch = admitted.launch;
+          }
+          auto target = std::make_shared<events::GpuStreamTarget>(*lobby->gpu_target);
+          target->launch = launch;
+          next_target = target;
+        }
         logs::log(logs::info, "[LOBBY] Session {} joining lobby {}", session->session_id, lobby->id);
 
         if (!lobby->multi_user && lobby->connected_sessions->load()->size() >= 1) {
           logs::log(logs::error, "[LOBBY] Lobby {} is full", lobby->id);
           join_lobby_event->error_message.get()->set_value("Lobby is full");
           return;
+        }
+
+        if (next_target) {
+          session->gpu_route->target.store(next_target);
+          if (!session->gpu_route->streaming.load())
+            next_target->launch->reservation->pause();
         }
 
         // Migrate joypads BEFORE adding the session to connected_sessions, or the relayed unplug races the queued plug
@@ -247,6 +339,7 @@ setup_lobbies_handlers(const immer::box<state::AppState> &app_state,
   // When a Moonlight session leaves the lobby
   handlers.push_back(app_state->event_bus->register_handler<immer::box<events::LeaveLobbyEvent>>(
       [=](const immer::box<events::LeaveLobbyEvent> &leave_lobby_event) {
+        std::lock_guard transition(*app_state->gpu_transitions);
         auto lobbies = app_state->lobbies->load();
         auto lobby = state::get_lobby_by_id(lobbies.get(), leave_lobby_event->lobby_id);
         auto sessions = app_state->running_sessions->load();
@@ -265,6 +358,7 @@ setup_lobbies_handlers(const immer::box<state::AppState> &app_state,
   // Stopping a lobby will trigger leave for all the connected sessions
   handlers.push_back(app_state->event_bus->register_handler<immer::box<events::StopLobbyEvent>>(
       [=](const immer::box<events::StopLobbyEvent> &stop_lobby_event) {
+        std::lock_guard transition(*app_state->gpu_transitions);
         auto lobbies = app_state->lobbies->load();
         auto lobby = state::get_lobby_by_id(lobbies.get(), stop_lobby_event->lobby_id);
 
@@ -272,6 +366,8 @@ setup_lobbies_handlers(const immer::box<state::AppState> &app_state,
           logs::log(logs::warning, "[LOBBY] lobby {} not found", stop_lobby_event->lobby_id);
           return;
         }
+        if (lobby->gpu_target)
+          lobby->gpu_target->launch->reservation->cancel();
         logs::log(logs::info, "[LOBBY] stopping lobby {}", stop_lobby_event->lobby_id);
 
         immer::vector<immer::box<std::string>> sessions = lobby->connected_sessions->load();
@@ -321,9 +417,18 @@ setup_lobbies_handlers(const immer::box<state::AppState> &app_state,
       }));
 
   auto on_moonlight_session_over = [app_state](std::size_t moonlight_session_id) {
+    std::lock_guard transition(*app_state->gpu_transitions);
     immer::vector<events::Lobby> lobbies = app_state->lobbies->load();
     if (auto lobby = state::get_lobby_by_connected_session(lobbies, std::to_string(moonlight_session_id))) {
       logs::log(logs::info, "[LOBBY] Moonlight stream {} over, leaving lobby {}", moonlight_session_id, lobby->id);
+      if (!state::get_session_by_id(app_state->running_sessions->load(), moonlight_session_id)) {
+        lobby->connected_sessions->update([&](const auto &connected) {
+          return connected |
+                 ranges::views::filter([&](const auto &id) { return *id != std::to_string(moonlight_session_id); }) |
+                 ranges::to<immer::vector<immer::box<std::string>>>();
+        });
+        return;
+      }
       // Fire the LeaveLobbyEvent so that it can also be picked up by WolfUI via SSE
       app_state->event_bus->fire_event(immer::box<events::LeaveLobbyEvent>{
           events::LeaveLobbyEvent{.lobby_id = lobby->id, .moonlight_session_id = moonlight_session_id}});
@@ -333,7 +438,15 @@ setup_lobbies_handlers(const immer::box<state::AppState> &app_state,
   // When a Moonlight client Pauses a session, we get the user out of a lobby
   handlers.push_back(app_state->event_bus->register_handler<immer::box<events::PauseStreamEvent>>(
       [=](const immer::box<events::PauseStreamEvent> &pause_stream_event) {
-        on_moonlight_session_over(pause_stream_event->session_id);
+        std::lock_guard transition(*app_state->gpu_transitions);
+        auto session = state::get_session_by_id(app_state->running_sessions->load(), pause_stream_event->session_id);
+        if (session && session->gpu_route) {
+          auto lobby =
+              state::get_lobby_by_connected_session(app_state->lobbies->load(), std::to_string(session->session_id));
+          if (lobby)
+            leave_lobby(app_state->event_bus, *lobby, *session, true);
+        } else
+          on_moonlight_session_over(pause_stream_event->session_id);
       }));
 
   // When a Moonlight client Stops a session, we get the user out of a lobby

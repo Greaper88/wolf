@@ -1,0 +1,106 @@
+= Per-session GPU selection (experimental VA integration)
+
+IMPORTANT: Automatic session routing currently supports verified VA hardware encoders.
+NVENC automatic contexts, custom video overrides, zero-copy pipelines and multi-user lobby sharing are not
+supported in this development version. Unsupported launches/transitions fail explicitly.
+Automatic sessions use ordinary video buffers with hardware encoding; expect additional CPU/memory
+traffic compared with zero-copy. Live Moonlight/Steam smoke tests have passed; broader performance and compatibility validation remain.
+
+The automatic-selection Compose environment contains only:
+
+[source,yaml]
+----
+environment:
+  - WOLF_GPU_AUTO_SELECT=true
+  - WOLF_GPU_AUTO_BLACKLIST=true
+----
+
+Either explicitly supplied `WOLF_RENDER_NODE` or `WOLF_ENCODER_NODE` disables the selector.
+The legacy render/encoder defaults and split-node behavior remain the responsibility of the legacy path.
+An explicit per-app render-node override also remains manual.
+Remove both node variables entirely to enable selection; an empty value is still a manual override.
+
+[cols="2,1,4",options="header"]
+|===
+|Variable |Default |Meaning
+|WOLF_GPU_AUTO_SELECT |true |Enable launch-time selection for supported automatic pipelines.
+|WOLF_GPU_AUTO_BLACKLIST |true |Exclude virtio_gpu, qxl, bochs-drm, vmwgfx, simpledrm, hyperv_drm, ast and mgag200.
+|WOLF_GPU_BLACKLIST |empty |Never select these GPU identities.
+|WOLF_GPU_LAST_RESORT |empty |Use these GPUs only when no preferred candidate passes capacity checks.
+|WOLF_GPU_PERCENT_THRESHOLD |90 |Reject measured GPU core usage at or above this percentage.
+|WOLF_GPU_PERCENT_RETRY_THRESHOLD |87 |Core gate on the single fresh retry.
+|WOLF_GPU_PERCENT_VARIANCE |5 |Core loads within this many points of the minimum tie.
+|WOLF_VRAM_PERCENT_THRESHOLD |85 |Reject measured VRAM usage at or above this percentage.
+|WOLF_VRAM_PERCENT_RETRY_THRESHOLD |80 |VRAM gate on retry.
+|WOLF_ENCODER_PERCENT_THRESHOLD |90 |Reject projected encoder usage at or above this percentage.
+|WOLF_ENCODER_PERCENT_RETRY_THRESHOLD |85 |Projected encoder gate on retry.
+|WOLF_ENCODER_PERCENT_HARD_LIMIT |98 |Independent hard limit for current encoder usage.
+|WOLF_ENCODER_PERCENT_VARIANCE |5 |Projected encoder loads within this many points of the minimum tie.
+|WOLF_ENCODER_UNKNOWN_POLICY |session_count |Keep unknown usage null and use session-count ranking; `reject` excludes unknown encoder telemetry.
+|===
+
+Lists accept commas and/or whitespace: `0000:2d:00.0`, `/dev/dri/renderD129`, `renderD129`,
+or `/dev/dri/by-path/pci-0000:2d:00.0-render`. Prefer PCI identities because render-node numbers can change.
+Explicit blacklist wins over last resort. Disabling auto-blacklist never bypasses hardware capability checks.
+
+Percentages must be finite numbers in [0,100]; retry thresholds cannot exceed primary thresholds.
+Booleans accept true/false (case insensitive) and 1/0. Invalid selector settings produce configuration errors;
+manual overrides and auto-selection=false bypass unrelated selector parsing.
+
+Selection uses fresh measurements at admission. Both rendering and encoding use the selected node.
+Survivors rank by preferred pool, active plus pending plus disconnected app count, projected encoder usage, core load,
+VRAM load and stable device identity. No llvmpipe or software encoder fallback is authorized.
+
+For measured encoder usage E and n active Wolf encoder sessions, another session projects E + E/n.
+Pending starts add further E/n estimates without increasing n. Thus 51% with one user rejects a second;
+59% with two users projects 88.5% and permits a third on the primary pass. This is an estimate, not a
+capacity guarantee for arbitrary resolution, frame-rate or codec changes.
+
+Unavailable telemetry is unknown, not zero. This patch reads AMD/sysfs core/VRAM and NVIDIA/NVML core,
+VRAM and encoder utilization. Intel/AMD encoder utilization remains unknown. The default policy permits
+unknown encoder telemetry using session counts; choose `reject` to require a measured encoder value.
+A device must still have a verified hardware encoder. Discovery's capability callback defaults to false.
+
+Automatic pool classification currently treats NVIDIA and devices reporting more than 1 GiB dedicated
+VRAM as preferred. Unclassified/shared-memory devices are last resort. This is a conservative heuristic.
+
+The optional session `gpu` field includes identity, name, render/encoder node, VRAM bytes, encoder usage,
+projected admission usage and session count. The UI shows `max(0, session_count_on_gpu - 1)` as other users.
+The status line remains hidden until launch integration populates metadata. Old servers remain compatible.
+
+Disconnecting keeps the application, GPU assignment and video context intact. Its encoder capacity
+is released after the stream pipeline stops, so another session may use the same GPU. Resume checks
+fresh load and cached capabilities on that original GPU; it never moves an existing application.
+If capacity is unavailable, wait and retry, or explicitly force-close and restart the app. Force-closing
+can lose unsaved work. Wolf never closes the app automatically just to free encoder capacity.
+
+Encoder failures after a stream starts also preserve the app. The session API exposes the explanation
+in `gpu.stream_error`, and Wolf UI displays it in the GPU status. Moonlight resume rejections include a
+status message; an already-running stream can only receive a termination code, so the client may show
+a generic disconnect instead of the full explanation. End-to-end client validation remains outstanding.
+
+Single-user Wolf UI sub-apps own a separate, persistent GPU assignment. Leaving or pausing the app,
+disconnecting Moonlight, and closing its original Wolf UI launcher do not move the running app.
+The assignment lasts until the sub-app exits or is explicitly stopped. A paused app does not reserve
+an encoder stream and does not make that GPU exclusive to the app.
+
+An updated Wolf UI supplies its source session and selected profile when creating or joining apps.
+The server identifies a persistent instance by profile and app state folder. Reopening it from another
+device reuses that instance, checks capacity on its original GPU, and places the viewer's encoder there.
+A busy GPU causes a rejection; Wolf does not migrate or restart the app. Only one viewer can join an
+automatically routed sub-app in this version. Joining also requires a codec supported by the app GPU.
+
+Returning to Wolf UI restores the launcher's own GPU and checks its capacity. Disconnecting leaves the
+sub-app running and returns the launcher route to Wolf UI; select the same profile and app to rejoin.
+Both the Wolf server and Wolf UI images must include these changes. Updating the server image alone
+is insufficient because Wolf starts Wolf UI from the image configured in its app runner.
+
+For an existing session, reconnect admission checks its original device, verified capabilities,
+VRAM and encoder capacity. It does not reject solely for high graphics-core usage: the retained
+app is already rendering, and another desktop may also contribute to that load. New application
+placement still applies the graphics-core threshold. Same-GPU producer switches preserve the
+existing viewer's encoder admission while replacing its pipeline.
+
+A new sub-app currently inherits the launcher GPU directly; automatic fallback to another device
+before creating the app is not implemented yet. A different device joining an existing sub-app
+uses fresh targeted admission on the app GPU, including its graphics-load gate.

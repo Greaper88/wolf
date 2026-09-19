@@ -9,6 +9,8 @@
 #include <csignal>
 #include <exceptions/exceptions.h>
 #include <filesystem>
+#include <gpu/discovery.hpp>
+#include <gpu/probe_process.hpp>
 #include <immer/array_transient.hpp>
 #include <immer/map_transient.hpp>
 #include <immer/vector_transient.hpp>
@@ -106,6 +108,17 @@ state::Host get_host_config(std::string_view pkey_filename, std::string_view cer
 auto initialize(std::string_view config_file, std::string_view pkey_filename, std::string_view cert_filename) {
   auto event_bus = std::make_shared<events::EventBusType>();
   auto running_sessions = std::make_shared<immer::atom<immer::vector<events::StreamSession>>>();
+  auto gpu_options = wolf::gpu::read_options();
+  std::shared_ptr<wolf::gpu::Runtime> gpu_runtime;
+  if (gpu_options.enabled()) {
+    gpu_runtime = std::make_shared<wolf::gpu::Runtime>(
+        gpu_options,
+        [] { return wolf::gpu::discover(); },
+        [] { return std::to_string(gst_registry_get_feature_list_cookie(gst_registry_get())); },
+        [](const wolf::gpu::Device &device, wolf::gpu::Codec codec, std::stop_token stop) {
+          return wolf::gpu::isolated_probe("/proc/self/exe", device, codec, stop);
+        });
+  }
   auto config = load_config(config_file, event_bus, running_sessions);
 
   auto host = get_host_config(pkey_filename, cert_filename);
@@ -116,7 +129,8 @@ auto initialize(std::string_view config_file, std::string_view pkey_filename, st
       .pairing_atom = std::make_shared<immer::atom<immer::map<std::string, immer::box<events::PairSignal>>>>(),
       .event_bus = event_bus,
       .lobbies = std::make_shared<immer::atom<immer::vector<events::Lobby>>>(),
-      .running_sessions = running_sessions};
+      .running_sessions = running_sessions,
+      .gpu_runtime = std::move(gpu_runtime)};
   return immer::box<state::AppState>(state);
 }
 
@@ -277,6 +291,8 @@ void run() {
 }
 
 int main(int argc, char *argv[]) try {
+  if (argc > 1 && std::string_view(argv[1]) == "--wolf-gpu-probe")
+    return wolf::gpu::probe_child(argc, argv);
   logs::init(logs::parse_level(utils::get_env("WOLF_LOG_LEVEL", "INFO")));
   // Graceful termination: stop all sessions/lobbies before exiting (see run()).
   std::signal(SIGINT, graceful_shutdown_handler);

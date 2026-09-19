@@ -121,6 +121,7 @@ struct StreamSessionHandleInputRequest {
 };
 
 struct CreateLobbyRequest {
+  std::optional<std::size_t> source_session_id;
   rfl::Description<"The profile that originally created the lobby", std::string> profile_id;
   std::string name;
   std::optional<std::string> icon_png_path;

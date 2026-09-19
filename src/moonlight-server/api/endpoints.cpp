@@ -1,6 +1,7 @@
 #include <api/api.hpp>
 #include <control/input_handler.hpp>
 #include <core/docker.hpp>
+#include <gpu/discovery.hpp>
 #include <rtp/udp-ping.hpp>
 #include <state/config.hpp>
 #include <state/sessions.hpp>
@@ -203,8 +204,35 @@ void UnixSocketServer::endpoint_RemoveProfile(const HTTPRequest &req, std::share
 void UnixSocketServer::endpoint_StreamSessions(const HTTPRequest &req, std::shared_ptr<UnixSocket> socket) {
   auto res = StreamSessionListResponse{.success = true};
   auto sessions = state_->app_state->running_sessions->load();
+  // Sample once per response, not once per session. No capability probes are needed for display.
+  bool has_gpu =
+      std::any_of(sessions->begin(), sessions->end(), [](const auto &session) { return session.gpu.has_value(); });
+  auto devices = has_gpu ? wolf::gpu::discover() : std::vector<wolf::gpu::Device>{};
   for (const auto &session : sessions.get()) {
-    res.sessions.push_back(rfl::Reflector<events::StreamSession>::from(session));
+    auto reflected = rfl::Reflector<events::StreamSession>::from(session);
+    if (reflected.gpu) {
+      auto &gpu = *reflected.gpu;
+      if (session.gpu_route)
+        gpu = session.gpu_route->target.load()->launch->reservation->gpu();
+      gpu.session_count_on_gpu = std::count_if(sessions->begin(), sessions->end(), [&](const auto &other) {
+        return other.gpu_route ? other.gpu_route->target.load()->launch->device.id == gpu.id
+                               : other.gpu && other.gpu->id == gpu.id;
+      });
+      if (session.gpu_route)
+        gpu.stream_error = session.gpu_route->target.load()->launch->reservation->error();
+      else if (session.gpu_launch)
+        gpu.stream_error = session.gpu_launch->reservation->error();
+      gpu.encoder_percent.reset(); // A vanished/unreadable GPU must not keep a stale usage value.
+      for (const auto &device : devices) {
+        if (device.id == gpu.id) {
+          gpu.encoder_percent = device.encoder_percent;
+          if (device.vram_bytes)
+            gpu.vram_bytes = device.vram_bytes;
+          break;
+        }
+      }
+    }
+    res.sessions.push_back(std::move(reflected));
   }
   send_http(socket, 200, rfl::json::write(res));
 }
@@ -243,6 +271,9 @@ void UnixSocketServer::endpoint_StreamSessionAdd(const HTTPRequest &req, std::sh
           .av1_gst_pipeline = sample_app->av1_gst_pipeline,
 
           .render_node = sample_app->render_node,
+          .gpu_auto_select = sample_app->gpu_auto_select,
+          .video = sample_app->video,
+          .audio = sample_app->audio,
           .opus_gst_pipeline = sample_app->opus_gst_pipeline,
           .start_virtual_compositor = true,
           .start_audio_server = true,
@@ -280,12 +311,25 @@ void UnixSocketServer::endpoint_StreamSessionAdd(const HTTPRequest &req, std::sh
         ss.audio_channel_count,
         ss.aes_key,
         ss.aes_iv);
+    try {
+      state::prepare_gpu_session(*state_->app_state, *new_session);
+    } catch (const std::exception &error) {
+      send_http(socket, 503, rfl::json::write(GenericErrorResponse{.error = error.what()}));
+      return;
+    }
     new_session->ip = ss.client_ip;
     new_session->rtsp_fake_ip = ss.rtsp_fake_ip;
 
     state_->app_state->running_sessions->update(
         [new_session](const immer::vector<events::StreamSession> &ses_v) { return ses_v.push_back(*new_session); });
-    state_->app_state->event_bus->fire_event(immer::box<events::StreamSession>(*new_session));
+    try {
+      state_->app_state->event_bus->fire_event(immer::box<events::StreamSession>(*new_session));
+    } catch (const std::exception &error) {
+      state_->app_state->event_bus->fire_event(
+          immer::box<events::StopStreamEvent>(events::StopStreamEvent{.session_id = new_session->session_id}));
+      send_http(socket, 503, rfl::json::write(GenericErrorResponse{.error = error.what()}));
+      return;
+    }
 
     auto res = StreamSessionCreated{.success = true, .session_id = std::to_string(new_session->session_id)};
     send_http(socket, 200, rfl::json::write(res));
@@ -304,7 +348,40 @@ void UnixSocketServer::endpoint_StreamSessionStart(const HTTPRequest &req, std::
     if (auto session = state::get_session_by_id(sessions.get(), session_id)) {
       auto video_session = start_req.value().video_session;
       video_session.session_id = session_id; // Can't be JSON encoded
+      video_session.gpu_route = session->gpu_route;
+      video_session.gpu_launch = session->gpu_launch;
+      video_session.video_context = session->video_context;
+      if (session->gpu_launch) {
+        if (video_session.gst_pipeline.empty() || (video_session.gst_pipeline != session->app->h264_gst_pipeline &&
+                                                   video_session.gst_pipeline != session->app->hevc_gst_pipeline &&
+                                                   video_session.gst_pipeline != session->app->av1_gst_pipeline)) {
+          send_http(socket,
+                    400,
+                    rfl::json::write(
+                        GenericErrorResponse{.error = "Use a verified video pipeline from the selected session app"}));
+          return;
+        }
+        if (session->gpu_route)
+          session->gpu_route->codec.store(video_session.gst_pipeline == session->app->av1_gst_pipeline    ? 2
+                                          : video_session.gst_pipeline == session->app->hevc_gst_pipeline ? 1
+                                                                                                          : 0);
+        auto error = state_->app_state->gpu_runtime->resume(*session->gpu_launch);
+        if (!error.empty()) {
+          send_http(socket, 503, rfl::json::write(GenericErrorResponse{.error = error}));
+          return;
+        }
+        video_session.render_node = session->app->render_node;
+      }
       if (video_session.render_node.empty()) {
+        if (session->gpu_route)
+          session->gpu_route->codec.store(video_session.gst_pipeline == session->app->av1_gst_pipeline    ? 2
+                                          : video_session.gst_pipeline == session->app->hevc_gst_pipeline ? 1
+                                                                                                          : 0);
+        auto error = state_->app_state->gpu_runtime->resume(*session->gpu_launch);
+        if (!error.empty()) {
+          send_http(socket, 503, rfl::json::write(GenericErrorResponse{.error = error}));
+          return;
+        }
         video_session.render_node = session->app->render_node;
       }
       state_->app_state->event_bus->fire_event(immer::box<events::VideoSession>(video_session));
@@ -354,7 +431,10 @@ void UnixSocketServer::endpoint_StreamSessionStop(const HTTPRequest &req, std::s
   if (session) {
     auto sessions = state_->app_state->running_sessions->load();
     auto session_id = std::stoul(session.value().session_id);
-    if (state::get_session_by_id(sessions.get(), session_id)) {
+    if (auto stopped = state::get_session_by_id(sessions.get(), session_id)) {
+      // Cancel before dispatch: another handler may block while startup is still completing.
+      if (stopped->gpu_launch)
+        stopped->gpu_launch->reservation->cancel();
       this->state_->app_state->event_bus->fire_event(
           immer::box<events::StopStreamEvent>(events::StopStreamEvent{.session_id = session_id}));
       auto res = GenericSuccessResponse{.success = true};
@@ -407,10 +487,43 @@ void UnixSocketServer::endpoint_Lobbies(const wolf::api::HTTPRequest &req, std::
 void UnixSocketServer::endpoint_LobbyCreate(const wolf::api::HTTPRequest &req, std::shared_ptr<UnixSocket> socket) {
   auto event = rfl::json::read<CreateLobbyRequest>(req.body);
   if (event) {
+    std::lock_guard transition(*state_->app_state->gpu_transitions);
     auto default_client_settings = state::ClientSettings{};
     auto client_settings = event.value().client_settings.value().value_or(PartialClientSettings{});
     auto lobby_id = state::gen_uuid();
+    std::shared_ptr<const events::GpuStreamTarget> target;
+    if (state_->app_state->gpu_runtime) {
+      if (!event->source_session_id || event->multi_user) {
+        send_http(socket,
+                  400,
+                  rfl::json::write(GenericErrorResponse{
+                      .error = "Automatic GPU apps require an updated Wolf UI and a single-user launch"}));
+        return;
+      }
+      auto source = state::get_session_by_id(state_->app_state->running_sessions->load(), *event->source_session_id);
+      if (!source || !source->gpu_route) {
+        send_http(socket, 400, rfl::json::write(GenericErrorResponse{.error = "Automatic launcher session not found"}));
+        return;
+      }
+      for (const auto &existing : *state_->app_state->lobbies->load()) {
+        if (existing.gpu_target && existing.started_by_profile_id == event->profile_id.get() &&
+            existing.runner_state_folder == event->runner_state_folder) {
+          send_http(socket, 200, rfl::json::write(LobbyCreateResponse{.lobby_id = existing.id}));
+          return;
+        }
+      }
+      auto held = state_->app_state->gpu_runtime->retain("app:" + lobby_id, *source->gpu_route->target.load()->launch);
+      if (!held.launch) {
+        send_http(socket, 503, rfl::json::write(GenericErrorResponse{.error = held.error}));
+        return;
+      }
+      target = state::gpu_target(*state_->app_state, held.launch, lobby_id);
+      event->video_settings.wayland_render_node = held.launch->device.render_node;
+      event->video_settings.runner_render_node = held.launch->device.render_node;
+      event->video_settings.video_producer_buffer_caps = "video/x-raw";
+    }
     auto create_lobby_ev = events::CreateLobbyEvent{
+        .gpu_target = target,
         .id = lobby_id,
         .profile_id = event.value().profile_id.get(),
         .name = event.value().name,

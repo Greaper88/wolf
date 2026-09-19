@@ -1,4 +1,5 @@
 #pragma once
+#include <gpu/runtime.hpp>
 
 #include "gst-video-context.hpp"
 
@@ -93,6 +94,7 @@ struct Config {
    * Profiles will be shown in WolfUI
    */
   std::shared_ptr<immer::atom<ProfilesList>> profiles;
+  wolf::config::GstVideoCfg gpu_video;
 };
 
 /**
@@ -157,6 +159,7 @@ using SessionsAtoms = std::shared_ptr<immer::atom<immer::vector<events::StreamSe
  * The whole application state as a composition of immutable datastructures
  */
 struct AppState {
+  std::shared_ptr<std::recursive_mutex> gpu_transitions = std::make_shared<std::recursive_mutex>();
   /**
    * The stored (and user modifiable) configuration
    */
@@ -195,6 +198,8 @@ struct AppState {
    * A list of all currently running (and paused) streaming sessions
    */
   SessionsAtoms running_sessions;
+
+  std::shared_ptr<wolf::gpu::Runtime> gpu_runtime;
 };
 
 const static immer::array<audio::AudioMode> AUDIO_CONFIGURATIONS = {

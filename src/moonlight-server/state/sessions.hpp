@@ -1,6 +1,7 @@
 #pragma once
 
 #include <events/events.hpp>
+#include <gpu/pipeline.hpp>
 #include <helpers/logger.hpp>
 #include <helpers/utils.hpp>
 #include <immer/vector.hpp>
@@ -117,7 +118,72 @@ inline std::shared_ptr<events::StreamSession> create_stream_session(immer::box<s
       .audio_stream_port = static_cast<unsigned short>(get_port(AUDIO_PING_PORT)),
       .control_stream_port = static_cast<unsigned short>(get_port(CONTROL_PORT))};
 
+  session.video_context = state->gst_context;
   return std::make_shared<events::StreamSession>(session);
+}
+
+inline std::shared_ptr<const events::GpuStreamTarget>
+gpu_target(const AppState &state,
+           std::shared_ptr<const wolf::gpu::Runtime::Launch> launch,
+           const std::string &producer,
+           std::shared_ptr<immer::atom<gst_video_context::gst_context_ptr>> context = {}) {
+  auto target = std::make_shared<events::GpuStreamTarget>();
+  target->launch = std::move(launch);
+  target->producer = producer;
+  target->context = context ? context : std::make_shared<immer::atom<gst_video_context::gst_context_ptr>>();
+  const auto &cfg = state.config->gpu_video;
+  auto bind = [&](std::size_t index, const std::vector<wolf::config::GstEncoder> &encoders) {
+    const auto &verified = target->launch->capabilities.codecs[index].encoder;
+    if (!verified)
+      return std::string{};
+    std::vector<wolf::gpu::PipelineTemplate> templates;
+    for (const auto &e : encoders)
+      templates.push_back({e.plugin_name, e.encoder_pipeline});
+    return wolf::gpu::bind_pipeline(*verified, templates, cfg.default_source, cfg.default_sink);
+  };
+  target->pipelines = {bind(0, cfg.h264_encoders), bind(1, cfg.hevc_encoders), bind(2, cfg.av1_encoders)};
+  return target;
+}
+
+// Called only for a new launch. Resume retains the existing bundle and context.
+inline void prepare_gpu_session(const AppState &state, events::StreamSession &session) {
+  if (!state.gpu_runtime || !session.app->gpu_auto_select)
+    return;
+  if (session.app->video)
+    throw std::runtime_error(
+        "Automatic GPU selection cannot retarget custom video overrides; pin this app's render node");
+  auto result = state.gpu_runtime->prepare(std::to_string(session.session_id));
+  if (result.bypass)
+    return;
+  if (!result.launch)
+    throw std::runtime_error(result.error);
+  const auto &cfg = state.config->gpu_video;
+  auto pipeline = [&](std::size_t index, const std::vector<wolf::config::GstEncoder> &encoders) {
+    const auto &verified = result.launch->capabilities.codecs[index].encoder;
+    if (!verified)
+      return std::string{};
+    std::vector<wolf::gpu::PipelineTemplate> templates;
+    for (const auto &encoder : encoders)
+      templates.push_back({encoder.plugin_name, encoder.encoder_pipeline});
+    return wolf::gpu::bind_pipeline(*verified, templates, cfg.default_source, cfg.default_sink);
+  };
+  auto app = std::make_shared<events::App>(*session.app);
+  app->h264_gst_pipeline = pipeline(0, cfg.h264_encoders);
+  app->hevc_gst_pipeline = pipeline(1, cfg.hevc_encoders);
+  app->av1_gst_pipeline = pipeline(2, cfg.av1_encoders);
+  app->video_producer_buffer_caps = "video/x-raw";
+  app->render_node = result.launch->device.render_node;
+  session.display_mode.hevc_supported = !app->hevc_gst_pipeline.empty();
+  session.display_mode.av1_supported = !app->av1_gst_pipeline.empty();
+  session.app = std::move(app);
+  session.video_context = std::make_shared<immer::atom<gst_video_context::gst_context_ptr>>();
+  session.gpu = result.launch->reservation->gpu();
+  session.gpu_launch = std::move(result.launch);
+  session.gpu_route = std::make_shared<events::GpuStreamRoute>();
+  session.gpu_route->home =
+      gpu_target(state, session.gpu_launch, std::to_string(session.session_id), session.video_context);
+  session.gpu_route->target.store(session.gpu_route->home);
+  session.gpu_route->runtime = state.gpu_runtime;
 }
 
 inline immer::vector<events::StreamSession> remove_session(const immer::vector<events::StreamSession> &sessions,

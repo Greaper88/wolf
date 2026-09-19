@@ -53,6 +53,9 @@ template <> struct Reflector<events::App> {
     std::string av1_gst_pipeline;
 
     std::string render_node;
+    std::optional<bool> gpu_auto_select;
+    std::optional<wolf::config::BaseAppVideoOverride> video;
+    std::optional<wolf::config::BaseAppAudioOverride> audio;
 
     std::string opus_gst_pipeline;
     bool start_virtual_compositor;
@@ -69,6 +72,9 @@ template <> struct Reflector<events::App> {
             .hevc_gst_pipeline = v.hevc_gst_pipeline,
             .av1_gst_pipeline = v.av1_gst_pipeline,
             .render_node = v.render_node,
+            .gpu_auto_select = v.gpu_auto_select,
+            .video = v.video,
+            .audio = v.audio,
             .opus_gst_pipeline = v.opus_gst_pipeline,
             .start_virtual_compositor = v.start_virtual_compositor,
             .start_audio_server = v.start_audio_server,
@@ -83,6 +89,9 @@ template <> struct Reflector<events::App> {
         .hevc_gst_pipeline = app.hevc_gst_pipeline,
         .av1_gst_pipeline = app.av1_gst_pipeline,
         .render_node = app.render_node,
+        .gpu_auto_select = app.gpu_auto_select.value_or(false),
+        .video = app.video,
+        .audio = app.audio,
         .opus_gst_pipeline = app.opus_gst_pipeline,
         .start_virtual_compositor = app.start_virtual_compositor,
         .start_audio_server = app.start_audio_server,
@@ -156,6 +165,7 @@ template <> struct Reflector<events::StreamSession> {
     std::optional<std::string> app_id;
     std::optional<std::string> client_id;
     std::optional<ClientSettings> client_settings;
+    std::optional<wolf::gpu::SessionGpu> gpu;
   };
 
   static ReflType from(const events::StreamSession &v) {
@@ -169,7 +179,8 @@ template <> struct Reflector<events::StreamSession> {
             .audio_channel_count = v.audio_channel_count,
             .app_id = v.app->base.id,
             .client_id = std::to_string(v.session_id),
-            .client_settings = v.client_settings};
+            .client_settings = v.client_settings,
+            .gpu = v.gpu};
   }
 };
 
@@ -180,6 +191,8 @@ template <> struct Reflector<events::Lobby> {
     std::optional<std::string> icon_png_path;
     bool multi_user;
     std::string started_by_profile_id;
+    std::string runner_state_folder;
+    std::optional<wolf::gpu::SessionGpu> gpu;
     bool pin_required;
     bool stop_when_everyone_leaves;
     Reflector<events::Runner>::ReflType runner;
@@ -193,6 +206,8 @@ template <> struct Reflector<events::Lobby> {
             .icon_png_path = v.icon_png_path,
             .multi_user = v.multi_user,
             .started_by_profile_id = v.started_by_profile_id,
+            .runner_state_folder = v.runner_state_folder,
+            .gpu = v.gpu_target ? std::optional(v.gpu_target->launch->reservation->gpu()) : std::nullopt,
             .pin_required = v.pin.has_value(),
             .stop_when_everyone_leaves = v.stop_when_everyone_leaves,
             .runner = v.runner->serialize(),

@@ -76,8 +76,12 @@ void serverinfo(const std::shared_ptr<typename SimpleWeb::Server<T>::Response> &
                                    local_ip,
                                    host->display_modes,
                                    is_https,
-                                   cfg->support_hevc,
-                                   cfg->support_av1);
+                                   stream_session       ? stream_session->display_mode.hevc_supported
+                                   : state->gpu_runtime ? state->gpu_runtime->supports(wolf::gpu::Codec::hevc)
+                                                        : cfg->support_hevc,
+                                   stream_session       ? stream_session->display_mode.av1_supported
+                                   : state->gpu_runtime ? state->gpu_runtime->supports(wolf::gpu::Codec::av1)
+                                                        : cfg->support_av1);
 
   send_xml<T>(response, SimpleWeb::StatusCode::success_ok, xml);
 }
@@ -430,9 +434,25 @@ void launch(const std::shared_ptr<typename SimpleWeb::Server<SimpleWeb::HTTPS>::
 
   auto client_ip = get_client_ip<SimpleWeb::HTTPS>(request);
   auto new_session = create_run_session(request->parse_query_string(), client_ip, current_client, state, app.value());
-  state->event_bus->fire_event(immer::box<events::StreamSession>(*new_session));
+  try {
+    state::prepare_gpu_session(*state, *new_session);
+  } catch (const std::exception &error) {
+    logs::log(logs::warning, "[GPU] Launch rejected: {}", error.what());
+    server_error<SimpleWeb::HTTPS>(response);
+    return;
+  }
+  // Publish before startup: synchronous startup failure must be able to remove this session.
   state->running_sessions->update(
       [new_session](const immer::vector<events::StreamSession> &ses_v) { return ses_v.push_back(*new_session); });
+  try {
+    state->event_bus->fire_event(immer::box<events::StreamSession>(*new_session));
+  } catch (const std::exception &error) {
+    logs::log(logs::error, "Session startup failed: {}", error.what());
+    state->event_bus->fire_event(
+        immer::box<events::StopStreamEvent>(events::StopStreamEvent{.session_id = new_session->session_id}));
+    server_error<SimpleWeb::HTTPS>(response);
+    return;
+  }
 
   auto rtsp_ip = get_rtsp_ip_string(get_host_ip<SimpleWeb::HTTPS>(request, state), *new_session);
   auto xml = moonlight::launch_success(rtsp_ip, std::to_string(get_port(state::RTSP_SETUP_PORT)));
@@ -448,8 +468,24 @@ void resume(const std::shared_ptr<typename SimpleWeb::Server<SimpleWeb::HTTPS>::
   auto client_ip = get_client_ip<SimpleWeb::HTTPS>(request);
   auto old_session = state::get_session_by_client(state->running_sessions->load(), current_client);
   if (old_session) {
+    if (old_session->gpu_launch) {
+      auto error = state->gpu_runtime->resume(*old_session->gpu_launch);
+      if (!error.empty()) {
+        XML xml;
+        xml.put("root.<xmlattr>.status_code", 503);
+        xml.put("root.<xmlattr>.status_message", error);
+        send_xml<SimpleWeb::HTTPS>(response, SimpleWeb::StatusCode::success_ok, xml);
+        return;
+      }
+    }
     auto new_session =
         create_run_session(request->parse_query_string(), client_ip, current_client, state, *old_session->app);
+    new_session->gpu_route = old_session->gpu_route;
+    new_session->gpu = old_session->gpu;
+    new_session->gpu_launch = old_session->gpu_launch;
+    new_session->video_context = old_session->video_context;
+    new_session->display_mode.hevc_supported = old_session->display_mode.hevc_supported;
+    new_session->display_mode.av1_supported = old_session->display_mode.av1_supported;
     // Carry over the old session display handle
     new_session->wayland_display = std::move(old_session->wayland_display);
     // Carry over the old session devices, they'll be already plugged into the container
@@ -466,6 +502,7 @@ void resume(const std::shared_ptr<typename SimpleWeb::Server<SimpleWeb::HTTPS>::
     auto rtsp_ip = get_rtsp_ip_string(get_host_ip<SimpleWeb::HTTPS>(request, state), *new_session);
     auto xml = moonlight::launch_resume(rtsp_ip, std::to_string(get_port(state::RTSP_SETUP_PORT)));
     send_xml<SimpleWeb::HTTPS>(response, SimpleWeb::StatusCode::success_ok, xml);
+    return;
   } else {
     logs::log(logs::warning, "[HTTPS] Received resume event from an unregistered session, ip: {}", client_ip);
   }
@@ -481,6 +518,8 @@ void cancel(const std::shared_ptr<typename SimpleWeb::Server<SimpleWeb::HTTPS>::
 
   auto client_session = state::get_session_by_client(state->running_sessions->load(), current_client);
   if (client_session) {
+    if (client_session->gpu_launch)
+      client_session->gpu_launch->reservation->cancel();
     state->event_bus->fire_event(
         immer::box<events::StopStreamEvent>(events::StopStreamEvent{.session_id = client_session->session_id}));
 

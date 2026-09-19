@@ -116,3 +116,6 @@ include(Catch)
 catch_discover_tests(wolftests
         PROPERTIES
         ENVIRONMENT "WOLF_SKIP_WAYLAND_SOCKET_WAIT=TRUE")
+
+# Dependency-free policy/provider regression suite.
+add_subdirectory(gpu)

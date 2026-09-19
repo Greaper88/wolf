@@ -17,8 +17,8 @@ using session_devices = immer::map<std::string /* session_id */, std::shared_ptr
  * Returns the RTPPingType event
  */
 template <typename RTPPingType>
-immer::box<RTPPingType> wait_for_ping(std::shared_ptr<events::EventBusType> ev_bus, const auto &sess) {
-  auto ping_promise = std::make_shared<std::promise<RTPPingType>>();
+std::optional<RTPPingType> wait_for_ping(std::shared_ptr<events::EventBusType> ev_bus, const auto &sess) {
+  auto ping_promise = std::make_shared<std::promise<std::optional<RTPPingType>>>();
   auto ping_future = ping_promise->get_future();
   auto resolved = std::make_shared<std::atomic_bool>(false);
 
@@ -36,8 +36,31 @@ immer::box<RTPPingType> wait_for_ping(std::shared_ptr<events::EventBusType> ev_b
         }
       });
 
-  // Wait for the promise to be fulfilled
+  auto cancel = [ping_promise, resolved] {
+    if (!resolved->exchange(true))
+      ping_promise->set_value(std::nullopt);
+  };
+  auto stop_handler = ev_bus->register_handler<immer::box<events::StopStreamEvent>>(
+      [id = sess->session_id, cancel](const immer::box<events::StopStreamEvent> &ev) {
+        if (ev->session_id == id)
+          cancel();
+      });
+  auto pause_handler = ev_bus->register_handler<immer::box<events::PauseStreamEvent>>(
+      [id = sess->session_id, cancel](const immer::box<events::PauseStreamEvent> &ev) {
+        if (ev->session_id == id)
+          cancel();
+      });
+  if (ping_future.wait_for(std::chrono::seconds(30)) == std::future_status::timeout) {
+    cancel();
+    if constexpr (std::is_same_v<RTPPingType, events::RTPVideoPingEvent>) {
+      if (auto launch = sess->gpu_launch.get(); launch && launch->reservation->valid())
+        ev_bus->fire_event(
+            immer::box<events::PauseStreamEvent>(events::PauseStreamEvent{.session_id = sess->session_id}));
+    }
+  }
   auto ping_ev = ping_future.get();
+  stop_handler.unregister();
+  pause_handler.unregister();
 
   // Unregister the handler since we only need it once
   handler.unregister();
@@ -56,9 +79,23 @@ setup_moonlight_handlers(const immer::box<state::AppState> &app_state,
    * This way we can accumulate devices here until the docker container is up and running
    */
   auto plugged_devices_queue = std::make_shared<immer::atom<session_devices>>();
+  handlers.push_back(app_state->event_bus->register_handler<immer::box<events::PauseStreamEvent>>(
+      [app_state](const immer::box<events::PauseStreamEvent> &ev) {
+        auto session = state::get_session_by_id(app_state->running_sessions->load(), ev->session_id);
+        if (session && session->gpu_launch)
+          session->gpu_launch->reservation->pause();
+      }));
+  handlers.push_back(app_state->event_bus->register_handler<immer::box<events::GpuEncoderFailed>>(
+      [runtime = app_state->gpu_runtime](const immer::box<events::GpuEncoderFailed> &failure) {
+        if (runtime)
+          runtime->invalidate(failure->device_id);
+      }));
 
   handlers.push_back(app_state->event_bus->register_handler<immer::box<events::StopStreamEvent>>(
       [&app_state, plugged_devices_queue](const immer::box<events::StopStreamEvent> &ev) {
+        auto stopped = state::get_session_by_id(app_state->running_sessions->load(), ev->session_id);
+        if (stopped && stopped->gpu_launch)
+          stopped->gpu_launch->reservation->cancel();
         // Remove session from app state so that HTTP/S applist gets updated
         // This should effectively destroy the virtual Wayland session since it holds the last reference
         app_state->running_sessions->update([&ev](const immer::vector<events::StreamSession> &ses_v) {
@@ -100,16 +137,27 @@ setup_moonlight_handlers(const immer::box<state::AppState> &app_state,
           logs::log(logs::debug, "[STREAM_SESSION] Create wayland compositor");
 
           // Start Gstreamer producer pipeline
-          std::thread([session, on_ready, gst_context = app_state->gst_context]() {
-            streaming::start_video_producer(std::to_string(session->session_id),
-                                            session->app->video_producer_buffer_caps,
-                                            session->app->render_node,
-                                            {.width = session->display_mode.width,
-                                             .height = session->display_mode.height,
-                                             .refreshRate = session->display_mode.refreshRate},
-                                            gst_context,
-                                            on_ready,
-                                            session->event_bus);
+          std::thread([session,
+                       on_ready,
+                       gst_context = session->video_context,
+                       sessions = app_state->running_sessions]() {
+            try {
+              streaming::start_video_producer(std::to_string(session->session_id),
+                                              session->app->video_producer_buffer_caps,
+                                              session->app->render_node,
+                                              {.width = session->display_mode.width,
+                                               .height = session->display_mode.height,
+                                               .refreshRate = session->display_mode.refreshRate},
+                                              gst_context,
+                                              on_ready,
+                                              session->event_bus);
+            } catch (const std::exception &error) {
+              logs::log(logs::error, "[GPU] Video producer failed: {}", error.what());
+            }
+            auto current = state::get_session_by_id(sessions->load(), session->session_id);
+            if (current && current->wayland_display == session->wayland_display)
+              session->event_bus->fire_event(
+                  immer::box<events::StopStreamEvent>(events::StopStreamEvent{.session_id = session->session_id}));
           }).detach();
         } else {
           // Create virtual devices
@@ -163,6 +211,8 @@ setup_moonlight_handlers(const immer::box<state::AppState> &app_state,
         // TODO: timeout? What if the wayland display is never ready?
         auto w_display_ready = on_ready->get_future().then([session, runtime_dir](auto fut) {
           streaming::WaylandDisplayReady ready = fut.get();
+          if (session->gpu_launch && !session->gpu_launch->reservation->valid())
+            return;
 
           auto wl_state = virtual_display::create_wayland_display(ready.wayland_plugin, ready.wayland_socket_name);
           // Set the wayland display
@@ -201,31 +251,55 @@ setup_moonlight_handlers(const immer::box<state::AppState> &app_state,
         }
 
         std::thread([=]() {
-          start_runner(
-              run_session->runner,
-              *devices_q,
-              immer::box<RunnerArgs>{RunnerArgs{
-                  .session_id = session_id,
-                  .video_settings =
-                      {
-                          .width = run_session->stream_session->display_mode.width,
-                          .height = run_session->stream_session->display_mode.height,
-                          .refresh_rate = run_session->stream_session->display_mode.refreshRate,
-                          .wayland_render_node = run_session->stream_session->app->render_node,
-                          .runner_render_node = run_session->stream_session->app->render_node,
-                          .video_producer_buffer_caps = run_session->stream_session->app->video_producer_buffer_caps,
-                      },
-                  .wayland_display = run_session->stream_session->wayland_display->load(),
-                  .audio_server = audio_server,
-                  .audio_sink = run_session->stream_session->audio_sink->load(),
-                  .host = app_state->host,
-                  .app_local_state_folder = run_session->stream_session->app_local_state_folder,
-                  .app_host_state_folder = run_session->stream_session->app_host_state_folder,
-                  .xdg_runtime_dir = runtime_dir,
-                  .client_settings = run_session->stream_session->client_settings}});
+          auto launch = run_session->stream_session->gpu_launch;
+          if (launch && !launch->reservation->valid())
+            return;
+          // A runner can install its stop handler after the original stop event's handler snapshot.
+          // Keep delivering cancellation until it exits; the lease prevents reuse during teardown.
+          std::jthread cancellation;
+          if (launch) {
+            cancellation = std::jthread([launch,
+                                         ev_bus = app_state->event_bus,
+                                         id = run_session->stream_session->session_id](std::stop_token stop) {
+              while (!stop.stop_requested()) {
+                if (!launch->reservation->valid())
+                  ev_bus->fire_event(immer::box<events::StopStreamEvent>(events::StopStreamEvent{.session_id = id}));
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+              }
+            });
+          }
+          try {
+            start_runner(
+                run_session->runner,
+                *devices_q,
+                immer::box<RunnerArgs>{RunnerArgs{
+                    .session_id = session_id,
+                    .video_settings =
+                        {
+                            .width = run_session->stream_session->display_mode.width,
+                            .height = run_session->stream_session->display_mode.height,
+                            .refresh_rate = run_session->stream_session->display_mode.refreshRate,
+                            .wayland_render_node = run_session->stream_session->app->render_node,
+                            .runner_render_node = run_session->stream_session->app->render_node,
+                            .video_producer_buffer_caps = run_session->stream_session->app->video_producer_buffer_caps,
+                        },
+                    .wayland_display = run_session->stream_session->wayland_display->load(),
+                    .audio_server = audio_server,
+                    .audio_sink = run_session->stream_session->audio_sink->load(),
+                    .host = app_state->host,
+                    .app_local_state_folder = run_session->stream_session->app_local_state_folder,
+                    .app_host_state_folder = run_session->stream_session->app_host_state_folder,
+                    .xdg_runtime_dir = runtime_dir,
+                    .client_settings = run_session->stream_session->client_settings}});
+          } catch (const std::exception &error) {
+            logs::log(logs::error, "Runner startup failed: {}", error.what());
+          }
 
           // Runner process ended
-          if (run_session->stop_stream_when_over) {
+          auto current =
+              state::get_session_by_id(app_state->running_sessions->load(), run_session->stream_session->session_id);
+          if (run_session->stop_stream_when_over && current &&
+              current->wayland_display == run_session->stream_session->wayland_display) {
             run_session->stream_session->wayland_display->store(nullptr);
 
             app_state->event_bus->fire_event(immer::box<events::StopStreamEvent>(
@@ -240,14 +314,32 @@ setup_moonlight_handlers(const immer::box<state::AppState> &app_state,
         // Start a thread that will wait for the RTP ping event
         std::thread([sess, ev_bus, gst_context]() {
           auto ping_ev = wait_for_ping<events::RTPVideoPingEvent>(ev_bus, sess);
+          if (!ping_ev)
+            return;
+          auto session_context = sess->video_context.get() ? sess->video_context.get() : gst_context;
 
           // Start streaming
-          streaming::start_streaming_video(sess,
-                                           ev_bus,
-                                           ping_ev->client_ip,
-                                           ping_ev->client_port,
-                                           gst_context,
-                                           ping_ev->video_socket.get());
+          try {
+            streaming::start_streaming_video(sess,
+                                             ev_bus,
+                                             ping_ev->client_ip,
+                                             ping_ev->client_port,
+                                             session_context,
+                                             ping_ev->video_socket.get());
+          } catch (const std::exception &error) {
+            if (auto launch = sess->gpu_launch.get(); launch && !launch->reservation->valid())
+              return;
+            logs::log(logs::error, "[GPU] Video stream failed: {}", error.what());
+            if (auto launch = sess->gpu_launch.get()) {
+              launch->reservation->fail("GPU encoder failed; it may be too busy. Wait and retry, or force-close "
+                                        "the app and restart it (unsaved data may be lost).");
+              ev_bus->fire_event(
+                  immer::box<events::PauseStreamEvent>(events::PauseStreamEvent{.session_id = sess->session_id}));
+              return;
+            }
+            ev_bus->fire_event(
+                immer::box<events::StopStreamEvent>(events::StopStreamEvent{.session_id = sess->session_id}));
+          }
         }).detach();
       }));
 
@@ -256,6 +348,8 @@ setup_moonlight_handlers(const immer::box<state::AppState> &app_state,
         // Start a thread that will wait for the RTP ping event
         std::thread([sess, ev_bus, audio_server]() {
           auto ping_ev = wait_for_ping<events::RTPAudioPingEvent>(ev_bus, sess);
+          if (!ping_ev)
+            return;
 
           // Start streaming
           auto audio_server_name = audio_server ? audio::get_server_name(audio_server->server)

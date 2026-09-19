@@ -195,6 +195,9 @@ parse_apps(const std::vector<BaseApp> &apps,
                         .hevc_gst_pipeline = hevc_gst_pipeline,
                         .av1_gst_pipeline = av1_gst_pipeline,
                         .render_node = app_render_node,
+                        .gpu_auto_select = !app.render_node.has_value(),
+                        .video = app.video,
+                        .audio = app.audio,
 
                         .opus_gst_pipeline = opus_gst_pipeline,
                         .start_virtual_compositor = app.start_virtual_compositor.value_or(true),
@@ -404,7 +407,8 @@ Config load_or_default(const std::string &source,
                 .support_hevc = hevc_encoder.has_value(),
                 .support_av1 = av1_encoder.has_value() && encoder_type(*av1_encoder) != SOFTWARE,
                 .paired_clients = clients_atom,
-                .profiles = profiles_atom};
+                .profiles = profiles_atom,
+                .gpu_video = default_gst_video_settings};
 }
 
 void pair(const Config &cfg, const PairedClient &client) {
@@ -482,14 +486,8 @@ void update_profiles(const Config &cfg, const ProfilesList &profiles) {
                        .icon_png_path = p->icon_png_path,
                        .pin = p->pin,
                        .apps = p->apps->load().get() | //
-                               ranges::views::transform([](const immer::box<events::App> &app) {
-                                 return BaseApp{.title = app->base.title,
-                                                .icon_png_path = app->base.icon_png_path,
-                                                .render_node = app->render_node,
-                                                .start_virtual_compositor = app->start_virtual_compositor,
-                                                .start_audio_server = app->start_audio_server,
-                                                .runner = app->runner->serialize()};
-                               }) | //
+                               ranges::views::transform(
+                                   [](const immer::box<events::App> &app) { return serialise_app(*app); }) | //
                                ranges::to_vector,
                    };
                  }) | //

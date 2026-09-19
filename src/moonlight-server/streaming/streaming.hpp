@@ -62,7 +62,10 @@ void start_streaming_audio(immer::box<events::AudioSession> audio_session,
 static bool run_pipeline(
     const std::string &pipeline_desc,
     const std::function<immer::array<immer::box<events::EventBusHandlers>>(gstreamer::gst_element_ptr /* pipeline */)>
-        &on_pipeline_ready) {
+        &on_pipeline_ready,
+    bool strict = false,
+    const std::function<void(gstreamer::gst_element_ptr)> &on_stopped = {},
+    const std::function<bool()> &interrupted = {}) {
   GError *error = nullptr;
   gstreamer::gst_element_ptr pipeline(gst_parse_launch(pipeline_desc.c_str(), &error), [](const auto &pipeline) {
     logs::log(logs::trace, "~pipeline");
@@ -77,6 +80,8 @@ static bool run_pipeline(
                       // this case there was a recoverable parsing error and you can try to play the pipeline.
     logs::log(logs::warning, "[GSTREAMER] Pipeline parse error (recovered): {}", error->message);
     g_error_free(error);
+    if (strict)
+      return false;
   }
 
   gstreamer::gst_main_context_ptr context = {g_main_context_new(), ::g_main_context_unref};
@@ -97,8 +102,40 @@ static bool run_pipeline(
   g_signal_connect(bus, "message::eos", G_CALLBACK(gstreamer::pipeline_eos_handler), loop.get());
   gst_object_unref(bus);
 
+  struct InterruptData {
+    const std::function<bool()> *test;
+    GMainLoop *loop;
+  } interrupt{&interrupted, loop.get()};
+  auto timer = g_timeout_source_new(50);
+  g_source_set_callback(
+      timer,
+      [](gpointer data) -> gboolean {
+        auto state = static_cast<InterruptData *>(data);
+        if (*state->test && (*state->test)())
+          g_main_loop_quit(state->loop);
+        return G_SOURCE_CONTINUE;
+      },
+      &interrupt,
+      nullptr);
+  g_source_attach(timer, context.get());
+  auto cleanup = [&] {
+    gst_element_set_state(pipeline.get(), GST_STATE_NULL);
+    if (on_stopped)
+      on_stopped(pipeline);
+    g_source_destroy(timer);
+    g_source_unref(timer);
+    auto bus = gst_pipeline_get_bus(GST_PIPELINE(pipeline.get()));
+    gst_bus_remove_signal_watch(bus);
+    gst_bus_set_sync_handler(bus, nullptr, nullptr, nullptr);
+    gst_object_unref(bus);
+    g_main_context_pop_thread_default(context.get());
+  };
+
   /* Set the pipeline to "playing" state*/
-  gst_element_set_state(pipeline.get(), GST_STATE_PLAYING);
+  if (gst_element_set_state(pipeline.get(), GST_STATE_PLAYING) == GST_STATE_CHANGE_FAILURE) {
+    cleanup();
+    return false;
+  }
   GST_DEBUG_BIN_TO_DOT_FILE_WITH_TS(reinterpret_cast<GstBin *>(pipeline.get()),
                                     GST_DEBUG_GRAPH_SHOW_ALL,
                                     "pipeline-start");
@@ -109,7 +146,7 @@ static bool run_pipeline(
   /* Out of the main loop, clean up nicely */
   gst_element_set_state(pipeline.get(), GST_STATE_PAUSED);
   gst_element_set_state(pipeline.get(), GST_STATE_READY);
-  gst_element_set_state(pipeline.get(), GST_STATE_NULL);
+  cleanup();
 
   return true;
 }

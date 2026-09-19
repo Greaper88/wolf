@@ -1,7 +1,11 @@
 #pragma once
 
+#include "gst-video-context.hpp"
+#include <gpu/runtime.hpp>
+
 #define BOOST_THREAD_PROVIDES_FUTURE_CONTINUATION
 #define BOOST_THREAD_PROVIDES_FUTURE
+#include <atomic>
 #include <boost/thread.hpp>
 #include <boost/thread/future.hpp>
 #include <core/audio.hpp>
@@ -70,6 +74,11 @@ struct App {
   std::string av1_gst_pipeline;
 
   std::string render_node;
+  // Eligibility only: environment overrides and runtime capability checks still take precedence.
+  // False by default preserves explicit nodes from legacy API clients.
+  bool gpu_auto_select = false;
+  std::optional<wolf::config::BaseAppVideoOverride> video;
+  std::optional<wolf::config::BaseAppAudioOverride> audio;
 
   std::string opus_gst_pipeline;
   bool start_virtual_compositor;
@@ -96,10 +105,26 @@ struct Profile {
  */
 constexpr std::string_view MOONLIGHT_PROFILE_ID = "moonlight-profile-id";
 
+// App ownership is independent of a viewer's current encoder. The route is shared across protocol copies.
+struct GpuStreamTarget {
+  std::shared_ptr<const wolf::gpu::Runtime::Launch> launch;
+  std::shared_ptr<immer::atom<gst_video_context::gst_context_ptr>> context;
+  std::array<std::string, 3> pipelines;
+  std::string producer;
+};
+struct GpuStreamRoute {
+  std::shared_ptr<const GpuStreamTarget> home;
+  std::atomic<std::shared_ptr<const GpuStreamTarget>> target;
+  std::shared_ptr<wolf::gpu::Runtime> runtime;
+  std::atomic<int> codec{0};
+  std::atomic<bool> streaming{false};
+};
 struct Lobby {
   const std::string id;
   const std::string name;
   const std::string started_by_profile_id;
+  std::string runner_state_folder;
+  std::shared_ptr<const GpuStreamTarget> gpu_target;
   std::optional<std::string> icon_png_path;
   const bool multi_user;
   /**
@@ -152,6 +177,7 @@ struct AudioSettings {
 };
 
 struct CreateLobbyEvent {
+  rfl::Skip<std::shared_ptr<const GpuStreamTarget>> gpu_target;
   const std::string id;
   std::string profile_id;
   const std::string name;
@@ -178,6 +204,7 @@ struct CreateLobbyEvent {
 };
 
 struct JoinLobbyEvent {
+  std::optional<std::string> profile_id;
   const std::string lobby_id;
   const std::size_t moonlight_session_id;
   std::optional<std::vector<short>> pin = std::nullopt;
@@ -238,7 +265,14 @@ enum class ColorSpace : int {
 /**
  * A VideoSession is created after the param exchange over RTSP
  */
+struct GpuEncoderFailed {
+  std::string device_id;
+};
+
 struct VideoSession {
+  rfl::Skip<std::shared_ptr<GpuStreamRoute>> gpu_route;
+  rfl::Skip<std::shared_ptr<const wolf::gpu::Runtime::Launch>> gpu_launch;
+  rfl::Skip<std::shared_ptr<immer::atom<gst_video_context::gst_context_ptr>>> video_context;
   wolf::core::virtual_display::DisplayMode display_mode;
   std::string gst_pipeline;
   std::string render_node;
@@ -338,6 +372,7 @@ using EventBusHandlers = dp::handler_registration<immer::box<PlugDeviceEvent>,
                                                   immer::box<PairSignal>,
                                                   immer::box<UnplugDeviceEvent>,
                                                   immer::box<StreamSession>,
+                                                  immer::box<GpuEncoderFailed>,
                                                   immer::box<VideoSession>,
                                                   immer::box<AudioSession>,
                                                   immer::box<IDRRequestEvent>,
@@ -359,6 +394,7 @@ using EventBusType = dp::event_bus<immer::box<PlugDeviceEvent>,
                                    immer::box<PairSignal>,
                                    immer::box<UnplugDeviceEvent>,
                                    immer::box<StreamSession>,
+                                   immer::box<GpuEncoderFailed>,
                                    immer::box<VideoSession>,
                                    immer::box<AudioSession>,
                                    immer::box<IDRRequestEvent>,
@@ -380,6 +416,7 @@ using EventsVariant = std::variant<immer::box<PlugDeviceEvent>,
                                    immer::box<PairSignal>,
                                    immer::box<UnplugDeviceEvent>,
                                    immer::box<StreamSession>,
+                                   immer::box<GpuEncoderFailed>,
                                    immer::box<VideoSession>,
                                    immer::box<AudioSession>,
                                    immer::box<IDRRequestEvent>,
@@ -413,6 +450,13 @@ struct StreamSession {
   std::shared_ptr<App> app;
   std::string app_local_state_folder;
   std::string app_host_state_folder;
+
+  // Populated by launch admission; absent for legacy/manual sessions.
+  std::shared_ptr<GpuStreamRoute> gpu_route;
+  std::optional<wolf::gpu::SessionGpu> gpu;
+  std::shared_ptr<const wolf::gpu::Runtime::Launch> gpu_launch;
+  std::shared_ptr<immer::atom<gst_video_context::gst_context_ptr>> video_context =
+      std::make_shared<immer::atom<gst_video_context::gst_context_ptr>>();
 
   // gcm encryption keys
   std::string aes_key;

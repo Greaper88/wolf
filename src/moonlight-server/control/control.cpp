@@ -156,6 +156,20 @@ void run_control(int port,
         logs::log(logs::debug, "[ENET] Client not found for session: {}", ev->session_id);
       });
 
+  auto pause_ev = event_bus->register_handler<immer::box<PauseStreamEvent>>(
+      [&connected_clients](const immer::box<PauseStreamEvent> &ev) {
+        auto terminate_pkt = ControlTerminatePacket{};
+        std::string plaintext = {(char *)&terminate_pkt, sizeof(terminate_pkt)};
+        for (auto &[peer, session] : *connected_clients.load()) {
+          if (session->session_id == ev->session_id) {
+            immer::box<std::shared_ptr<ENetPeer>> enet_client = {to_shared_ptr(peer)};
+            encrypt_and_send(plaintext, session->aes_key, enet_client);
+            return;
+          }
+        }
+        logs::log(logs::debug, "[ENET] Client not found for session: {}", ev->session_id);
+      });
+
   while (true) {
     if (enet_host_service(host.get(), &event, timeout.count()) > 0) {
       auto [client_ip, client_port] = get_ip((sockaddr *)&event.peer->address.address);

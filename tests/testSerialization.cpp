@@ -4,6 +4,7 @@
 #include <events/reflectors.hpp>
 #include <rfl.hpp>
 #include <rfl/json.hpp>
+#include <rfl/toml.hpp>
 
 using Catch::Matchers::Equals;
 using namespace wolf::core;
@@ -60,3 +61,42 @@ TEST_CASE("Serialize to JSON", "[serialization]") {
 //     REQUIRE(result.value().age == 45);
 //   }
 // }
+TEST_CASE("App GPU intent survives API and TOML round trips", "[serialization][gpu]") {
+  auto bus = std::make_shared<events::EventBusType>();
+  events::App app{
+      .base = {.title = "GPU app", .id = "gpu-app"},
+      .render_node = "/dev/dri/renderD129",
+      .gpu_auto_select = true,
+      .video = wolf::config::BaseAppVideoOverride{.source = "custom-source", .h264_encoder = "custom-encoder"},
+      .audio = wolf::config::BaseAppAudioOverride{.source = "custom-audio"},
+      .start_virtual_compositor = true,
+      .start_audio_server = true,
+      .runner = state::get_runner(wolf::config::AppCMD{.run_cmd = "true"}, bus)};
+
+  SECTION("Automatic apps do not persist a resolved device") {
+    auto wire = rfl::json::read<rfl::Reflector<events::App>::ReflType>(rfl::json::write(app)).value();
+    REQUIRE(wire.gpu_auto_select == true);
+    auto restored = rfl::Reflector<events::App>::to(wire, bus);
+    auto saved = state::serialise_app(restored);
+    auto persisted = rfl::toml::read<wolf::config::BaseApp>(rfl::toml::write(saved)).value();
+    REQUIRE_FALSE(persisted.render_node.has_value());
+    REQUIRE(persisted.video->source == "custom-source");
+    REQUIRE(persisted.video->h264_encoder == "custom-encoder");
+    REQUIRE(persisted.audio->source == "custom-audio");
+  }
+
+  SECTION("Explicit per-app devices remain pinned") {
+    app.gpu_auto_select = false;
+    auto saved = state::serialise_app(app);
+    REQUIRE(saved.render_node == "/dev/dri/renderD129");
+  }
+
+  SECTION("Legacy API clients retain explicit node semantics") {
+    auto wire = rfl::Reflector<events::App>::from(app);
+    wire.gpu_auto_select.reset();
+    auto legacy = rfl::json::read<rfl::Reflector<events::App>::ReflType>(rfl::json::write(wire)).value();
+    auto restored = rfl::Reflector<events::App>::to(legacy, bus);
+    REQUIRE_FALSE(restored.gpu_auto_select);
+    REQUIRE(state::serialise_app(restored).render_node == "/dev/dri/renderD129");
+  }
+}

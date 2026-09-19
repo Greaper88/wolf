@@ -44,6 +44,8 @@ FetchContent_Declare(
         reflect-cpp
         GIT_REPOSITORY https://github.com/getml/reflect-cpp
         GIT_TAG v0.21.0
+        # Its only submodule is vcpkg, which is disabled below.
+        GIT_SUBMODULES ""
 )
 set(REFLECTCPP_USE_VCPKG OFF)
 
@@ -132,6 +134,7 @@ target_include_directories(wolf_runner PUBLIC .)
 
 file(GLOB HEADER_LIST CONFIGURE_DEPENDS */*.hpp)
 file(GLOB SRC_LIST SRCS
+        gpu/*.cpp
         api/*.cpp
         audio/*.cpp
         control/*.cpp

@@ -12,10 +12,14 @@ export WOLF_CFG_FILE=$WOLF_CFG_FOLDER/config.toml
 export WOLF_PRIVATE_KEY_FILE=$WOLF_CFG_FOLDER/key.pem
 export WOLF_PRIVATE_CERT_FILE=$WOLF_CFG_FOLDER/cert.pem
 
-# Set default values for environment variables
-export WOLF_RENDER_NODE=${WOLF_RENDER_NODE:-/dev/dri/renderD128}
-export WOLF_ENCODER_NODE=${WOLF_ENCODER_NODE:-$WOLF_RENDER_NODE}
-export GST_GL_DRM_DEVICE=${GST_GL_DRM_DEVICE:-$WOLF_ENCODER_NODE}
+# Preserve explicit GPU pins. Unset nodes let Wolf verify and select GPUs automatically;
+# injecting renderD128 here would be indistinguishable from an operator's manual override.
+if [ -n "${WOLF_RENDER_NODE:-}" ]; then
+    export WOLF_ENCODER_NODE=${WOLF_ENCODER_NODE:-$WOLF_RENDER_NODE}
+fi
+if [ -n "${WOLF_ENCODER_NODE:-}" ]; then
+    export GST_GL_DRM_DEVICE=${GST_GL_DRM_DEVICE:-$WOLF_ENCODER_NODE}
+fi
 
 # Update fake-udev if missing from the path
 export WOLF_DOCKER_FAKE_UDEV_PATH=${WOLF_DOCKER_FAKE_UDEV_PATH:-$HOST_APPS_STATE_FOLDER/fake-udev}

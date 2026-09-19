@@ -177,5 +177,17 @@ void update_client_settings(const Config &cfg, std::size_t client_id, const Pair
  * Replaces the currently loaded profiles
  * Side effects: will save back the configuration to disk
  */
+// Persist operator intent, never the node/pipelines resolved for a particular session.
+inline BaseApp serialise_app(const events::App &app) {
+  return BaseApp{.title = app.base.title,
+                 .icon_png_path = app.base.icon_png_path,
+                 .render_node = app.gpu_auto_select ? std::nullopt : std::make_optional(app.render_node),
+                 .video = app.video,
+                 .audio = app.audio,
+                 .start_virtual_compositor = app.start_virtual_compositor,
+                 .start_audio_server = app.start_audio_server,
+                 .runner = app.runner->serialize()};
+}
+
 void update_profiles(const Config &cfg, const ProfilesList &profiles);
 } // namespace state

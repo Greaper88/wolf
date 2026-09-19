@@ -170,6 +170,8 @@ announce(const RTSP_PACKET &req, const events::StreamSession &session) {
   bool video_format_hevc = args["x-nv-vqos[0].bitStreamFormat"].value_or(0) == 1;
   bool video_format_av1 = args["x-nv-vqos[0].bitStreamFormat"].value_or(0) == 2;
   auto csc = args["x-nv-video[0].encoderCscMode"].value_or(0);
+  if (session.gpu_route)
+    session.gpu_route->codec.store(video_format_av1 ? 2 : video_format_hevc ? 1 : 0);
 
   // Video session
   moonlight::DisplayMode display = {.width = args["x-nv-video[0].clientViewportWd"].value(),
@@ -188,6 +190,10 @@ announce(const RTSP_PACKET &req, const events::StreamSession &session) {
   } else {
     logs::log(logs::debug, "[RTSP] Moonlight requested video format H264");
     gst_pipeline = session.app->h264_gst_pipeline;
+  }
+
+  if (gst_pipeline.empty()) {
+    return error_msg(400, "Unsupported codec for selected GPU", req.seq_number);
   }
 
   auto audio_channels = args["x-nv-audio.surround.numChannels"].value_or(session.audio_channel_count);
@@ -217,6 +223,9 @@ announce(const RTSP_PACKET &req, const events::StreamSession &session) {
 
   // Video session
   events::VideoSession video = {
+      .gpu_route = session.gpu_route,
+      .gpu_launch = session.gpu_launch,
+      .video_context = session.video_context,
       .display_mode = {.width = display.width, .height = display.height, .refreshRate = display.refreshRate},
       .gst_pipeline = gst_pipeline,
       .render_node = session.app->render_node,

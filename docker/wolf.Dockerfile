@@ -54,10 +54,13 @@ WORKDIR /wolf
 
 ENV CCACHE_DIR=/cache/ccache
 ENV CMAKE_BUILD_DIR=/cache/cmake-build
+ARG WOLF_BUILD_JOBS=4
 RUN --mount=type=cache,target=/cache/ccache \
+    --mount=type=cache,target=/cache/cmake-build,sharing=locked \
     cmake -B$CMAKE_BUILD_DIR \
     -DCMAKE_BUILD_TYPE=RelWithDebInfo \
-    -DCMAKE_CXX_STANDARD=17 \
+    -DFETCHCONTENT_UPDATES_DISCONNECTED=ON \
+    -DCMAKE_CXX_STANDARD=20 \
     -DCMAKE_CXX_EXTENSIONS=OFF \
     -DCMAKE_CXX_FLAGS="-Wno-missing-template-arg-list-after-template-kw" \
     -DBUILD_SHARED_LIBS=OFF \
@@ -65,8 +68,11 @@ RUN --mount=type=cache,target=/cache/ccache \
     -DBUILD_FAKE_UDEV_CLI=ON \
     -DBUILD_TESTING=OFF \
     -G Ninja && \
-    ninja -C $CMAKE_BUILD_DIR wolf && \
-    ninja -C $CMAKE_BUILD_DIR fake-udev && \
+    # COPY can preserve source timestamps older than cached objects. Clean object outputs;
+    # ccache still reuses unchanged compilation while dependency downloads stay cached.
+    ninja -C $CMAKE_BUILD_DIR -t clean && \
+    ninja -C $CMAKE_BUILD_DIR -j "$WOLF_BUILD_JOBS" wolf && \
+    ninja -C $CMAKE_BUILD_DIR -j "$WOLF_BUILD_JOBS" fake-udev && \
     # We have to copy out the built executables because this will only be available inside the buildkit cache
     cp $CMAKE_BUILD_DIR/src/moonlight-server/wolf /wolf/wolf && \
     cp $CMAKE_BUILD_DIR/src/fake-udev/fake-udev /wolf/fake-udev
@@ -129,7 +135,6 @@ ENV GST_GL_API=gles2 \
     WOLF_PRIVATE_KEY_FILE=$WOLF_CFG_FOLDER/key.pem \
     WOLF_PRIVATE_CERT_FILE=$WOLF_CFG_FOLDER/cert.pem \
     WOLF_PULSE_IMAGE=ghcr.io/games-on-whales/pulseaudio:master \
-    WOLF_RENDER_NODE=/dev/dri/renderD128 \
     WOLF_STOP_CONTAINER_ON_EXIT=TRUE \
     WOLF_WAYLAND_SOCKET_WAIT_TIMEOUT_MS=5000 \
     WOLF_DOCKER_SOCKET=/var/run/docker.sock \
