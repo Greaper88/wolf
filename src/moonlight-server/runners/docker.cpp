@@ -1,3 +1,4 @@
+#include <gpu/app_isolation.hpp>
 #include <runners/docker.hpp>
 
 namespace wolf::core::docker {
@@ -40,8 +41,11 @@ void RunDocker::run(std::string_view session_id,
                     const immer::map<std::string, std::string> &env_variables,
                     std::string_view render_node) {
 
+  const bool isolate_mesa = env_variables.find("DRI_PRIME") != nullptr;
   std::vector<std::string> full_env;
   full_env.insert(full_env.end(), this->container.env.begin(), this->container.env.end());
+  if (isolate_mesa)
+    std::erase_if(full_env, wolf::gpu::mesa_selection_env);
   for (const auto &env_var : env_variables) {
     full_env.push_back(fmt::format("{}={}", env_var.first, env_var.second));
   }
@@ -175,6 +179,74 @@ void RunDocker::run(std::string_view session_id,
       final_json_opts = boost::json::serialize(parsed_json);
     } else {
       logs::log(logs::warning, "[DOCKER] Failed to get major numbers for hidraw and input");
+    }
+  }
+
+  if (isolate_mesa) {
+    try {
+      // Device nodes are the enforcement boundary; Mesa settings keep normal apps'
+      // enumeration aligned. Do not silently accept overrides that expose other GPUs.
+      auto options = utils::parse_json(final_json_opts).as_object();
+      const auto allowed = linked_devices(render_node);
+      auto error = [&]() -> std::string {
+        if (allowed.empty())
+          return "selected GPU has no device nodes";
+        for (const auto &device : devices)
+          if (!wolf::gpu::allowed_graphics_device(device.path_on_host, device.path_in_container, allowed))
+            return "extra or remapped GPU device: " + device.path_on_host;
+        for (const auto &mount : mounts)
+          if (wolf::gpu::graphics_mount(mount.source) || wolf::gpu::graphics_mount(mount.destination))
+            return "GPU device bind mount: " + mount.source;
+        if (auto config = options.if_contains("HostConfig")) {
+          const auto &host = config->as_object();
+          if (auto privileged = host.if_contains("Privileged"); privileged && privileged->as_bool())
+            return "privileged mode exposes all GPUs";
+          for (const auto *key : {"DeviceRequests", "VolumesFrom"})
+            if (auto value = host.if_contains(key); value && !value->as_array().empty())
+              return std::string(key) + " can bypass per-app GPU device selection";
+          if (auto extra = host.if_contains("Devices"))
+            for (const auto &entry : extra->as_array()) {
+              const auto &device = entry.as_object();
+              if (!wolf::gpu::allowed_graphics_device(device.at("PathOnHost").as_string().c_str(),
+                                                      device.at("PathInContainer").as_string().c_str(),
+                                                      allowed))
+                return "additional GPU device in HostConfig.Devices";
+            }
+          if (auto binds = host.if_contains("Binds"))
+            for (const auto &entry : binds->as_array()) {
+              auto parts = utils::split(entry.as_string().c_str(), ':');
+              if (parts.size() < 2 || wolf::gpu::graphics_mount(parts[0]) || wolf::gpu::graphics_mount(parts[1]))
+                return "GPU device bind mount in HostConfig.Binds";
+            }
+          if (auto mounts = host.if_contains("Mounts"))
+            for (const auto &entry : mounts->as_array()) {
+              const auto &mount = entry.as_object();
+              for (const auto *key : {"Source", "Target"})
+                if (auto value = mount.if_contains(key); value && wolf::gpu::graphics_mount(value->as_string().c_str()))
+                  return "GPU device bind mount in HostConfig.Mounts";
+            }
+          if (auto rules = host.if_contains("DeviceCgroupRules"))
+            for (const auto &entry : rules->as_array())
+              if (wolf::gpu::broad_graphics_rule(entry.as_string().c_str()))
+                return "GPU-wide device cgroup rule";
+        }
+        return {};
+      }();
+      if (!error.empty()) {
+        logs::log(logs::error, "[GPU] Refusing app {}: {}. Expose only the selected GPU nodes.", session_id, error);
+        return;
+      }
+      if (auto env = options.if_contains("Env")) {
+        json::array filtered;
+        for (const auto &value : env->as_array())
+          if (!wolf::gpu::mesa_selection_env(value.as_string().c_str()))
+            filtered.push_back(value);
+        options["Env"] = std::move(filtered);
+      }
+      final_json_opts = json::serialize(options);
+    } catch (const std::exception &error) {
+      logs::log(logs::error, "[GPU] Refusing app {}: invalid isolation configuration: {}", session_id, error.what());
+      return;
     }
   }
 

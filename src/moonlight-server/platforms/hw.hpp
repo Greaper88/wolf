@@ -1,5 +1,6 @@
 #pragma once
 
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -31,3 +32,6 @@ GPU_VENDOR get_vendor(std::string_view gpu);
 std::string get_vendor_name(GPU_VENDOR vendor);
 
 std::string get_mac_address(std::string_view local_ip);
+
+// Resolve the selected DRM device to its physical PCI identity.
+std::optional<std::string> get_gpu_pci_id(std::string_view render_node);

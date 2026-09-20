@@ -94,16 +94,27 @@ std::optional<std::string> get_nvidia_node(std::string_view primary_node) {
  */
 std::shared_ptr<drmDevice> drm_open_device(std::string_view device) {
   auto render_node_fd = open(device.data(), O_RDWR | O_CLOEXEC);
+  if (render_node_fd < 0)
+    throw std::runtime_error(fmt::format("Unable to open DRM device {}: {}", device, strerror(errno)));
   drmDevice *dev = nullptr;
   auto ret = drmGetDevice2(render_node_fd, 0, &dev);
   if (ret < 0) {
+    close(render_node_fd);
     throw std::runtime_error(fmt::format("Error during drmGetDevice for {}, {}", device, strerror(-ret)));
   }
 
-  return {dev, [&render_node_fd](auto dev) {
+  return {dev, [render_node_fd](auto dev) {
             drmFreeDevice(&dev);
             close(render_node_fd);
           }};
+}
+
+std::optional<std::string> get_gpu_pci_id(std::string_view render_node) {
+  auto device = drm_open_device(render_node);
+  if (device->bustype != DRM_BUS_PCI || !device->businfo.pci)
+    return {};
+  const auto &pci = *device->businfo.pci;
+  return fmt::format("{:04x}:{:02x}:{:02x}.{:x}", pci.domain, pci.bus, pci.dev, pci.func);
 }
 
 void add_character_device(std::vector<std::string> &devices, std::string_view path, bool optional = false) {

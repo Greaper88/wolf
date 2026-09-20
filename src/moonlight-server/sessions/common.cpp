@@ -1,3 +1,4 @@
+#include <gpu/app_isolation.hpp>
 #include <immer/array_transient.hpp>
 #include <immer/map_transient.hpp>
 #include <platforms/hw.hpp>
@@ -54,6 +55,19 @@ void start_runner(std::shared_ptr<events::Runner> runner,
   std::copy(additional_devices.begin(), additional_devices.end(), std::back_inserter(all_devices));
 
   auto gpu_vendor = get_vendor(render_node);
+  if (gpu_vendor == AMD || gpu_vendor == INTEL) {
+    auto pci = get_gpu_pci_id(render_node);
+    auto prime = pci ? wolf::gpu::mesa_prime_selector(*pci) : std::nullopt;
+    if (!prime) {
+      logs::log(logs::error, "[GPU] Cannot isolate app {}: missing PCI identity for {}", args->session_id, render_node);
+      return;
+    }
+    full_env.set("DRI_PRIME", *prime);
+    // Clear a potentially conflicting image-level vendor/device preference.
+    full_env.set("MESA_VK_DEVICE_SELECT", "");
+    full_env.set("MESA_VK_DEVICE_SELECT_FORCE_DEFAULT_DEVICE", "1");
+    logs::log(logs::info, "[GPU] App {} pinned to {} (DRI_PRIME={})", args->session_id, render_node, *prime);
+  }
   if (gpu_vendor == NVIDIA) {
     if (auto driver_volume = utils::get_env("NVIDIA_DRIVER_VOLUME_NAME")) {
       logs::log(logs::info, "Mounting nvidia driver {}:/usr/nvidia", driver_volume);

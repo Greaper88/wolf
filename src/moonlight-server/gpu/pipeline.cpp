@@ -23,7 +23,16 @@ std::string bind_pipeline(const EncoderBinding &binding,
       continue;
     auto end = entry.pipeline.find_first_of(" \t\r\n!", first);
     auto factory = entry.pipeline.substr(first, end - first);
-    if (factory != generic && factory != binding.factory)
+    // Saved configurations may contain a VA factory resolved for another GPU.
+    // Rebind only the same codec and normal/low-power family; retain its properties.
+    const std::string prefix = "varenderD";
+    const std::string suffix = codec + (low_power ? "lpenc" : "enc");
+    bool same_family = false;
+    if (factory.starts_with(prefix) && factory.ends_with(suffix) && factory.size() > prefix.size() + suffix.size()) {
+      const auto node = factory.substr(prefix.size(), factory.size() - prefix.size() - suffix.size());
+      same_family = node.find_first_not_of("0123456789") == std::string::npos;
+    }
+    if (factory != generic && factory != binding.factory && !same_family)
       continue;
     auto encoder = entry.pipeline;
     encoder.replace(first, factory.size(), binding.factory);

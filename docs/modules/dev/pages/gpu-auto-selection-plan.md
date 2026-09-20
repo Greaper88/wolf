@@ -2,6 +2,11 @@
 
 ## Implemented
 
+Mesa app runners receive a PCI-address `DRI_PRIME` selector with Vulkan's `!` suffix, independently
+for each launcher/sub-app. Docker overrides are checked against the selected device's linked DRM
+nodes and conflicting Mesa environment entries are replaced. Broad GPU exposure is rejected.
+Process runners receive environment selection only. Existing containers must be recreated to adopt it.
+
 Wolf verifies each eligible device's hardware codecs at startup/in the background using bounded
 subprocess probes. Launches use cached capabilities plus fresh load measurements; they do not run
 another test encode. Each session carries its selected device, verified encoder factories and video

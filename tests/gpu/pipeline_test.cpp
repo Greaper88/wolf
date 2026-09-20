@@ -29,6 +29,21 @@ int main() {
   check(result.find("lpenc") == std::string::npos, "normal encoder never inherits low-power template");
   check(result.find("width={width}") != std::string::npos && result.find("h264parse ! appsink") != std::string::npos,
         "format placeholders and configured parser are preserved");
+  for (auto [codec, name] : {std::pair{Codec::h264, "h264"}, {Codec::hevc, "h265"}, {Codec::av1, "av1"}}) {
+    for (const auto *mode : {"enc", "lpenc"}) {
+      const auto suffix = std::string(name) + mode;
+      EncoderBinding target{"varenderD130" + suffix, "va", codec, "/dev/dri/renderD130", {}};
+      auto rebound =
+          bind_pipeline(target, {{"va", "varenderD129" + suffix + " bitrate={bitrate} ! parser"}}, "source", "sink");
+      check(rebound.find(target.factory + " bitrate={bitrate} ! parser") != std::string::npos,
+            "saved device-specific template binds to selected GPU and retains properties");
+      check(rebound.find("renderD129") == std::string::npos, "previous GPU is not retained");
+    }
+  }
+  for (const auto *wrong :
+       {"varenderD129h265enc", "varenderD129h264lpenc", "varenderDh264enc", "varenderDfoo129h264enc"})
+    rejects([&] { bind_pipeline(binding, {{"va", wrong}}, "source", "sink"); },
+            "rebind rejects different codec, power mode and invalid device factory");
   binding.factory = "varenderD130h264lpenc";
   check(bind_pipeline(binding, templates, "source", "sink").find(binding.factory) != std::string::npos,
         "low-power factory uses matching template");

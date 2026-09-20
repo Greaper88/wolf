@@ -61,3 +61,8 @@ target_include_directories(gpu_pipeline_tests PRIVATE ${GPU}/..)
 target_link_libraries(gpu_pipeline_tests PRIVATE Threads::Threads)
 target_compile_options(gpu_pipeline_tests PRIVATE -Wall -Wextra -Wpedantic)
 add_test(NAME gpu_pipeline_tests COMMAND gpu_pipeline_tests)
+
+add_executable(gpu_app_isolation_tests app_isolation_test.cpp)
+target_include_directories(gpu_app_isolation_tests PRIVATE ${GPU}/..)
+target_compile_options(gpu_app_isolation_tests PRIVATE -Wall -Wextra -Wpedantic)
+add_test(NAME gpu_app_isolation_tests COMMAND gpu_app_isolation_tests)
