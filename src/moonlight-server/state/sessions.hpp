@@ -117,6 +117,12 @@ inline std::shared_ptr<events::StreamSession> create_stream_session(immer::box<s
       .audio_stream_port = static_cast<unsigned short>(get_port(AUDIO_PING_PORT)),
       .control_stream_port = static_cast<unsigned short>(get_port(CONTROL_PORT))};
 
+  auto home = std::make_shared<events::GpuStreamTarget>();
+  home->render_node = run_app.render_node;
+  home->pipelines = {run_app.h264_gst_pipeline, run_app.hevc_gst_pipeline, run_app.av1_gst_pipeline};
+  home->producer = std::to_string(session.session_id);
+  session.gpu_route->home = home;
+  session.gpu_route->target.store(home);
   return std::make_shared<events::StreamSession>(session);
 }
 

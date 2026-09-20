@@ -19,6 +19,10 @@ struct GstVideoContext {
   GstContext *context;
 };
 
+bool supports_cuda() {
+  return true;
+}
+
 bool init() {
   return gst_cuda_load_library();
 }
@@ -26,7 +30,7 @@ bool init() {
 namespace fs = std::filesystem;
 
 std::optional<std::string> getPciBusIdFromDri(const fs::path &driPath) {
-  struct stat st {};
+  struct stat st{};
   if (stat(driPath.c_str(), &st) != 0) {
     return std::nullopt;
   }
@@ -155,8 +159,8 @@ bool set_context(gst_context_ptr context, GstMessage *msg) {
   return false;
 }
 
-cuda_context_ptr create_cuda_context(const std::string &device_path) {
-  auto device_id = getCudaDeviceFromDri(device_path).value_or(0);
+cuda_context_ptr create_cuda_context(const std::string &device_path, std::optional<unsigned int> cuda_device) {
+  auto device_id = cuda_device ? static_cast<int>(*cuda_device) : getCudaDeviceFromDri(device_path).value_or(0);
   logs::log(logs::info, "Creating CUDA context for device {} (detected CUDA device ID: {})", device_path, device_id);
   auto cuda_ctx = gst_cuda_context_new(device_id);
   if (cuda_ctx) {
@@ -166,14 +170,15 @@ cuda_context_ptr create_cuda_context(const std::string &device_path) {
   return nullptr;
 }
 
-gst_context_ptr need_context_for_device(const std::string &device_path, GstMessage *msg) {
+gst_context_ptr
+need_context_for_device(const std::string &device_path, GstMessage *msg, std::optional<unsigned int> cuda_device) {
   if (GST_MESSAGE_TYPE(msg) == GST_MESSAGE_NEED_CONTEXT) {
     const gchar *context_type;
     gst_message_parse_context_type(msg, &context_type);
 
     logs::log(logs::debug, "Received NEED_CONTEXT for type {}", context_type);
     if (g_strcmp0(context_type, GST_CUDA_CONTEXT_TYPE) == 0) {
-      if (auto cuda_context = create_cuda_context(device_path)) {
+      if (auto cuda_context = create_cuda_context(device_path, cuda_device)) {
         auto context = gst_context_new_cuda_context(cuda_context.get());
         gst_element_set_context(GST_ELEMENT(GST_MESSAGE_SRC(msg)), context);
         logs::log(logs::debug, "Created CUDA context for device: {}", device_path);

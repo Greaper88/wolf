@@ -100,7 +100,7 @@ setup_moonlight_handlers(const immer::box<state::AppState> &app_state,
           logs::log(logs::debug, "[STREAM_SESSION] Create wayland compositor");
 
           // Start Gstreamer producer pipeline
-          std::thread([session, on_ready, gst_context = app_state->gst_context]() {
+          std::thread([session, on_ready, gst_context = session->gpu_route->home->context]() {
             streaming::start_video_producer(std::to_string(session->session_id),
                                             session->app->video_producer_buffer_caps,
                                             session->app->render_node,

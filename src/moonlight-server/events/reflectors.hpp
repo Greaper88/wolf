@@ -140,6 +140,8 @@ template <> struct Reflector<events::StartRunner> {
 
 template <> struct Reflector<events::StreamSession> {
   struct ReflType {
+    int video_codec;
+    bool video_sdr_420;
     std::string client_ip;
 
     // gcm encryption keys
@@ -159,7 +161,9 @@ template <> struct Reflector<events::StreamSession> {
   };
 
   static ReflType from(const events::StreamSession &v) {
-    return {.client_ip = v.ip,
+    return {.video_codec = v.gpu_route->codec.load(),
+            .video_sdr_420 = v.gpu_route->sdr_420.load(),
+            .client_ip = v.ip,
             .aes_key = v.aes_key,
             .aes_iv = v.aes_iv,
             .rtsp_fake_ip = v.rtsp_fake_ip,

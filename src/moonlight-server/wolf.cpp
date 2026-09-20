@@ -9,6 +9,7 @@
 #include <csignal>
 #include <exceptions/exceptions.h>
 #include <filesystem>
+#include <gpu/probe_process.hpp>
 #include <immer/array_transient.hpp>
 #include <immer/map_transient.hpp>
 #include <immer/vector_transient.hpp>
@@ -116,7 +117,8 @@ auto initialize(std::string_view config_file, std::string_view pkey_filename, st
       .pairing_atom = std::make_shared<immer::atom<immer::map<std::string, immer::box<events::PairSignal>>>>(),
       .event_bus = event_bus,
       .lobbies = std::make_shared<immer::atom<immer::vector<events::Lobby>>>(),
-      .running_sessions = running_sessions};
+      .running_sessions = running_sessions,
+      .gpus = wolf::gpu::probe_inventory(config.gpu_video)};
   return immer::box<state::AppState>(state);
 }
 
@@ -277,6 +279,8 @@ void run() {
 }
 
 int main(int argc, char *argv[]) try {
+  if (argc > 1 && std::string_view(argv[1]) == "--wolf-gpu-probe")
+    return wolf::gpu::probe_child(argc, argv);
   logs::init(logs::parse_level(utils::get_env("WOLF_LOG_LEVEL", "INFO")));
   // Graceful termination: stop all sessions/lobbies before exiting (see run()).
   std::signal(SIGINT, graceful_shutdown_handler);

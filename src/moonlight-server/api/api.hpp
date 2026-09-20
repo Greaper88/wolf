@@ -120,7 +120,20 @@ struct StreamSessionHandleInputRequest {
       input_packet_hex;
 };
 
+struct GpuInfo {
+  wolf::gpu::Device device;
+  std::array<bool, 3> codecs; // H.264, HEVC, AV1; SDR 8-bit 4:2:0
+  unsigned int users = 0;     // Connected Wolf viewers, counted once on their current GPU
+  unsigned int apps = 0;      // Resident lobbies, including those with no viewers
+};
+struct GpusResponse {
+  bool success = true;
+  std::vector<GpuInfo> gpus;
+};
+
 struct CreateLobbyRequest {
+  std::optional<std::string> gpu_id;
+  std::optional<std::size_t> source_session_id;
   rfl::Description<"The profile that originally created the lobby", std::string> profile_id;
   std::string name;
   std::optional<std::string> icon_png_path;
@@ -213,6 +226,7 @@ private:
   void endpoint_StreamSessionStop(const HTTPRequest &req, std::shared_ptr<UnixSocket> socket);
   void endpoint_StreamSessionHandleInput(const HTTPRequest &req, std::shared_ptr<UnixSocket> socket);
 
+  void endpoint_Gpus(const HTTPRequest &req, std::shared_ptr<UnixSocket> socket);
   void endpoint_Lobbies(const HTTPRequest &req, std::shared_ptr<UnixSocket> socket);
   void endpoint_LobbyCreate(const HTTPRequest &req, std::shared_ptr<UnixSocket> socket);
   void endpoint_LobbyJoin(const HTTPRequest &req, std::shared_ptr<UnixSocket> socket);

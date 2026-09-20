@@ -112,6 +112,7 @@ TEST_CASE("Pair APIs", "[API]") {
       .pairing_cache = std::make_shared<immer::atom<immer::map<std::string, state::PairCache>>>(),
       .pairing_atom = std::make_shared<immer::atom<immer::map<std::string, immer::box<events::PairSignal>>>>(),
       .event_bus = event_bus,
+      .lobbies = std::make_shared<immer::atom<immer::vector<events::Lobby>>>(),
       .running_sessions = running_sessions});
 
   auto runtime_dir = api_runtime_dir();
@@ -129,6 +130,21 @@ TEST_CASE("Pair APIs", "[API]") {
   auto response = req(curl.get(), HTTPMethod::GET, "http://localhost/api/v1/pair/pending");
   REQUIRE(response);
   REQUIRE_THAT(response->second, Equals("{\"success\":true,\"requests\":[]}"));
+
+  auto gpus_response = req(curl.get(), HTTPMethod::GET, "http://localhost/api/v1/gpus");
+  REQUIRE(gpus_response);
+  REQUIRE(gpus_response->first == 200);
+  REQUIRE(rfl::json::read<GpusResponse>(gpus_response->second));
+  auto invalid_gpu = req(curl.get(), HTTPMethod::POST, "http://localhost/api/v1/lobbies/create", R"({
+    "gpu_id":"missing", "profile_id":"test", "name":"test", "multi_user":false, "stop_when_everyone_leaves":true,
+    "video_settings":{"width":1280,"height":720,"refresh_rate":60,"wayland_render_node":"",
+                      "runner_render_node":"","video_producer_buffer_caps":""},
+    "audio_settings":{"channel_count":2},"runner_state_folder":"test",
+    "runner":{"type":"process","run_cmd":"true"}
+  })");
+  REQUIRE(invalid_gpu);
+  REQUIRE(invalid_gpu->first == 400);
+  REQUIRE_THAT(invalid_gpu->second, ContainsSubstring("active source session"));
 
   // Checkout the list of paired clients (there will be one in the test config file)
   response = req(curl.get(), HTTPMethod::GET, "http://localhost/api/v1/clients");
@@ -222,6 +238,7 @@ TEST_CASE("APPs APIs", "[API]") {
       .pairing_cache = std::make_shared<immer::atom<immer::map<std::string, state::PairCache>>>(),
       .pairing_atom = std::make_shared<immer::atom<immer::map<std::string, immer::box<events::PairSignal>>>>(),
       .event_bus = event_bus,
+      .lobbies = std::make_shared<immer::atom<immer::vector<events::Lobby>>>(),
       .running_sessions = running_sessions});
 
   auto runtime_dir = api_runtime_dir();
@@ -302,6 +319,7 @@ TEST_CASE("Profile APIs", "[API]") {
       .pairing_cache = std::make_shared<immer::atom<immer::map<std::string, state::PairCache>>>(),
       .pairing_atom = std::make_shared<immer::atom<immer::map<std::string, immer::box<events::PairSignal>>>>(),
       .event_bus = event_bus,
+      .lobbies = std::make_shared<immer::atom<immer::vector<events::Lobby>>>(),
       .running_sessions = running_sessions});
 
   auto runtime_dir = api_runtime_dir();
@@ -385,6 +403,7 @@ TEST_CASE("Sessions APIs", "[API]") {
       .pairing_cache = std::make_shared<immer::atom<immer::map<std::string, state::PairCache>>>(),
       .pairing_atom = std::make_shared<immer::atom<immer::map<std::string, immer::box<events::PairSignal>>>>(),
       .event_bus = event_bus,
+      .lobbies = std::make_shared<immer::atom<immer::vector<events::Lobby>>>(),
       .running_sessions = running_sessions});
 
   auto runtime_dir = api_runtime_dir();
@@ -457,6 +476,7 @@ TEST_CASE("Session APIs without app_id or client_id", "[API]") {
       .pairing_cache = std::make_shared<immer::atom<immer::map<std::string, state::PairCache>>>(),
       .pairing_atom = std::make_shared<immer::atom<immer::map<std::string, immer::box<events::PairSignal>>>>(),
       .event_bus = event_bus,
+      .lobbies = std::make_shared<immer::atom<immer::vector<events::Lobby>>>(),
       .running_sessions = running_sessions});
 
   auto runtime_dir = api_runtime_dir();
@@ -779,6 +799,7 @@ TEST_CASE("SSE APIs", "[API]") {
       .pairing_cache = std::make_shared<immer::atom<immer::map<std::string, state::PairCache>>>(),
       .pairing_atom = std::make_shared<immer::atom<immer::map<std::string, immer::box<events::PairSignal>>>>(),
       .event_bus = event_bus,
+      .lobbies = std::make_shared<immer::atom<immer::vector<events::Lobby>>>(),
       .running_sessions = running_sessions});
 
   auto runtime_dir = api_runtime_dir();

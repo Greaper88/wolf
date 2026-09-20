@@ -17,6 +17,7 @@ namespace wolf::core::sessions {
 void leave_lobby(const std::shared_ptr<events::EventBusType> &ev_bus,
                  const events::Lobby &lobby,
                  const events::StreamSession &session) {
+  session.gpu_route->target.store(session.gpu_route->home);
   logs::log(logs::info, "[LOBBY] Session {} leaving lobby {}", session.session_id, lobby.id);
   // Remove the current session from the lobby list
   lobby.connected_sessions->update([session](const immer::vector<immer::box<std::string>> &connected_sessions) {
@@ -80,6 +81,8 @@ setup_lobbies_handlers(const immer::box<state::AppState> &app_state,
             events::Lobby{.id = lobby_settings->id,
                           .name = lobby_settings->name,
                           .started_by_profile_id = lobby_settings->profile_id,
+                          .render_node = lobby_settings->video_settings.wayland_render_node,
+                          .gpu_target = lobby_settings->gpu_target.get(),
                           .icon_png_path = lobby_settings->icon_png_path,
                           .multi_user = lobby_settings->multi_user,
                           .pin = lobby_settings->pin,
@@ -94,7 +97,11 @@ setup_lobbies_handlers(const immer::box<state::AppState> &app_state,
           std::shared_ptr<boost::promise<streaming::WaylandDisplayReady>> on_ready =
               std::make_shared<boost::promise<streaming::WaylandDisplayReady>>();
 
-          std::thread([lobby, lobby_settings, ev_bus, on_ready, gst_context = app_state->gst_context]() {
+          std::thread([lobby,
+                       lobby_settings,
+                       ev_bus,
+                       on_ready,
+                       gst_context = lobby->gpu_target ? lobby->gpu_target->context : app_state->gst_context]() {
             streaming::start_video_producer(lobby->id,
                                             lobby_settings->video_settings.video_producer_buffer_caps,
                                             lobby_settings->video_settings.wayland_render_node,
@@ -103,7 +110,8 @@ setup_lobbies_handlers(const immer::box<state::AppState> &app_state,
                                              .refreshRate = lobby_settings->video_settings.refresh_rate},
                                             gst_context,
                                             on_ready,
-                                            ev_bus);
+                                            ev_bus,
+                                            lobby->gpu_target ? lobby->gpu_target->cuda_device : std::nullopt);
           }).detach();
 
           auto w_display_ready = on_ready->get_future().then(
@@ -204,6 +212,20 @@ setup_lobbies_handlers(const immer::box<state::AppState> &app_state,
           join_lobby_event->error_message.get()->set_value("Lobby is full");
           return;
         }
+
+        if (lobby->gpu_target && (!session->gpu_route->sdr_420.load() ||
+                                  lobby->gpu_target->pipelines[session->gpu_route->codec.load()].empty())) {
+          join_lobby_event->error_message.get()->set_value("The selected GPU cannot encode this client's codec");
+          return;
+        }
+        auto target = lobby->gpu_target;
+        if (!target) {
+          auto legacy = session->gpu_route->home ? std::make_shared<events::GpuStreamTarget>(*session->gpu_route->home)
+                                                 : std::make_shared<events::GpuStreamTarget>();
+          legacy->producer = lobby->id;
+          target = legacy;
+        }
+        session->gpu_route->target.store(target);
 
         // Migrate joypads BEFORE adding the session to connected_sessions, or the relayed unplug races the queued plug
         events::JoypadList joypads = session->joypads->load();

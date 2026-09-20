@@ -22,10 +22,14 @@ set(SRC_LIST
         testMoonlight.cpp
         testRTSP.cpp
         testWolfAPI.cpp
+        testManualGpu.cpp
         testBatchedSend.cpp)
 
 option(TEST_RUST_WAYLAND "Test our custom Rust wayland compositor" ON)
 if (UNIX AND NOT APPLE)
+    # Opt-in hardware executable; not a CTest entry because CI may not expose DRM devices.
+    add_executable(manual_gpu_zero_copy_smoke EXCLUDE_FROM_ALL gpu/zero_copy_smoke.cpp)
+    target_link_libraries(manual_gpu_zero_copy_smoke PRIVATE wolf::runner)
     if (TEST_RUST_WAYLAND)
         find_package(PkgConfig)
         pkg_check_modules(wayland-client REQUIRED IMPORTED_TARGET wayland-client)
@@ -116,3 +120,17 @@ include(Catch)
 catch_discover_tests(wolftests
         PROPERTIES
         ENVIRONMENT "WOLF_SKIP_WAYLAND_SOCKET_WAIT=TRUE")
+
+if (UNIX AND NOT APPLE)
+    add_library(manual_gpu_fake_cuda SHARED gpu/fake_cuda.cpp)
+    set_target_properties(manual_gpu_fake_cuda PROPERTIES OUTPUT_NAME cuda SOVERSION 1)
+    add_executable(manual_gpu_encoder_tests gpu/encoder_probe_test.cpp)
+    pkg_get_variable(MANUAL_GPU_GST_PLUGIN_DIR gstreamer-1.0 pluginsdir)
+    target_compile_definitions(manual_gpu_encoder_tests PRIVATE GPU_TEST_PLUGIN_DIR="${MANUAL_GPU_GST_PLUGIN_DIR}")
+    target_link_libraries(manual_gpu_encoder_tests PRIVATE wolf::runner)
+    add_dependencies(manual_gpu_encoder_tests manual_gpu_fake_cuda)
+    add_test(NAME manual_gpu_encoder_tests COMMAND ${CMAKE_COMMAND} -E env
+        "LD_LIBRARY_PATH=$<TARGET_FILE_DIR:manual_gpu_fake_cuda>:$ENV{LD_LIBRARY_PATH}"
+        "GST_PLUGIN_PATH=" "GST_PLUGIN_SYSTEM_PATH=" "GST_REGISTRY=/tmp/wolf-manual-gpu-test-registry.bin"
+        $<TARGET_FILE:manual_gpu_encoder_tests>)
+endif ()

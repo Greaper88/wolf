@@ -1,6 +1,7 @@
 #pragma once
 
 #include "gst-video-context.hpp"
+#include <gpu/inventory.hpp>
 
 #include <boost/asio.hpp>
 #include <chrono>
@@ -80,6 +81,7 @@ struct Config {
   std::string config_source;
   bool support_hevc;
   bool support_av1;
+  wolf::config::GstVideoCfg gpu_video;
 
   /**
    * Mutable, paired_clients will be loaded up on startup
@@ -195,6 +197,7 @@ struct AppState {
    * A list of all currently running (and paused) streaming sessions
    */
   SessionsAtoms running_sessions;
+  std::vector<wolf::gpu::Capabilities> gpus;
 };
 
 const static immer::array<audio::AudioMode> AUDIO_CONFIGURATIONS = {

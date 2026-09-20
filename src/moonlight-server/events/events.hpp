@@ -1,4 +1,6 @@
 #pragma once
+#include "gst-video-context.hpp"
+#include <atomic>
 
 #define BOOST_THREAD_PROVIDES_FUTURE_CONTINUATION
 #define BOOST_THREAD_PROVIDES_FUTURE
@@ -96,10 +98,28 @@ struct Profile {
  */
 constexpr std::string_view MOONLIGHT_PROFILE_ID = "moonlight-profile-id";
 
+// Shared across protocol snapshots; changing a target never changes GPU policy.
+struct GpuStreamTarget {
+  std::optional<unsigned int> cuda_device;
+  std::string render_node;
+  std::array<std::string, 3> pipelines;
+  std::string producer;
+  std::shared_ptr<immer::atom<gst_video_context::gst_context_ptr>> context =
+      std::make_shared<immer::atom<gst_video_context::gst_context_ptr>>();
+};
+struct GpuStreamRoute {
+  std::shared_ptr<const GpuStreamTarget> home;
+  std::atomic<std::shared_ptr<const GpuStreamTarget>> target;
+  std::atomic<int> codec{0};
+  std::atomic<bool> sdr_420{true};
+  std::atomic<bool> streaming{false};
+};
 struct Lobby {
   const std::string id;
   const std::string name;
   const std::string started_by_profile_id;
+  std::string render_node;
+  std::shared_ptr<const GpuStreamTarget> gpu_target;
   std::optional<std::string> icon_png_path;
   const bool multi_user;
   /**
@@ -152,6 +172,7 @@ struct AudioSettings {
 };
 
 struct CreateLobbyEvent {
+  rfl::Skip<std::shared_ptr<const GpuStreamTarget>> gpu_target;
   const std::string id;
   std::string profile_id;
   const std::string name;
@@ -239,6 +260,7 @@ enum class ColorSpace : int {
  * A VideoSession is created after the param exchange over RTSP
  */
 struct VideoSession {
+  rfl::Skip<std::shared_ptr<GpuStreamRoute>> gpu_route;
   wolf::core::virtual_display::DisplayMode display_mode;
   std::string gst_pipeline;
   std::string render_node;
@@ -405,6 +427,7 @@ using EventsVariant = std::variant<immer::box<PlugDeviceEvent>,
  * can start working their magic.
  */
 struct StreamSession {
+  std::shared_ptr<GpuStreamRoute> gpu_route = std::make_shared<GpuStreamRoute>();
   moonlight::DisplayMode display_mode;
   int audio_channel_count;
 

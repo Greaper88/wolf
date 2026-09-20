@@ -1,6 +1,8 @@
 #include <api/api.hpp>
 #include <control/input_handler.hpp>
 #include <core/docker.hpp>
+#include <gpu/discovery.hpp>
+#include <gpu/encoder_probe.hpp>
 #include <rtp/udp-ping.hpp>
 #include <state/config.hpp>
 #include <state/sessions.hpp>
@@ -304,6 +306,10 @@ void UnixSocketServer::endpoint_StreamSessionStart(const HTTPRequest &req, std::
     if (auto session = state::get_session_by_id(sessions.get(), session_id)) {
       auto video_session = start_req.value().video_session;
       video_session.session_id = session_id; // Can't be JSON encoded
+      video_session.gpu_route = session->gpu_route;
+      session->gpu_route->codec.store(video_session.gst_pipeline == session->app->av1_gst_pipeline    ? 2
+                                      : video_session.gst_pipeline == session->app->hevc_gst_pipeline ? 1
+                                                                                                      : 0);
       if (video_session.render_node.empty()) {
         video_session.render_node = session->app->render_node;
       }
@@ -394,6 +400,31 @@ void UnixSocketServer::endpoint_StreamSessionHandleInput(const HTTPRequest &req,
   }
 }
 
+void UnixSocketServer::endpoint_Gpus(const HTTPRequest &req, std::shared_ptr<UnixSocket> socket) {
+  GpusResponse response;
+  auto sessions = state_->app_state->running_sessions->load();
+  auto lobbies = state_->app_state->lobbies->load();
+  for (auto device : wolf::gpu::discover()) {
+    GpuInfo info{.device = device, .codecs = {false, false, false}};
+    for (const auto &known : state_->app_state->gpus)
+      if (known.device.id == device.id && known.device.render_node == device.render_node &&
+          known.device.driver == device.driver && device.accessible)
+        for (int codec = 0; codec < 3; ++codec)
+          info.codecs[codec] = !known.pipelines[codec].empty();
+    for (const auto &session : *sessions) {
+      auto target = session.gpu_route->target.load();
+      if (target && session.gpu_route->streaming.load() &&
+          wolf::gpu::same_render_device(target->render_node, device.render_node))
+        ++info.users;
+    }
+    for (const auto &lobby : *lobbies)
+      if (wolf::gpu::same_render_device(lobby.render_node, device.render_node))
+        ++info.apps;
+    response.gpus.push_back(std::move(info));
+  }
+  send_http(socket, 200, rfl::json::write(response));
+}
+
 void UnixSocketServer::endpoint_Lobbies(const wolf::api::HTTPRequest &req, std::shared_ptr<UnixSocket> socket) {
   immer::vector<events::Lobby> lobbies = state_->app_state->lobbies->load();
   auto res = LobbiesResponse{.lobbies = lobbies | //
@@ -410,7 +441,46 @@ void UnixSocketServer::endpoint_LobbyCreate(const wolf::api::HTTPRequest &req, s
     auto default_client_settings = state::ClientSettings{};
     auto client_settings = event.value().client_settings.value().value_or(PartialClientSettings{});
     auto lobby_id = state::gen_uuid();
+    std::shared_ptr<const events::GpuStreamTarget> target;
+    if (event->gpu_id) {
+      auto reject = [&](const std::string &message) {
+        send_http(socket, 400, rfl::json::write(GenericErrorResponse{.error = message}));
+      };
+      auto source = event->source_session_id ? state::get_session_by_id(state_->app_state->running_sessions->load(),
+                                                                        *event->source_session_id)
+                                             : std::optional<events::StreamSession>{};
+      if (!source || !source->gpu_route->streaming.load()) {
+        reject("An active source session is required for manual GPU selection");
+        return;
+      }
+      const auto &gpus = state_->app_state->gpus;
+      auto selected =
+          std::find_if(gpus.begin(), gpus.end(), [&](const auto &gpu) { return gpu.device.id == *event->gpu_id; });
+      if (!source->gpu_route->sdr_420.load() || selected == gpus.end() ||
+          selected->pipelines[source->gpu_route->codec.load()].empty()) {
+        reject("The selected GPU cannot encode this client's codec");
+        return;
+      }
+      auto fresh = wolf::gpu::discover();
+      if (std::none_of(fresh.begin(), fresh.end(), [&](const auto &gpu) {
+            return gpu.id == selected->device.id && gpu.render_node == selected->device.render_node &&
+                   gpu.driver == selected->device.driver && gpu.accessible;
+          })) {
+        reject("The selected GPU is no longer available");
+        return;
+      }
+      auto manual = std::make_shared<events::GpuStreamTarget>();
+      manual->render_node = selected->device.render_node;
+      manual->cuda_device = selected->cuda_device;
+      manual->pipelines = selected->pipelines;
+      manual->producer = lobby_id;
+      target = manual;
+      event->video_settings.wayland_render_node = manual->render_node;
+      event->video_settings.runner_render_node = manual->render_node;
+      event->video_settings.video_producer_buffer_caps = selected->producer_caps;
+    }
     auto create_lobby_ev = events::CreateLobbyEvent{
+        .gpu_target = target,
         .id = lobby_id,
         .profile_id = event.value().profile_id.get(),
         .name = event.value().name,

@@ -51,6 +51,7 @@ static void application_message_handler(GstBus *bus, GstMessage *msg, gpointer d
 
 struct NeedContextData {
   const std::string device_path;
+  std::optional<unsigned int> cuda_device;
   std::shared_ptr<immer::atom<gst_video_context::gst_context_ptr>> gst_context;
 };
 
@@ -59,7 +60,8 @@ static void need_context_handler(GstBus *bus, GstMessage *msg, gpointer data) {
   if (auto gst_context = ctx_data->gst_context->load().get()) {
     logs::log(logs::debug, "Context already set, passing it to the pipeline.");
     gst_video_context::set_context(gst_context, msg);
-  } else if (auto video_context = gst_video_context::need_context_for_device(ctx_data->device_path, msg)) {
+  } else if (auto video_context =
+                 gst_video_context::need_context_for_device(ctx_data->device_path, msg, ctx_data->cuda_device)) {
     ctx_data->gst_context->store(video_context);
   }
 }
@@ -94,7 +96,8 @@ void start_video_producer(const std::string &session_id,
                           const wolf::core::virtual_display::DisplayMode &display_mode,
                           std::shared_ptr<immer::atom<gst_video_context::gst_context_ptr>> video_context,
                           std::shared_ptr<boost::promise<WaylandDisplayReady>> on_ready,
-                          std::shared_ptr<events::EventBusType> event_bus) {
+                          std::shared_ptr<events::EventBusType> event_bus,
+                          std::optional<unsigned int> cuda_device) {
   auto pipeline = fmt::format("waylanddisplaysrc name=wolf_wayland_source render_node={render_node} ! "
                               "{buffer_format}, width={width}, height={height}, framerate={fps}/1 ! \n"    //
                               "interpipesink sync=true async=false name={session_id}_video max-buffers=1", //
@@ -107,8 +110,8 @@ void start_video_producer(const std::string &session_id,
   logs::log(logs::debug, "[GSTREAMER] Starting video producer: {}", pipeline);
   auto bus_data_ptr =
       std::make_shared<GstBusData>(GstBusData{.on_ready = std::move(on_ready), .wayland_plugin = nullptr});
-  std::shared_ptr<NeedContextData> ctx_data_ptr =
-      std::make_shared<NeedContextData>(NeedContextData{.device_path = render_node, .gst_context = video_context});
+  std::shared_ptr<NeedContextData> ctx_data_ptr = std::make_shared<NeedContextData>(
+      NeedContextData{.device_path = render_node, .cuda_device = cuda_device, .gst_context = video_context});
   run_pipeline(pipeline, [=](auto pipeline) {
     logs::log(logs::debug, "Setting up waylanddisplaysrc");
 
@@ -370,12 +373,16 @@ static void configure_appsink(GstElement *appsink, UDPSink *udp_sink) {
 /**
  * Start VIDEO pipeline
  */
-void start_streaming_video(immer::box<events::VideoSession> video_session,
-                           const std::shared_ptr<events::EventBusType> &event_bus,
-                           std::string client_ip,
-                           unsigned short client_port,
-                           std::shared_ptr<immer::atom<gst_video_context::gst_context_ptr>> video_context,
-                           std::shared_ptr<udp::socket> video_socket) {
+static void stream_video_once(immer::box<events::VideoSession> video_session,
+                              const std::shared_ptr<events::EventBusType> &event_bus,
+                              std::string client_ip,
+                              unsigned short client_port,
+                              std::shared_ptr<immer::atom<gst_video_context::gst_context_ptr>> video_context,
+                              std::shared_ptr<udp::socket> video_socket,
+                              std::array<uint32_t, 2> &sequence,
+                              const std::string &producer,
+                              const std::function<bool()> &interrupted,
+                              std::optional<unsigned int> cuda_device = {}) {
   auto [color_range, color_space] = get_color_params(video_session);
 
   auto pipeline = fmt::format(
@@ -395,6 +402,11 @@ void start_streaming_video(immer::box<events::VideoSession> video_session,
       fmt::arg("color_space", color_space),
       fmt::arg("color_range", color_range),
       fmt::arg("host_port", video_session->port));
+  if (!producer.empty()) {
+    auto source = "listen-to=" + std::to_string(video_session->session_id) + "_video";
+    if (auto pos = pipeline.find(source); pos != std::string::npos)
+      pipeline.replace(pos, source.size(), "listen-to=" + producer + "_video");
+  }
   logs::log(logs::debug, "Starting video pipeline: \n{}", pipeline);
 
   bool enable_pacing = utils::get_env("WOLF_ENABLE_VIDEO_PACING", "TRUE") == std::string("TRUE");
@@ -407,9 +419,17 @@ void start_streaming_video(immer::box<events::VideoSession> video_session,
               std::max(1L, static_cast<long>(1000000000L * 80 / 100 / 1000 / (video_session->packet_size * 8)))),
           .max_batch_size = std::min<std::size_t>(16, 65536 / video_session->packet_size),
       }});
-  std::shared_ptr<NeedContextData> ctx_data_ptr = std::make_shared<NeedContextData>(
-      NeedContextData{.device_path = video_session->render_node, .gst_context = video_context});
-  run_pipeline(pipeline, [video_session, event_bus, udp_sink, ctx_data_ptr](auto pipeline) {
+  std::shared_ptr<NeedContextData> ctx_data_ptr =
+      std::make_shared<NeedContextData>(NeedContextData{.device_path = video_session->render_node,
+                                                        .cuda_device = cuda_device,
+                                                        .gst_context = video_context});
+  auto on_ready = [video_session, event_bus, udp_sink, ctx_data_ptr, &sequence](auto pipeline) {
+    if (auto pay = gst_bin_get_by_name(GST_BIN(pipeline.get()), "moonlight_pay")) {
+      auto packetizer = gst_rtp_moonlight_pay_video(pay);
+      packetizer->cur_seq_number = sequence[0];
+      packetizer->frame_num = sequence[1];
+      gst_object_unref(pay);
+    }
     if (auto app_sink_el = gst_bin_get_by_name(GST_BIN(pipeline.get()), "wolf_udp_sink")) {
       logs::log(logs::debug, "Setting up wolf_udp_sink");
       g_assert(GST_IS_APP_SINK(app_sink_el));
@@ -459,27 +479,6 @@ void start_streaming_video(immer::box<events::VideoSession> video_session,
           }
         });
 
-    auto switch_producer_handler = event_bus->register_handler<immer::box<events::SwitchStreamProducerEvents>>(
-        [sess_id = video_session->session_id,
-         pipeline](const immer::box<events::SwitchStreamProducerEvents> &switch_ev) {
-          if (switch_ev->session_id == sess_id) {
-            logs::log(logs::debug,
-                      "[GSTREAMER] Switching video producer pipeline for {} to {}",
-                      sess_id,
-                      switch_ev->interpipe_src_id);
-            /* Grab a reference to the interpipesrc */
-            auto pipe_name = fmt::format("interpipesrc_{}_video", sess_id);
-            if (auto src = gst_bin_get_by_name(GST_BIN(pipeline.get()), pipe_name.c_str())) {
-              /* Perform the switch */
-              auto video_interpipe = fmt::format("{}_video", switch_ev->interpipe_src_id);
-              g_object_set(src, "listen-to", video_interpipe.c_str(), nullptr);
-              gst_object_unref(src);
-            } else {
-              logs::log(logs::error, "[GSTREAMER] Failed to get video interpipesrc for {}", sess_id);
-            }
-          }
-        });
-
     auto stop_handler = event_bus->register_handler<immer::box<events::StopStreamEvent>>(
         [sess_id = video_session->session_id, pipeline](const immer::box<events::StopStreamEvent> &ev) {
           if (ev->session_id == sess_id) {
@@ -490,9 +489,83 @@ void start_streaming_video(immer::box<events::VideoSession> video_session,
 
     return immer::array<immer::box<events::EventBusHandlers>>{std::move(idr_handler),
                                                               std::move(pause_handler),
-                                                              std::move(switch_producer_handler),
                                                               std::move(stop_handler)};
-  });
+  };
+  run_pipeline(
+      pipeline,
+      on_ready,
+      true,
+      [&](auto pipeline) {
+        if (auto pay = gst_bin_get_by_name(GST_BIN(pipeline.get()), "moonlight_pay")) {
+          auto packetizer = gst_rtp_moonlight_pay_video(pay);
+          sequence = {packetizer->cur_seq_number, packetizer->frame_num};
+          gst_object_unref(pay);
+        }
+      },
+      interrupted);
+}
+
+void start_streaming_video(immer::box<events::VideoSession> initial,
+                           const std::shared_ptr<events::EventBusType> &event_bus,
+                           std::string client_ip,
+                           unsigned short client_port,
+                           std::shared_ptr<immer::atom<gst_video_context::gst_context_ptr>> context,
+                           std::shared_ptr<udp::socket> socket) {
+  std::array<uint32_t, 2> sequence{};
+  auto route = initial->gpu_route.get();
+  if (!route) {
+    stream_video_once(initial, event_bus, client_ip, client_port, context, socket, sequence, "", [] { return false; });
+    return;
+  }
+  if (route->streaming.exchange(true))
+    return;
+  struct Activity {
+    std::shared_ptr<events::GpuStreamRoute> route;
+    ~Activity() {
+      route->streaming.store(false);
+    }
+  } activity{route};
+  auto stopped = std::make_shared<std::atomic_bool>(false);
+  auto pause = event_bus->register_handler<immer::box<events::PauseStreamEvent>>(
+      [stopped, id = initial->session_id](const immer::box<events::PauseStreamEvent> &ev) {
+        if (ev->session_id == id)
+          stopped->store(true);
+      });
+  auto stop = event_bus->register_handler<immer::box<events::StopStreamEvent>>(
+      [stopped, id = initial->session_id](const immer::box<events::StopStreamEvent> &ev) {
+        if (ev->session_id == id)
+          stopped->store(true);
+      });
+  while (!stopped->load()) {
+    auto target = route->target.load();
+    auto video = *initial;
+    video.gst_pipeline = target->pipelines[route->codec.load()];
+    video.render_node = target->render_node;
+    auto interrupted = [route, target, stopped] { return stopped->load() || route->target.load() != target; };
+    try {
+      stream_video_once(immer::box<events::VideoSession>(video),
+                        event_bus,
+                        client_ip,
+                        client_port,
+                        target->context,
+                        socket,
+                        sequence,
+                        target->producer,
+                        interrupted,
+                        target->cuda_device);
+    } catch (const std::exception &error) {
+      logs::log(logs::error, "[GPU] Encoder error: {}", error.what());
+      event_bus->fire_event(immer::box<events::PauseStreamEvent>{events::PauseStreamEvent{initial->session_id}});
+      break;
+    }
+    if (!interrupted()) {
+      logs::log(logs::error, "[GPU] Encoder stopped on {}", target->render_node);
+      event_bus->fire_event(immer::box<events::PauseStreamEvent>{events::PauseStreamEvent{initial->session_id}});
+      break;
+    }
+  }
+  pause.unregister();
+  stop.unregister();
 }
 
 /**

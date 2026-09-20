@@ -235,6 +235,14 @@ UnixSocketServer::UnixSocketServer(boost::asio::io_context &io_context,
                        .handler = [this](auto req, auto socket) { endpoint_RunnerStart(req, socket); },
                    });
 
+  state_->http.add(HTTPMethod::GET,
+                   "/api/v1/gpus",
+                   {
+                       .summary = "GPU inventory, verified SDR codecs and current usage",
+                       .response_description = {{200, {.json_schema = rfl::json::to_schema<GpusResponse>()}}},
+                       .handler = [this](auto req, auto socket) { endpoint_Gpus(req, socket); },
+                   });
+
   /**
    * Lobbies API
    */

@@ -9,5 +9,8 @@ GPU_VENDOR get_vendor(std::string_view gpu) {
 }
 
 std::string get_mac_address(std::string_view local_ip) {
-  return "00:00:00:00:00:00"
+  return "00:00:00:00:00:00";
+}
+std::string get_gpu_name(unsigned int, unsigned int) {
+  return {};
 }

@@ -272,3 +272,13 @@ std::string get_mac_address(std::string_view local_ip) {
 
   return "00:00:00:00:00:00";
 }
+
+std::string get_gpu_name(unsigned int vendor, unsigned int device) {
+  auto pci = pci_alloc();
+  pci_init(pci);
+  char name[256]{};
+  pci_lookup_name(pci, name, sizeof(name), PCI_LOOKUP_VENDOR | PCI_LOOKUP_DEVICE, vendor, device);
+  std::string result = name;
+  pci_cleanup(pci);
+  return result;
+}

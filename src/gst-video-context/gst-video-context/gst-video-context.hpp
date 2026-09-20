@@ -2,6 +2,7 @@
 
 #include <gst/gst.h>
 #include <memory>
+#include <optional>
 #include <string>
 
 namespace gst_video_context {
@@ -10,6 +11,7 @@ namespace gst_video_context {
  * Dynamically links and load up the required libraries; needs to be called once.
  */
 bool init();
+bool supports_cuda();
 
 struct GstVideoContext;
 using gst_context_ptr = std::shared_ptr<GstVideoContext>;
@@ -21,7 +23,8 @@ using gst_context_ptr = std::shared_ptr<GstVideoContext>;
  * Returns a smart pointer to the created context, it's up to the caller to store it
  * properly for the duration of the pipeline. Returns nullptr if we haven't created any context.
  */
-gst_context_ptr need_context_for_device(const std::string &device_path, GstMessage *msg);
+gst_context_ptr
+need_context_for_device(const std::string &device_path, GstMessage *msg, std::optional<unsigned int> cuda_device = {});
 
 bool set_context(gst_context_ptr context, GstMessage *msg);
 

@@ -215,8 +215,12 @@ announce(const RTSP_PACKET &req, const events::StreamSession &session) {
     logs::log(logs::debug, "[RTSP] Adjusted video bitrate to {} Kbps", bitrate);
   }
 
+  session.gpu_route->codec.store(video_format_av1 ? 2 : video_format_hevc ? 1 : 0);
+  session.gpu_route->sdr_420.store(args["x-nv-video[0].dynamicRangeMode"].value_or(0) == 0 &&
+                                   args["x-nv-video[0].chromaSamplingType"].value_or(0) == 0);
   // Video session
   events::VideoSession video = {
+      .gpu_route = session.gpu_route,
       .display_mode = {.width = display.width, .height = display.height, .refreshRate = display.refreshRate},
       .gst_pipeline = gst_pipeline,
       .render_node = session.app->render_node,

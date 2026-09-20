@@ -403,6 +403,7 @@ Config load_or_default(const std::string &source,
                 .config_source = source,
                 .support_hevc = hevc_encoder.has_value(),
                 .support_av1 = av1_encoder.has_value() && encoder_type(*av1_encoder) != SOFTWARE,
+                .gpu_video = default_gst_video_settings,
                 .paired_clients = clients_atom,
                 .profiles = profiles_atom};
 }
