@@ -1,3 +1,24 @@
+# Automatic GPU selection development fork:
+**If migrating from an existing install from the upstream fork, the Wolf-UI image in the config.toml file will need to be updated.**
+
+This fork aims to automatically detect, select, reject, and load balance across all GPUs in a multi-GPU system. 
+This fork uses the following two images:
+
+In the Docker launch or Compose:
+ -  ghcr.io/greaper88/wolf:gpu-selection-dev
+
+In the `config.toml` file (change only if config is pre-existing):
+ -  ghcr.io/greaper88/wolf-ui:gpu-selection-dev
+
+## Limitations
+- Automatic GPU selection currently requires verified VA-API hardware encoding.
+  Tested with AMD/Mesa; Intel GPUs must pass the startup capability checks.
+- NVIDIA-only users should continue using upstream Wolf for now.
+  Automatic NVIDIA/NVENC selection and load balancing are not yet implemented in this fork.
+- Running and paused apps remain pinned to their assigned GPU.
+  Load balancing applies when assigning new sessions.
+- Simultaneous multi-user lobby sharing is not supported with automatic GPU selection.
+
 # games-on-whales/wolf
 
 [![Linux build and test](https://github.com/games-on-whales/wolf/actions/workflows/linux-build-test.yml/badge.svg)](https://github.com/games-on-whales/wolf/actions/workflows/linux-build-test.yml)
