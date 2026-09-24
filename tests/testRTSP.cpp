@@ -247,22 +247,23 @@ TEST_CASE("Custom Parser", "[RTSP]") {
 }
 
 state::SessionsAtoms test_init_state() {
-  events::StreamSession session = {.display_mode = {1920, 1080, 60},
-                                   .audio_channel_count = 2,
-                                   .event_bus = std::make_shared<events::EventBusType>(),
-                                   .app = std::make_shared<events::App>(events::App{.base = {},
-                                                                                    .h264_gst_pipeline = "",
-                                                                                    .hevc_gst_pipeline = "",
-                                                                                    .opus_gst_pipeline = "",
-                                                                                    .runner = nullptr}),
-                                   .aes_key = crypto::hex_to_str("9d804e47a6aa6624b7d4b502b32cc522", true),
-                                   .aes_iv = crypto::hex_to_str("01234567890", true),
-                                   .rtsp_fake_ip = "00.11.22.33.44",
-                                   .session_id = 1234,
-                                   .ip = "127.0.0.1",
-                                   .video_stream_port = 1234,
-                                   .audio_stream_port = 1235,
-                                   .control_stream_port = 1236};
+  events::StreamSession session = {
+      .display_mode = {1920, 1080, 60},
+      .audio_channel_count = 2,
+      .event_bus = std::make_shared<events::EventBusType>(),
+      .app = std::make_shared<events::App>(events::App{.base = {},
+                                                       .h264_gst_pipeline = "fakesrc ! fakesink",
+                                                       .hevc_gst_pipeline = "",
+                                                       .opus_gst_pipeline = "",
+                                                       .runner = nullptr}),
+      .aes_key = crypto::hex_to_str("9d804e47a6aa6624b7d4b502b32cc522", true),
+      .aes_iv = crypto::hex_to_str("01234567890", true),
+      .rtsp_fake_ip = "00.11.22.33.44",
+      .session_id = 1234,
+      .ip = "127.0.0.1",
+      .video_stream_port = 1234,
+      .audio_stream_port = 1235,
+      .control_stream_port = 1236};
   return std::make_shared<immer::atom<immer::vector<events::StreamSession>>>(
       immer::vector<events::StreamSession>{session});
 }

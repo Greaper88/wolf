@@ -35,6 +35,10 @@ force-closing/restarting with possible loss of unsaved work. Moonlight's mid-str
 has no custom error-text field, so the client may show a generic disconnect. Stop cancels admission
 and holds ownership through teardown; late callbacks cannot release a replacement session's lease.
 
+The upstream resume-response fix and shared-IP session-routing fixes are integrated. Control
+connections prefer session secrets, and RTSP resolves session identifiers before attempting an
+IP fallback. Legacy IP-only connections are accepted only when they identify a unique session.
+
 ## Validation at the initial development push
 
 - Wolf and Wolf UI Docker development images built successfully.
@@ -63,8 +67,9 @@ and holds ownership through teardown; late callbacks cannot release a replacemen
   whole-device usage; external desktops/encoders and deduplication must be accounted for.
 - Unknown encoder telemetry uses session-count policy by default. Startup codec probes establish basic
   support, not maximum resolution/frame rate or guaranteed concurrent-stream capacity.
-- The legacy IP-only session fallback can confuse devices behind the same public IP. This predates
-  the GPU work and is not addressed here.
+- Ambiguous legacy IP-only connections are rejected instead of attaching to another user's session.
+  Clients without usable handshake identifiers still cannot reliably share a public IP; see the
+  shared-IP sections in `docs/modules/user/pages/troubleshooting.adoc`.
 - Automatic lobby creation requires an automatic source session when the global runtime is enabled;
   mixed manual/automatic app configurations need further compatibility coverage.
 - Session GPU counts describe tracked stream sessions, not unique human users or all resident apps.
