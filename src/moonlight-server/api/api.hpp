@@ -1,6 +1,7 @@
 #pragma once
 
 #include <api/http_server.hpp>
+#include <deque>
 #include <events/events.hpp>
 #include <events/reflectors.hpp>
 #include <moonlight/control.hpp>
@@ -179,6 +180,8 @@ struct DockerPullImageResponse {
 struct UnixSocket {
   boost::asio::local::stream_protocol::socket socket;
   bool is_alive = true;
+  // Accessed only on the API io_context. Own buffers until each write completes.
+  std::deque<std::shared_ptr<const std::string>> pending_writes;
 };
 
 class UnixSocketServer {
@@ -236,6 +239,7 @@ private:
                  const std::vector<std::string_view> &http_headers,
                  std::string_view body);
   void send_data(std::shared_ptr<UnixSocket> socket, std::string_view data);
+  void write_next(std::shared_ptr<UnixSocket> socket);
 
   void handle_request(const HTTPRequest &req, std::shared_ptr<UnixSocket> socket);
   void start_connection(std::shared_ptr<UnixSocket> socket);

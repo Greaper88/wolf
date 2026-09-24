@@ -335,7 +335,9 @@ UnixSocketServer::UnixSocketServer(boost::asio::io_context &io_context,
 }
 
 void UnixSocketServer::sse_keepalive(const boost::system::error_code &e) {
-  if (e && e.value() != boost::asio::error::operation_aborted) {
+  if (e == boost::asio::error::operation_aborted)
+    return;
+  if (e) {
     logs::log(logs::warning, "[API] Error in keepalive timer: {}", e.message());
     return;
   }
@@ -346,17 +348,13 @@ void UnixSocketServer::sse_keepalive(const boost::system::error_code &e) {
 }
 
 void UnixSocketServer::sse_broadcast(const std::string &payload) {
-  for (auto &socket : state_->sockets) {
-    boost::asio::async_write(socket->socket,
-                             boost::asio::buffer(payload),
-                             [this, socket](const boost::system::error_code &ec, std::size_t /*length*/) {
-                               if (ec) {
-                                 logs::log(logs::debug, "[API] Error sending event: {}", ec.message());
-                                 close(*socket);
-                                 cleanup_sockets();
-                               }
-                             });
-  }
+  // Events can originate on runner/download threads. Keep the subscriber list and
+  // all socket operations on the same io_context as accept/read/write callbacks.
+  boost::asio::post(state_->io_context, [this, payload]() {
+    cleanup_sockets();
+    for (auto &socket : state_->sockets)
+      send_data(socket, payload);
+  });
 }
 
 void UnixSocketServer::broadcast_event(const std::string &event_type, const std::string &event_data) {
@@ -383,13 +381,35 @@ void UnixSocketServer::send_http(std::shared_ptr<UnixSocket> socket,
 }
 
 void UnixSocketServer::send_data(std::shared_ptr<UnixSocket> socket, std::string_view data) {
+  auto payload = std::make_shared<const std::string>(data);
+  boost::asio::post(state_->io_context, [this, socket, payload]() {
+    // Image pulls may continue after their HTTP client leaves. Stop attempting
+    // writes after the first failure, while allowing the download to finish.
+    if (!socket->is_alive)
+      return;
+    const bool idle = socket->pending_writes.empty();
+    socket->pending_writes.push_back(payload);
+    if (idle)
+      write_next(socket);
+  });
+}
+
+void UnixSocketServer::write_next(std::shared_ptr<UnixSocket> socket) {
+  auto payload = socket->pending_writes.front();
   boost::asio::async_write(socket->socket,
-                           boost::asio::buffer(data),
-                           [this, socket](const boost::system::error_code &ec, std::size_t /*length*/) {
+                           boost::asio::buffer(*payload),
+                           [this, socket, payload](const boost::system::error_code &ec, std::size_t /*length*/) {
+                             if (!socket->is_alive)
+                               return;
                              if (ec) {
-                               logs::log(logs::error, "[API] Error sending data: {}", ec.message());
+                               logs::log(logs::debug, "[API] Closing disconnected response stream: {}", ec.message());
                                close(*socket);
+                               cleanup_sockets();
+                               return;
                              }
+                             socket->pending_writes.pop_front();
+                             if (!socket->pending_writes.empty())
+                               write_next(socket);
                            });
 }
 
@@ -398,7 +418,7 @@ void UnixSocketServer::handle_request(const HTTPRequest &req, std::shared_ptr<Un
 
   if (!state_->http.handle_request(req, socket)) {
     send_http(socket, 404, "");
-    close(*socket);
+    // The final write retains the socket until the response has been sent.
   }
 }
 
@@ -487,7 +507,9 @@ void UnixSocketServer::start_accept() {
 }
 
 void UnixSocketServer::close(UnixSocket &socket) {
-  socket.socket.close();
   socket.is_alive = false;
+  socket.pending_writes.clear();
+  boost::system::error_code ignored;
+  socket.socket.close(ignored);
 }
 } // namespace wolf::api
