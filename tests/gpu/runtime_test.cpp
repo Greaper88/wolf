@@ -24,13 +24,17 @@ template <typename F> void eventually(F condition) {
 }
 int main(int argc, char **argv) {
   if (argc > 1 && std::string(argv[1]) == "--wolf-gpu-probe") {
-    if (std::string(argv[3]) == "hang") {
+    if (std::string(argv[3]) == "hang" || (argc == 7 && std::string(argv[3]) == "dma-hang")) {
       for (;;)
         pause();
     }
     if (std::string(argv[3]) == "fail")
       return 2;
-    std::string reply = std::string(argv[3]) == "bad" ? "bad reply\n" : "WOLF_GPU_V1 vah264enc va -1\n";
+    if (argc == 7 && std::string(argv[3]) == "dma-fail")
+      return 2;
+    std::string reply = std::string(argv[3]) == "bad" ? "bad reply\n"
+                        : argc == 7                   ? "WOLF_GPU_V2 vah264enc va -1 varenderD129postproc\n"
+                                                      : "WOLF_GPU_V2 vah264enc va -1 -\n";
     return write(3, reply.data(), reply.size()) == static_cast<ssize_t>(reply.size()) ? 0 : 2;
   }
   Device d;
@@ -199,9 +203,50 @@ int main(int argc, char **argv) {
     });
     check(runtime.prepare("invalidated").launch != nullptr, "reverified device can be reserved after rollback");
   }
+  // Optional zero-copy policy must affect admission and advertised codecs, not only pipeline construction.
+  for (const auto [required, enabled] : {std::pair{false, true}, {true, true}, {false, false}}) {
+    Options options;
+    options.require_zero_copy = required;
+    options.use_zero_copy = enabled;
+    auto second = d;
+    second.id = "cpu-buffer-only";
+    second.render_node = "/dev/dri/renderD130";
+    Runtime runtime(
+        options,
+        [&] { return std::vector{d, second}; },
+        [] { return "v1"; },
+        [&](const Device &device, Codec codec, std::stop_token) {
+          EncoderBinding binding{"vah264enc", "va", codec, device.render_node, {}};
+          if (device.id == d.id && codec != Codec::av1)
+            binding.zero_copy_postproc = "varenderD129postproc";
+          return EncoderProbeResult{binding, {}};
+        });
+    eventually([&] {
+      auto c = runtime.capabilities(second);
+      return c && c->status != CapabilityCache::Status::pending;
+    });
+    auto first = runtime.prepare("dma-session", d.id);
+    check(first.launch && first.launch->zero_copy == enabled, "launch caches requested buffer mode");
+    auto app = runtime.retain("dma-app", *first.launch);
+    check(app.launch && app.launch->zero_copy == enabled, "persistent app retains producer buffer mode");
+    check(runtime.supports(Codec::hevc), "verified zero-copy codec remains advertised");
+    auto fallback = runtime.prepare("cpu-session", second.id);
+    check(bool(fallback.launch) == !required, "strict policy excludes non-zero-copy GPU");
+    if (fallback.launch)
+      check(!fallback.launch->zero_copy, "fallback uses CPU buffers on its pinned GPU");
+    check(runtime.supports(Codec::av1) == !required, "strict policy never advertises unverified zero-copy codec");
+  }
   auto encoded = isolated_probe("/proc/self/exe", d, Codec::h264);
   check(encoded.encoder && encoded.encoder->render_node == d.render_node,
         "isolated process returns device-bound result");
+  check(encoded.encoder->zero_copy_postproc == "varenderD129postproc", "separate DMA probe returns converter binding");
+  for (const auto id : {"dma-fail", "dma-hang"}) {
+    auto failure = d;
+    failure.id = id;
+    auto fallback = isolated_probe("/proc/self/exe", failure, Codec::h264, {}, std::chrono::milliseconds(100));
+    check(fallback.encoder && !fallback.encoder->zero_copy_postproc && !fallback.failures.empty(),
+          "failed or hung DMA trial preserves verified CPU-buffer hardware fallback");
+  }
   check(!isolated_probe("/no-such-wolf-probe", d, Codec::h264).encoder, "spawn failure fails closed");
   d.id = "bad";
   check(!isolated_probe("/proc/self/exe", d, Codec::h264).encoder, "malformed child reply rejected");

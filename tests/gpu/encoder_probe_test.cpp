@@ -186,7 +186,9 @@ int main(int argc, char **argv) {
   check(!encoder_binding(nullptr, d, Codec::h264), "missing factory rejected");
   check(!probe_encoder(d).encoder, "instantiable matching factory must actually encode frames");
   encode_mode = 1;
-  check(probe_encoder(d).encoder.has_value(), "completed fixture encode with output is accepted");
+  auto working = probe_encoder(d);
+  check(working.encoder.has_value(), "completed fixture encode with output is accepted");
+  check(!probe_zero_copy(d, *working.encoder), "working encoder alone cannot authorize zero-copy");
   encode_mode = 2;
   check(!probe_encoder(d).encoder, "EOS with no encoded output is rejected");
   encode_mode = 3;

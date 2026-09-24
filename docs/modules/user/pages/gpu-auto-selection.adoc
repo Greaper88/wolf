@@ -1,10 +1,11 @@
 = Per-session GPU selection (experimental VA integration)
 
 IMPORTANT: Automatic session routing currently supports verified VA hardware encoders.
-NVENC automatic contexts, custom video overrides, zero-copy pipelines and multi-user lobby sharing are not
+NVENC automatic contexts, custom video overrides and multi-user lobby sharing are not
 supported in this development version. Unsupported launches/transitions fail explicitly.
-Automatic sessions use ordinary video buffers with hardware encoding; expect additional CPU/memory
-traffic compared with zero-copy. Live Moonlight/Steam smoke tests have passed; broader performance and compatibility validation remain.
+Automatic sessions prefer a verified zero-copy VA pipeline. GPUs without that path retain CPU-buffer
+conversion with hardware encoding unless `WOLF_GPU_REQUIRE_ZERO_COPY=true` excludes them.
+Broader performance and compatibility validation remain.
 
 The automatic-selection Compose environment contains only:
 
@@ -25,6 +26,8 @@ Remove both node variables entirely to enable selection; an empty value is still
 |Variable |Default |Meaning
 |WOLF_GPU_AUTO_SELECT |true |Enable launch-time selection for supported automatic pipelines.
 |WOLF_GPU_AUTO_BLACKLIST |true |Exclude virtio_gpu, qxl, bochs-drm, vmwgfx, simpledrm, hyperv_drm, ast and mgag200.
+|WOLF_USE_ZERO_COPY |true |Use the startup-verified DMA-BUF/VA path when available. `false` uses CPU-buffer conversion with hardware encoding.
+|WOLF_GPU_REQUIRE_ZERO_COPY |false |Exclude GPUs without verified H.264 zero-copy support and exclude codecs without a verified zero-copy path. Requires `WOLF_USE_ZERO_COPY=true`.
 |WOLF_GPU_BLACKLIST |empty |Never select these GPU identities.
 |WOLF_GPU_LAST_RESORT |empty |Use these GPUs only when no preferred candidate passes capacity checks.
 |WOLF_GPU_PERCENT_THRESHOLD |90 |Reject measured GPU core usage at or above this percentage.
@@ -60,6 +63,34 @@ Unavailable telemetry is unknown, not zero. This patch reads AMD/sysfs core/VRAM
 VRAM and encoder utilization. Intel/AMD encoder utilization remains unknown. The default policy permits
 unknown encoder telemetry using session counts; choose `reject` to require a measured encoder value.
 A device must still have a verified hardware encoder. Discovery's capability callback defaults to false.
+
+Zero-copy verification runs in separate bounded subprocesses at startup/background refresh, never at
+app launch or reconnect. It tests the actual compositor exporting linear 8-bit XR24 DMA buffers,
+the selected GPU's VA postprocessor producing NV12 VA surfaces, and that GPU's encoder producing
+frames. Converter and encoder identities are checked against their read-only device paths.
+The check also verifies that VA attached a surface to the original DMA memory, rejecting a hidden
+CPU-copy import fallback. Missing VA inspection support is treated as unverified zero-copy.
+This verifies the implemented path, not every format/modifier a GPU might theoretically support.
+It does not establish maximum resolution, frame rate, HDR support or concurrent encoder capacity.
+Here zero-copy means avoiding a CPU readback/upload of raw video frames; GPU color conversion still occurs.
+
+The H.264 result fixes the producer's buffer mode for its lifetime. A zero-copy producer only offers
+codecs that also passed zero-copy verification. The mode and GPU remain pinned across disconnects,
+profile app resumes, device changes and returns to the launcher. Startup and producer logs identify
+zero-copy, CPU-buffer fallback, or exclusion explicitly. Restart Wolf to apply these environment changes.
+
+To allow only verified zero-copy GPUs in the automatic pool:
+
+[source,yaml]
+----
+environment:
+  - WOLF_USE_ZERO_COPY=true
+  - WOLF_GPU_REQUIRE_ZERO_COPY=true
+----
+
+These settings do not override explicit manual GPU pins. Disabling the virtual-device auto-blacklist
+does not bypass the zero-copy requirement. A failed zero-copy trial does not erase a separately
+verified hardware encoder: it remains available when the requirement is off.
 
 Automatic pool classification currently treats NVIDIA and devices reporting more than 1 GiB dedicated
 VRAM as preferred. Unclassified/shared-memory devices are last resort. This is a conservative heuristic.

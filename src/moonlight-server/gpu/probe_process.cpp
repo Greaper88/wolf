@@ -12,11 +12,13 @@ extern char **environ;
 #endif
 
 namespace wolf::gpu {
-EncoderProbeResult isolated_probe(const std::string &executable,
-                                  const Device &device,
-                                  Codec codec,
-                                  std::stop_token stop,
-                                  std::chrono::milliseconds timeout) {
+namespace {
+EncoderProbeResult run_probe(const std::string &executable,
+                             const Device &device,
+                             Codec codec,
+                             std::stop_token stop,
+                             std::chrono::milliseconds timeout,
+                             const std::string &zero_copy_encoder = {}) {
   auto failure = [](const char *reason) { return EncoderProbeResult{std::nullopt, {reason}}; };
 #ifdef __linux__
   if (stop.stop_requested())
@@ -57,6 +59,8 @@ EncoderProbeResult isolated_probe(const std::string &executable,
                                 device.id,
                                 device.driver,
                                 codec_arg};
+  if (!zero_copy_encoder.empty())
+    args.push_back(zero_copy_encoder);
   std::vector<char *> argv;
   for (auto &arg : args)
     argv.push_back(arg.data());
@@ -103,22 +107,46 @@ EncoderProbeResult isolated_probe(const std::string &executable,
   if (!WIFEXITED(status) || WEXITSTATUS(status) != 0 || length <= 0 || length >= 1024)
     return failure("GPU hardware encode verification failed");
   std::istringstream reply(std::string(buffer, length));
-  std::string marker, factory, plugin, extra;
+  std::string marker, factory, plugin, postproc, extra;
   long long cuda = -1;
-  if (!(reply >> marker >> factory >> plugin >> cuda) || (reply >> extra) || marker != "WOLF_GPU_V1" ||
+  if (!(reply >> marker >> factory >> plugin >> cuda >> postproc) || (reply >> extra) || marker != "WOLF_GPU_V2" ||
       factory.find_first_not_of("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-") !=
           std::string::npos ||
       (plugin != "va" && plugin != "nvcodec") || cuda < -1 || cuda > 2147483647 || (plugin == "nvcodec" && cuda < 0) ||
-      (plugin == "va" && cuda != -1))
+      (plugin == "va" && cuda != -1) ||
+      (postproc != "-" &&
+       (plugin != "va" || !postproc.starts_with("va") || !postproc.ends_with("postproc") ||
+        postproc.find_first_not_of("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_") !=
+            std::string::npos)))
     return failure("Invalid GPU probe response");
   return {EncoderBinding{factory,
                          plugin,
                          codec,
                          device.render_node,
-                         cuda < 0 ? std::nullopt : std::make_optional(static_cast<unsigned int>(cuda))},
+                         cuda < 0 ? std::nullopt : std::make_optional(static_cast<unsigned int>(cuda)),
+                         postproc == "-" ? std::nullopt : std::make_optional(postproc)},
           {}};
 #else
   return failure("Isolated GPU probing is unavailable on this platform");
 #endif
+}
+} // namespace
+
+EncoderProbeResult isolated_probe(const std::string &executable,
+                                  const Device &device,
+                                  Codec codec,
+                                  std::stop_token stop,
+                                  std::chrono::milliseconds timeout) {
+  auto result = run_probe(executable, device, codec, stop, timeout);
+  if (result.encoder)
+    result.encoder->zero_copy_postproc.reset();
+  if (result.encoder && result.encoder->plugin == "va" && !stop.stop_requested()) {
+    auto dma = run_probe(executable, device, codec, stop, timeout, result.encoder->factory);
+    if (dma.encoder && dma.encoder->factory == result.encoder->factory)
+      result.encoder->zero_copy_postproc = dma.encoder->zero_copy_postproc;
+    if (!result.encoder->zero_copy_postproc)
+      result.failures.emplace_back("Zero-copy compositor/VA encode verification failed; CPU-buffer fallback available");
+  }
+  return result;
 }
 } // namespace wolf::gpu

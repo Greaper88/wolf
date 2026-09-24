@@ -111,6 +111,7 @@ struct GpuStreamTarget {
   std::shared_ptr<immer::atom<gst_video_context::gst_context_ptr>> context;
   std::array<std::string, 3> pipelines;
   std::string producer;
+  std::string producer_caps;
 };
 struct GpuStreamRoute {
   std::shared_ptr<const GpuStreamTarget> home;

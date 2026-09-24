@@ -4,6 +4,9 @@ Run inside a network-isolated Wolf container with two verified VA GPUs, three
 throwaway paired clients and a first app running an animated Wayland client.
 The server must expose its default internal ports and Unix socket. The test
 creates/stops sessions and a sub-app, and exercises real HEVC RTP output.
+For the strict zero-copy fixture, set WOLF_GPU_TEST_REQUIRE_ZERO_COPY=1 and
+WOLF_GPU_EXPECT_ZERO_COPY_NODE to the sole verified zero-copy GPU's render node.
+That mode verifies streaming on it and rejection while its first encoder is pending.
 Never run against user sessions. Set WOLF_GPU_DISPOSABLE_TEST=1 explicitly.
 """
 import os
@@ -13,7 +16,7 @@ import http.client, socket, json, time, struct, select
 class UnixHTTP(http.client.HTTPConnection):
     def connect(self):
         self.sock=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM); self.sock.settimeout(25)
-        self.sock.connect('/var/run/wolf/wolf.sock')
+        self.sock.connect(os.environ.get('WOLF_SOCKET_PATH','/var/run/wolf/wolf.sock'))
 def request(path,data=None):
     c=UnixHTTP('localhost'); c.request('GET' if data is None else 'POST','/api/v1/'+path,
         None if data is None else json.dumps(data),{'Content-Type':'application/json'})
@@ -21,10 +24,12 @@ def request(path,data=None):
 def ok(path,data=None):
     status,body=request(path,data); assert status==200,(path,status,body); return body
 clients=ok('clients')['clients']; app=ok('apps')['apps'][0]; sid=[x['client_id'] for x in clients]
-def add(i):
-    data=dict(client_ip='127.0.0.1',aes_key='00'*16,aes_iv='0',rtsp_fake_ip=f'127.0.0.{i+2}',
+def session_data(i):
+    return dict(client_ip='127.0.0.1',aes_key='00'*16,aes_iv='0',rtsp_fake_ip=f'127.0.0.{i+2}',
         video_width=640,video_height=360,video_refresh_rate=30,audio_channel_count=2,
         app_id=app['id'],client_id=sid[i])
+def add(i):
+    data=session_data(i)
     deadline=time.monotonic()+25
     while True:
         status,body=request('sessions/add',data)
@@ -64,6 +69,21 @@ def frames(udp,seconds=1.5):
     assert values,'No encoded video packets received';return values
 lobby=None
 try:
+    if os.environ.get('WOLF_GPU_TEST_REQUIRE_ZERO_COPY') == '1':
+        add(0)
+        current=next(s for s in sessions() if s['client_id']==sid[0])
+        assert current['gpu']['render_node']==os.environ['WOLF_GPU_EXPECT_ZERO_COPY_NODE'],current['gpu']
+        deadline=time.monotonic()+25
+        while True:
+            status,body=request('sessions/add',session_data(1))
+            if status!=503 or 'verification in progress' not in json.dumps(body).lower():break
+            assert time.monotonic()<deadline,body
+            time.sleep(.25)
+        assert status==503,(status,body)
+        assert len(sessions())==1,'strict policy must not fall back to the other GPU'
+        frames(stream(0))
+        print('PASS: strict zero-copy selects the verified GPU, encodes frames, and excludes the fallback GPU',flush=True)
+        raise SystemExit(0)
     add(0);add(1);g0,g1=gpu(0),gpu(1);assert g0!=g1,(g0,g1)
     u0=stream(0);u1=stream(1);frames(u0);frames(u1)
     print('PASS: both launchers encode on separate GPUs',g0,g1,flush=True)

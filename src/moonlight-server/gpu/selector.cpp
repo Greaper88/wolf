@@ -85,6 +85,10 @@ Options read_options(const Environment &env) {
   if (!o.auto_select)
     return o;
   o.auto_blacklist = boolean("WOLF_GPU_AUTO_BLACKLIST", true);
+  o.use_zero_copy = boolean("WOLF_USE_ZERO_COPY", true);
+  o.require_zero_copy = boolean("WOLF_GPU_REQUIRE_ZERO_COPY", false);
+  if (o.require_zero_copy && !o.use_zero_copy)
+    throw std::invalid_argument("WOLF_GPU_REQUIRE_ZERO_COPY requires WOLF_USE_ZERO_COPY=true");
   o.blacklist = list(env("WOLF_GPU_BLACKLIST").value_or(""));
   o.last_resort = list(env("WOLF_GPU_LAST_RESORT").value_or(""));
   o.gpu_threshold = number("WOLF_GPU_PERCENT_THRESHOLD", 90);

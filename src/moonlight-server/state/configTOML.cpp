@@ -335,7 +335,7 @@ Config load_or_default(const std::string &source,
   }
 
   logs::log(logs::info,
-            "Using {} pipeline on {} ({})",
+            "Legacy/default pipeline configuration: {} on {} ({}); automatic sessions use their own verified GPU path",
             use_zero_copy ? "zero copy" : "legacy",
             get_vendor_name(vendor),
             default_gst_render_node);

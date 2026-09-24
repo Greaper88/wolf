@@ -22,7 +22,10 @@ int main(int argc, char **argv) {
       auto result = wolf::gpu::isolated_probe("/proc/self/exe", device, codec);
       std::cout << name << ": ";
       if (result.encoder) {
-        std::cout << result.encoder->factory << " verified\n";
+        std::cout << result.encoder->factory << " verified; "
+                  << (result.encoder->zero_copy_postproc ? "zero-copy via " + *result.encoder->zero_copy_postproc
+                                                         : "CPU-buffer fallback (zero-copy unavailable)")
+                  << '\n';
         if (codec == wolf::gpu::Codec::h264)
           h264 = true;
       } else {

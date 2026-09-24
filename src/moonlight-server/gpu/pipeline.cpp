@@ -5,9 +5,19 @@ namespace wolf::gpu {
 std::string bind_pipeline(const EncoderBinding &binding,
                           const std::vector<PipelineTemplate> &templates,
                           const std::string &source,
-                          const std::string &sink) {
+                          const std::string &sink,
+                          bool zero_copy) {
   if (binding.plugin != "va")
     throw std::runtime_error("Automatic session pipelines currently require a verified VA encoder");
+  std::string conversion = "videoconvertscale add-borders=true ! video/x-raw";
+  if (zero_copy) {
+    const auto &postproc = binding.zero_copy_postproc;
+    if (!postproc || !postproc->starts_with("va") || !postproc->ends_with("postproc") ||
+        postproc->find_first_not_of("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_") !=
+            std::string::npos)
+      throw std::runtime_error("Zero-copy requires a verified device-bound VA converter");
+    conversion = std::string(zero_copy_caps) + " ! " + *postproc + " add-borders=true ! video/x-raw(memory:VAMemory)";
+  }
   const std::string codec = binding.codec == Codec::h264 ? "h264" : binding.codec == Codec::hevc ? "h265" : "av1";
   const bool low_power = binding.factory.ends_with(codec + "lpenc");
   const std::string generic = "va" + codec + (low_power ? "lpenc" : "enc");
@@ -36,9 +46,8 @@ std::string bind_pipeline(const EncoderBinding &binding,
       continue;
     auto encoder = entry.pipeline;
     encoder.replace(first, factory.size(), binding.factory);
-    return source +
-           " ! videoconvertscale add-borders=true ! "
-           "video/x-raw,format=NV12,width={width},height={height},pixel-aspect-ratio=1/1,"
+    return source + " ! " + conversion +
+           ",format=NV12,width={width},height={height},pixel-aspect-ratio=1/1,"
            "chroma-site={color_range},colorimetry={color_space} ! " +
            encoder + " ! " + sink;
   }

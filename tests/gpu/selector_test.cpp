@@ -41,6 +41,16 @@ Options options(std::map<std::string, std::string> env = {}) {
 void config_tests() {
   auto o = options();
   check(o.enabled() && o.auto_blacklist, "default-on flags");
+  check(o.use_zero_copy && !o.require_zero_copy, "zero-copy preferred with fallback by default");
+  check(options({{"WOLF_GPU_REQUIRE_ZERO_COPY", "true"}}).require_zero_copy, "strict zero-copy policy is configurable");
+  check(!options({{"WOLF_USE_ZERO_COPY", "FALSE"}}).use_zero_copy, "explicit zero-copy disable");
+  bool conflict = false;
+  try {
+    options({{"WOLF_USE_ZERO_COPY", "false"}, {"WOLF_GPU_REQUIRE_ZERO_COPY", "true"}});
+  } catch (const std::invalid_argument &) {
+    conflict = true;
+  }
+  check(conflict, "contradictory zero-copy settings rejected");
   check(o.gpu_threshold == 90 && o.gpu_retry_threshold == 87 && o.gpu_variance == 5, "GPU defaults");
   check(o.vram_threshold == 85 && o.vram_retry_threshold == 80, "VRAM defaults");
   check(o.encoder_threshold == 90 && o.encoder_retry_threshold == 85 && o.encoder_hard_limit == 98 &&
@@ -62,7 +72,11 @@ void config_tests() {
     }
     check(rejected, "invalid percentage rejected");
   }
-  for (auto key : {"WOLF_GPU_AUTO_SELECT", "WOLF_GPU_AUTO_BLACKLIST", "WOLF_ENCODER_UNKNOWN_POLICY"}) {
+  for (auto key : {"WOLF_GPU_AUTO_SELECT",
+                   "WOLF_GPU_AUTO_BLACKLIST",
+                   "WOLF_ENCODER_UNKNOWN_POLICY",
+                   "WOLF_USE_ZERO_COPY",
+                   "WOLF_GPU_REQUIRE_ZERO_COPY"}) {
     bool rejected = false;
     try {
       options({{key, "typo"}});

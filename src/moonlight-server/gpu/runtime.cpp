@@ -71,7 +71,11 @@ Runtime::LaunchResult Runtime::prepare(const std::string &session_id, const std:
     auto current = cache_.lookup(device, generation);
     if (generation == sampled_generation && current && current->status == CapabilityCache::Status::ready &&
         current->revision == capability.revision) {
-      return {std::make_shared<const Launch>(Launch{std::move(result.reservation), device, capability}), false, {}};
+      const auto &h264 = capability.codecs[0].encoder;
+      const bool zero_copy = options_.use_zero_copy && h264 && h264->zero_copy_postproc.has_value();
+      return {std::make_shared<const Launch>(Launch{std::move(result.reservation), device, capability, zero_copy}),
+              false,
+              {}};
     }
   }
   // The local reservation releases on return, including invalidation racing with admission.
@@ -85,7 +89,9 @@ Runtime::LaunchResult Runtime::retain(const std::string &app_id, const Launch &p
   auto held = admission_.retain(app_id, *parent.reservation);
   if (!held.reservation)
     return {nullptr, false, held.error};
-  return {std::make_shared<const Launch>(Launch{held.reservation, parent.device, *cached}), false, {}};
+  return {std::make_shared<const Launch>(Launch{held.reservation, parent.device, *cached, parent.zero_copy}),
+          false,
+          {}};
 }
 std::string Runtime::resume(const Launch &launch) {
   return launch.reservation->resume(options_, [&] {
@@ -109,7 +115,9 @@ bool Runtime::supports(Codec codec) const {
       auto capability = cache_.lookup(device, generation);
       if (capability && capability->status == CapabilityCache::Status::ready) {
         const auto &binding = capability->codecs[static_cast<std::size_t>(codec)].encoder;
-        if (binding && binding->plugin == "va")
+        const auto &h264 = capability->codecs[0].encoder;
+        const bool zero_copy = options_.use_zero_copy && h264 && h264->zero_copy_postproc.has_value();
+        if (binding && binding->plugin == "va" && (!zero_copy || binding->zero_copy_postproc))
           return true;
       }
     }
@@ -142,7 +150,12 @@ void Runtime::verify(std::stop_token stop) {
         cache_.verify(device, generation, [&](const Device &d, Codec codec) {
           if (stop.stop_requested())
             return EncoderProbeResult{};
-          return probe_(d, codec, stop);
+          auto result = probe_(d, codec, stop);
+          if (options_.require_zero_copy && result.encoder && !result.encoder->zero_copy_postproc) {
+            result.encoder.reset();
+            result.failures.emplace_back("Excluded by WOLF_GPU_REQUIRE_ZERO_COPY: no verified zero-copy path");
+          }
+          return result;
         });
       }
     } catch (...) {

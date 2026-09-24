@@ -27,6 +27,19 @@ int main() {
   auto result = bind_pipeline(binding, templates, "interpipesrc listen-to={session_id}_video", "appsink");
   check(result.find("varenderD129h264enc bitrate={bitrate}") != std::string::npos, "exact GPU factory bound");
   check(result.find("lpenc") == std::string::npos, "normal encoder never inherits low-power template");
+  rejects([&] { bind_pipeline(binding, templates, "source", "sink", true); },
+          "zero-copy cannot be enabled without startup verification");
+  binding.zero_copy_postproc = "varenderD129postproc";
+  auto dma = bind_pipeline(binding, templates, "source", "sink", true);
+  check(dma.find(zero_copy_caps) != std::string::npos &&
+            dma.find("varenderD129postproc add-borders=true ! video/x-raw(memory:VAMemory)") != std::string::npos &&
+            dma.find("videoconvert") == std::string::npos,
+        "zero-copy binds exact converter and enforces DMA-BUF input plus VA encoder surfaces");
+  check(bind_pipeline(binding, templates, "source", "sink", false).find("videoconvertscale") != std::string::npos,
+        "explicit disable retains CPU-buffer path even on zero-copy-capable hardware");
+  binding.zero_copy_postproc = "vapostproc ! videoconvert";
+  rejects([&] { bind_pipeline(binding, templates, "source", "sink", true); }, "malformed converter fails closed");
+  binding.zero_copy_postproc.reset();
   check(result.find("width={width}") != std::string::npos && result.find("h264parse ! appsink") != std::string::npos,
         "format placeholders and configured parser are preserved");
   for (auto [codec, name] : {std::pair{Codec::h264, "h264"}, {Codec::hevc, "h265"}, {Codec::av1, "av1"}}) {

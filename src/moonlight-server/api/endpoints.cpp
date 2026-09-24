@@ -520,7 +520,7 @@ void UnixSocketServer::endpoint_LobbyCreate(const wolf::api::HTTPRequest &req, s
       target = state::gpu_target(*state_->app_state, held.launch, lobby_id);
       event->video_settings.wayland_render_node = held.launch->device.render_node;
       event->video_settings.runner_render_node = held.launch->device.render_node;
-      event->video_settings.video_producer_buffer_caps = "video/x-raw";
+      event->video_settings.video_producer_buffer_caps = target->producer_caps;
     }
     auto create_lobby_ev = events::CreateLobbyEvent{
         .gpu_target = target,

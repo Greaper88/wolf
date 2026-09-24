@@ -13,8 +13,10 @@ another test encode. Each session carries its selected device, verified encoder 
 context. Explicit environment GPU pins retain the legacy path. Eligible app configuration preserves
 selection intent rather than saving the automatically resolved node as a manual override.
 
-Automatic pipelines currently use VA hardware encoders and ordinary video buffers. No software
-fallback is used. The UI shows the selected GPU, available telemetry and stream errors.
+Automatic VA pipelines prefer a separately verified compositor DMA-BUF to VA-surface encode path.
+Converter and encoder both bind to the selected device. CPU-buffer conversion with hardware encoding
+remains available unless `WOLF_GPU_REQUIRE_ZERO_COPY=true` excludes it; software encoding is never used.
+The producer buffer mode stays with the retained app. The UI shows the selected GPU, available telemetry and stream errors.
 
 Single-user Wolf UI sub-apps inherit the launcher's GPU and hold independent retained assignments.
 Disconnecting or closing the original launcher does not move or close the sub-app. Its profile ID
@@ -58,7 +60,7 @@ IP fallback. Legacy IP-only connections are accepted only when they identify a u
 
 ## Known limitations and next work
 
-- Automatic NVIDIA/NVENC contexts, custom video overrides, zero-copy and multi-user lobby sharing
+- Automatic NVIDIA/NVENC contexts, custom video overrides and multi-user lobby sharing
   remain unsupported. Device-specific encoder discovery alone does not enable NVENC session routing.
 - A new sub-app currently inherits the launcher GPU as a hard assignment. Preferred-GPU placement
   with fallback before the app starts remains to be implemented. Existing apps must never migrate.

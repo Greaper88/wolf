@@ -25,6 +25,8 @@ struct Options {
   double encoder_variance = 5;
   std::string encoder_unknown_policy = "session_count";
   bool manual_override = false;
+  bool use_zero_copy = true;
+  bool require_zero_copy = false;
 
   bool enabled() const {
     return auto_select && !manual_override;

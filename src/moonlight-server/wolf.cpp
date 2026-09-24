@@ -115,8 +115,22 @@ auto initialize(std::string_view config_file, std::string_view pkey_filename, st
         gpu_options,
         [] { return wolf::gpu::discover(); },
         [] { return std::to_string(gst_registry_get_feature_list_cookie(gst_registry_get())); },
-        [](const wolf::gpu::Device &device, wolf::gpu::Codec codec, std::stop_token stop) {
-          return wolf::gpu::isolated_probe("/proc/self/exe", device, codec, stop);
+        [require_zero_copy = gpu_options.require_zero_copy](const wolf::gpu::Device &device,
+                                                            wolf::gpu::Codec codec,
+                                                            std::stop_token stop) {
+          auto result = wolf::gpu::isolated_probe("/proc/self/exe", device, codec, stop);
+          const char *name = codec == wolf::gpu::Codec::h264   ? "H264"
+                             : codec == wolf::gpu::Codec::hevc ? "HEVC"
+                                                               : "AV1";
+          logs::log(logs::info,
+                    "[GPU] Startup verification {} {}: {}",
+                    device.render_node,
+                    name,
+                    !result.encoder                      ? "hardware encode unavailable"
+                    : result.encoder->zero_copy_postproc ? "zero-copy verified (DMA-BUF -> VA)"
+                    : require_zero_copy ? "excluded: WOLF_GPU_REQUIRE_ZERO_COPY, no verified zero-copy path"
+                                        : "hardware encode verified; CPU-buffer fallback (zero-copy unavailable)");
+          return result;
         });
   }
   auto config = load_config(config_file, event_bus, running_sessions);

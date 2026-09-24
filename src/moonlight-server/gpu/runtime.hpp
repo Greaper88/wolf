@@ -23,6 +23,7 @@ public:
     std::shared_ptr<Admission::Reservation> reservation;
     Device device;
     CapabilityCache::Snapshot capabilities;
+    bool zero_copy = false;
   };
   struct LaunchResult {
     std::shared_ptr<const Launch> launch;

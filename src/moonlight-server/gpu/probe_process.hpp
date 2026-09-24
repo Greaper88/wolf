@@ -4,6 +4,8 @@
 #include <stop_token>
 
 namespace wolf::gpu {
+// Each phase has its own deadline: basic encoding first, then optional DMA-BUF/VA import.
+// Failure of the latter preserves a verified hardware encoder for non-strict policy.
 EncoderProbeResult isolated_probe(const std::string &executable,
                                   const Device &device,
                                   Codec codec,

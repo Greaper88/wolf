@@ -130,18 +130,28 @@ gpu_target(const AppState &state,
   auto target = std::make_shared<events::GpuStreamTarget>();
   target->launch = std::move(launch);
   target->producer = producer;
+  target->producer_caps = target->launch->zero_copy ? wolf::gpu::zero_copy_caps : "video/x-raw";
   target->context = context ? context : std::make_shared<immer::atom<gst_video_context::gst_context_ptr>>();
   const auto &cfg = state.config->gpu_video;
   auto bind = [&](std::size_t index, const std::vector<wolf::config::GstEncoder> &encoders) {
     const auto &verified = target->launch->capabilities.codecs[index].encoder;
-    if (!verified)
+    if (!verified || (target->launch->zero_copy && !verified->zero_copy_postproc))
       return std::string{};
     std::vector<wolf::gpu::PipelineTemplate> templates;
     for (const auto &e : encoders)
       templates.push_back({e.plugin_name, e.encoder_pipeline});
-    return wolf::gpu::bind_pipeline(*verified, templates, cfg.default_source, cfg.default_sink);
+    return wolf::gpu::bind_pipeline(*verified,
+                                    templates,
+                                    cfg.default_source,
+                                    cfg.default_sink,
+                                    target->launch->zero_copy);
   };
   target->pipelines = {bind(0, cfg.h264_encoders), bind(1, cfg.hevc_encoders), bind(2, cfg.av1_encoders)};
+  logs::log(logs::info,
+            "[GPU] Producer {} uses {} on {}",
+            producer,
+            target->launch->zero_copy ? "zero-copy (DMA-BUF -> VA)" : "CPU-buffer conversion with hardware encoding",
+            target->launch->device.render_node);
   return target;
 }
 
@@ -157,31 +167,21 @@ inline void prepare_gpu_session(const AppState &state, events::StreamSession &se
     return;
   if (!result.launch)
     throw std::runtime_error(result.error);
-  const auto &cfg = state.config->gpu_video;
-  auto pipeline = [&](std::size_t index, const std::vector<wolf::config::GstEncoder> &encoders) {
-    const auto &verified = result.launch->capabilities.codecs[index].encoder;
-    if (!verified)
-      return std::string{};
-    std::vector<wolf::gpu::PipelineTemplate> templates;
-    for (const auto &encoder : encoders)
-      templates.push_back({encoder.plugin_name, encoder.encoder_pipeline});
-    return wolf::gpu::bind_pipeline(*verified, templates, cfg.default_source, cfg.default_sink);
-  };
+  auto home = gpu_target(state, result.launch, std::to_string(session.session_id));
   auto app = std::make_shared<events::App>(*session.app);
-  app->h264_gst_pipeline = pipeline(0, cfg.h264_encoders);
-  app->hevc_gst_pipeline = pipeline(1, cfg.hevc_encoders);
-  app->av1_gst_pipeline = pipeline(2, cfg.av1_encoders);
-  app->video_producer_buffer_caps = "video/x-raw";
+  app->h264_gst_pipeline = home->pipelines[0];
+  app->hevc_gst_pipeline = home->pipelines[1];
+  app->av1_gst_pipeline = home->pipelines[2];
+  app->video_producer_buffer_caps = home->producer_caps;
   app->render_node = result.launch->device.render_node;
   session.display_mode.hevc_supported = !app->hevc_gst_pipeline.empty();
   session.display_mode.av1_supported = !app->av1_gst_pipeline.empty();
   session.app = std::move(app);
-  session.video_context = std::make_shared<immer::atom<gst_video_context::gst_context_ptr>>();
+  session.video_context = home->context;
   session.gpu = result.launch->reservation->gpu();
   session.gpu_launch = std::move(result.launch);
   session.gpu_route = std::make_shared<events::GpuStreamRoute>();
-  session.gpu_route->home =
-      gpu_target(state, session.gpu_launch, std::to_string(session.session_id), session.video_context);
+  session.gpu_route->home = std::move(home);
   session.gpu_route->target.store(session.gpu_route->home);
   session.gpu_route->runtime = state.gpu_runtime;
 }
