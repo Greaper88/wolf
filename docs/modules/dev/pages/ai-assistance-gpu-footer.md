@@ -40,9 +40,9 @@ semantics; it does not count distinct profiles.
   Its actual footer scene was rendered at ordinary and narrow widths, checking
   left alignment, truncation and separation from the right-side action hints.
 
-Local candidates are `wolf:gpu-footer-candidate` and
-`wolf-ui:gpu-footer-candidate`. They have not replaced the running services or
-the published development tags as part of this change.
+Initial verification used local candidates `wolf:gpu-footer-candidate` and
+`wolf-ui:gpu-footer-candidate`. Release builds, publication digests and deployment
+are recorded in [the publication record](gpu-footer-publication-2026-09-25.md).
 
 ## Tools
 
