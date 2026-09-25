@@ -1,172 +1,87 @@
-name: Docker build
+name: Publish container image
 
 on:
   push:
+    branches: [auto-gpu-selection, dev-gpu-selection]
     paths-ignore:
       - "docs/**"
-      - ".github/**"
+      - "**/*.md"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: publish-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
-  buildx:
+  publish:
+    if: github.ref_name == 'auto-gpu-selection' || github.ref_name == 'dev-gpu-selection'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # Set derived configuration variables:
-      # - images: images to build (docker and/or github)
-      # - push: if images need to be uploaded to repository (when secrets available)
-      # - has_docker_token
-      # - has_github_token
-      # - cache_from: image tag to use for imported cache
-      # - cache_to: image tag to use for exported cache
-      # - github_server_url: reference to source code repository
-      - name: Prepare
-        id: prep
+      - name: Select image channel
+        id: channel
+        shell: bash
         run: |
-          IMAGES=""
-          PUSH=false
-          if [ -n "${{ secrets.DOCKERHUB_TOKEN }}" ]; then
-            IMAGES="gameonwhales/wolf"
-            PUSH=true
-            echo "has_docker_token=true" >> $GITHUB_OUTPUT
-          fi
-          if [ -n "${{ secrets.GHCR_TOKEN }}" ]; then
-            REGISTRY_IMAGE="ghcr.io/${{ github.repository_owner }}/wolf"
-            if [ "$IMAGES" = "" ]; then
-              IMAGES="ghcr.io/${REGISTRY_IMAGE}"
-            else
-              IMAGES="$IMAGES,ghcr.io/${REGISTRY_IMAGE}"
-            fi
-            PUSH=true
-            echo "has_github_token=true" >> $GITHUB_OUTPUT
-            echo "cache_from=type=registry,ref=${REGISTRY_IMAGE}:buildcache" >> $GITHUB_OUTPUT
-            echo "cache_to=type=registry,ref=${REGISTRY_IMAGE}:buildcache,mode=max" >> $GITHUB_OUTPUT
-          else
-            echo "cache_from=type=registry,ref=${REGISTRY_IMAGE}:buildcache" >> $GITHUB_OUTPUT
-            echo "cache_to=" >> $GITHUB_OUTPUT
-          fi
-          echo "images=${IMAGES}" >> $GITHUB_OUTPUT
-          echo "push=${PUSH}" >> $GITHUB_OUTPUT
-          echo "github_server_url=${GITHUB_SERVER_URL}" >> $GITHUB_OUTPUT
+          case "$GITHUB_REF_NAME" in
+            auto-gpu-selection) tag=latest ;;
+            dev-gpu-selection) tag=gpu-selection-dev ;;
+            *) exit 1 ;;
+          esac
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "image=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
 
-      - name: Docker meta
+      - name: Read optional AI provenance from the commit
+        id: provenance
+        shell: bash
+        run: |
+          {
+            echo 'labels<<AI_PROVENANCE'
+            git log -1 --format=%B | git interpret-trailers --parse | awk '
+              /^AI-Agent: / {sub(/^AI-Agent: /, ""); print "ai.agent=" $0}
+              /^AI-Model-Version: / {sub(/^AI-Model-Version: /, ""); print "ai.model-version=" $0}
+              /^AI-Inference-Date: / {sub(/^AI-Inference-Date: /, ""); print "ai.inference-date=" $0}
+            '
+            echo 'AI_PROVENANCE'
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Image metadata
         id: meta
-        uses: docker/metadata-action@v4
+        uses: docker/metadata-action@v5
         with:
-          # list of Docker images to use as base name for tags
-          images: ${{ steps.prep.outputs.images }}
-          # generate Docker tags based on the following events/attributes
+          images: ${{ steps.channel.outputs.image }}
           tags: |
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}
-            type=edge,branch=master
-            type=ref,event=branch
-            type=raw,value=alpha
-            type=sha
-          flavor: latest=false # let's not produce a :latest tag
+            type=raw,value=${{ steps.channel.outputs.tag }}
+            type=sha,format=long,prefix=sha-
+          flavor: latest=false
+          labels: |
+            org.opencontainers.image.version=${{ steps.channel.outputs.tag }}
+            ${{ steps.provenance.outputs.labels }}
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v2
-        with:
-          install: true
-          version: latest
-          driver-opts: image=moby/buildkit:master
+        uses: docker/setup-buildx-action@v3
 
-      - name: Login to DockerHub
-        if: steps.prep.outputs.has_docker_token != '' # secrets not available in PRs
-        uses: docker/login-action@v2
-        with:
-          username: abeltramo
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-
-
-      - name: Login to GitHub Container Registry
-        if: steps.prep.outputs.has_github_token != '' # secrets not available in PRs
-        uses: docker/login-action@v2
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.repository_owner }}
-          password: ${{ secrets.GHCR_TOKEN }}
+          password: ${{ secrets.GHCR_TOKEN || secrets.GITHUB_TOKEN }}
 
-      - name: Build GPU Drivers
-        uses: docker/build-push-action@v3
+      - name: Build and publish
+        uses: docker/build-push-action@v6
         with:
-          builder: ${{ steps.buildx.outputs.name }}
-          context: docker/
-          file: docker/gpu-drivers.Dockerfile
-          push: true
-          tags: ghcr.io/${{ github.repository_owner }}/gpu-drivers:2025.05,gameonwhales/gpu-drivers:2025.05 # TODO: set build version as param
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=registry,ref=ghcr.io/${{ github.repository_owner }}/gpu-drivers:buildcache
-          cache-to: type=registry,ref=ghcr.io/${{ github.repository_owner }}/gpu-drivers:buildcache,mode=max
-
-      - name: Build Gstreamer
-        uses: docker/build-push-action@v3
-        with:
-          builder: ${{ steps.buildx.outputs.name }}
-          context: docker/
-          file: docker/gstreamer.Dockerfile
-          push: true
-          build-args: |
-            GSTREAMER_VERSION=1.26.7
-            BASE_IMAGE=ghcr.io/${{ github.repository_owner }}/gpu-drivers:2025.05
-          tags: ghcr.io/${{ github.repository_owner }}/gstreamer:1.26.7,gameonwhales/gstreamer:1.26.7 # TODO: set gstreamer version as param
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=registry,ref=ghcr.io/${{ github.repository_owner }}/gstreamer:buildcache
-          cache-to: type=registry,ref=ghcr.io/${{ github.repository_owner }}/gstreamer:buildcache,mode=max
-
-      - name: Build Wolf
-        uses: docker/build-push-action@v3
-        with:
-          builder: ${{ steps.buildx.outputs.name }}
           context: .
           file: docker/wolf.Dockerfile
-          push: ${{ steps.prep.outputs.push }}
+          push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
-            BASE_IMAGE=ghcr.io/${{ github.repository_owner }}/gstreamer:1.26.7
-            IMAGE_SOURCE=${{ steps.prep.outputs.github_server_url }}/${{ github.repository }}
-          cache-from: ${{ steps.prep.outputs.cache_from }}
-          cache-to: ${{ steps.prep.outputs.cache_to }}
-
-  test_devcontainer:
-    runs-on: ubuntu-latest
-    needs: buildx
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Login to GitHub Container Registry
-        if: steps.prep.outputs.has_github_token != '' # secrets not available in PRs
-        uses: docker/login-action@v2
-        with:
-          registry: ghcr.io
-          username: ${{ github.repository_owner }}
-          password: ${{ secrets.GHCR_TOKEN }}
-
-      - name: Run tests in devcontainer
-        uses: devcontainers/ci@v0.3
-        with:
-          imageTag: devcontainer
-          imageName: ghcr.io/${{ github.repository_owner }}/wolf
-          cacheFrom: ghcr.io/${{ github.repository_owner }}/wolf:buildcache
-          push: never
-          # TODO:
-          # runCmd: |
-          #   cmake -Bbuild \
-          #         -H$GITHUB_WORKSPACE \
-          #         -DCMAKE_BUILD_TYPE=Debug \
-          #         -DCMAKE_CXX_EXTENSIONS=OFF \
-          #         -DTEST_VIRTUAL_INPUT=OFF \
-          #         -DTEST_DOCKER=ON \
-          #         -DTEST_RUST_WAYLAND=ON \
-          #         -DTEST_NVIDIA=OFF \
-          #         -DTEST_EXCEPTIONS=OFF \
-          #         -DTEST_UHID=OFF \
-          #         -G Ninja
-          #
-          #   ninja -j $(nproc) wolftests
-          #
-          #   ./wolftests --reporter JUnit::out=${{runner.workspace}}/report.xml --reporter console::out=-::colour-mode=ansi
+            WOLF_BUILD_JOBS=2
+          cache-from: type=gha,scope=${{ steps.channel.outputs.tag }}
+          cache-to: type=gha,scope=${{ steps.channel.outputs.tag }},mode=max

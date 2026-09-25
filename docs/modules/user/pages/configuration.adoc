@@ -154,7 +154,7 @@ id = 'moonlight-profile-id'
         [profiles.apps.runner]
         type = 'docker'
         name = 'Wolf-UI'
-        image = 'ghcr.io/greaper88/wolf-ui:gpu-selection-dev'
+        image = 'ghcr.io/greaper88/wolf-ui:latest'
         devices = []
         env = [
             'GOW_REQUIRED_DEVICES=/dev/input/event* /dev/dri/* /dev/nvidia*',
