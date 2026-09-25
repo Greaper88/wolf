@@ -1,4 +1,10 @@
 # Automatic GPU selection development fork:
+
+This is the `dev-gpu-selection` branch for future NVIDIA and vGPU work. For the
+primary AMD/Mesa release, use [`auto-gpu-selection`](https://github.com/Greaper88/wolf/tree/auto-gpu-selection)
+and the matching `ghcr.io/greaper88/wolf:latest` / `ghcr.io/greaper88/wolf-ui:latest` images.
+The development image pair below remains available for testing.
+
 **If migrating from an existing install from the upstream fork, the Wolf-UI image in the config.toml file will need to be updated.**
 
 This fork aims to automatically detect, select, reject, and load balance across all GPUs in a multi-GPU system. 
