@@ -1,6 +1,8 @@
 #include "discovery.hpp"
 #include <algorithm>
+#include <charconv>
 #include <fstream>
+#include <map>
 #include <regex>
 #include <set>
 #ifdef __linux__
@@ -12,6 +14,71 @@
 
 namespace wolf::gpu {
 namespace {
+std::string trim(std::string value) {
+  auto first = value.find_first_not_of(" \t\r\n");
+  return first == std::string::npos ? "" : value.substr(first, value.find_last_not_of(" \t\r\n") - first + 1);
+}
+
+std::optional<unsigned int> hex_number(std::string value) {
+  value = trim(std::move(value));
+  if (value.starts_with("0x") || value.starts_with("0X"))
+    value.erase(0, 2);
+  unsigned int result;
+  auto [end, ec] = std::from_chars(value.data(), value.data() + value.size(), result, 16);
+  if (ec != std::errc{} || end != value.data() + value.size())
+    return std::nullopt;
+  return result;
+}
+
+struct DeviceNames {
+  std::map<std::pair<unsigned int, unsigned int>, std::string> amd, pci;
+
+  explicit DeviceNames(const DiscoveryPaths &paths) {
+    std::ifstream amd_file(paths.amdgpu_ids);
+    std::string line;
+    while (std::getline(amd_file, line)) {
+      auto first = line.find(','), second = line.find(',', first == std::string::npos ? first : first + 1);
+      if (first == std::string::npos || second == std::string::npos)
+        continue;
+      auto device = hex_number(line.substr(0, first));
+      auto revision = hex_number(line.substr(first + 1, second - first - 1));
+      auto name = trim(line.substr(second + 1));
+      if (device && revision && !name.empty())
+        amd[{*device, *revision}] = name;
+    }
+    std::ifstream pci_file(paths.pci_ids);
+    if (!pci_file && paths.pci_ids == DiscoveryPaths{}.pci_ids)
+      pci_file.open("/usr/share/misc/pci.ids");
+    std::optional<unsigned int> vendor;
+    while (std::getline(pci_file, line)) {
+      if (line.empty() || line.front() == '#')
+        continue;
+      if (line.front() != '\t') {
+        vendor = line.size() > 4 && line[4] == ' ' ? hex_number(line.substr(0, 4)) : std::nullopt;
+      } else if (vendor && line.size() > 5 && line[1] != '\t' && line[5] == ' ') {
+        if (auto device = hex_number(line.substr(1, 4)))
+          pci[{*vendor, *device}] = trim(line.substr(5));
+      }
+    }
+  }
+
+  std::string lookup(unsigned int vendor, unsigned int device, std::optional<unsigned int> revision) const {
+    if (vendor == 0x1002 && revision) {
+      if (auto it = amd.find({device, *revision}); it != amd.end())
+        return it->second;
+    }
+    if (auto it = pci.find({vendor, device}); it != pci.end())
+      return it->second;
+    return vendor == 0x1002 ? "AMD GPU" : vendor == 0x8086 ? "Intel GPU" : vendor == 0x10de ? "NVIDIA GPU" : "GPU";
+  }
+};
+
+const DeviceNames &system_device_names() {
+  // Immutable name databases are loaded once; telemetry refreshes do not reread them.
+  static const DeviceNames names(DiscoveryPaths{});
+  return names;
+}
+
 std::optional<std::uint64_t> read_number(const std::filesystem::path &path) {
   std::ifstream file(path);
   std::string value;
@@ -110,6 +177,10 @@ std::vector<Device> discover(const DiscoveryPaths &paths, const CapabilityProbe 
 #ifdef __linux__
   std::error_code ec;
   std::set<std::string> seen;
+  std::optional<DeviceNames> custom_names;
+  if (paths.amdgpu_ids != DiscoveryPaths{}.amdgpu_ids || paths.pci_ids != DiscoveryPaths{}.pci_ids)
+    custom_names.emplace(paths);
+  const auto &names = custom_names ? *custom_names : system_device_names();
   std::filesystem::directory_iterator it(paths.dri, ec), end;
   for (; !ec && it != end; it.increment(ec)) {
     auto node_name = it->path().filename().string();
@@ -132,9 +203,13 @@ std::vector<Device> discover(const DiscoveryPaths &paths, const CapabilityProbe 
     d.driver = std::filesystem::path(resolved_path(sys_device / "driver")).filename().string();
     auto vendor = read_text(sys_device / "vendor");
     auto product = read_text(sys_device / "device");
-    d.name = read_text(sys_device / "product_name");
-    if (d.name.empty())
-      d.name = d.driver + " " + vendor + ":" + product + " (" + d.id + ")";
+    d.name = trim(read_text(sys_device / "product_name"));
+    if (d.name.empty()) {
+      auto vendor_id = hex_number(vendor), device_id = hex_number(product);
+      d.name = vendor_id && device_id
+                   ? names.lookup(*vendor_id, *device_id, hex_number(read_text(sys_device / "revision")))
+                   : "GPU";
+    }
     struct stat info{};
     if (stat(d.render_node.c_str(), &info) == 0 && S_ISCHR(info.st_mode)) {
       int fd = open(d.render_node.c_str(), O_RDWR | O_CLOEXEC);

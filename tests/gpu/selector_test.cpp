@@ -305,10 +305,26 @@ void discovery_tests() {
   std::ofstream(pci / "mem_info_vram_total") << "8589934592";
   std::ofstream(pci / "mem_info_vram_used") << "4294967296";
   std::ofstream(pci / "gpu_busy_percent") << "41";
-  auto result = discover({dir / "dri", dir / "sys"});
+  std::ofstream(dir / "amdgpu.ids") << "# test names\n1234, 00, AMD Wrong Revision\n1234, CF, AMD Test GPU\n";
+  std::ofstream(dir / "pci.ids") << "1002  AMD\n\t1234  Generic AMD GPU\n\t\t1002 0000  Board name\n"
+                                 << "8086  Intel\n\t1234  Intel Test Graphics\nC 03 Display\n\t00 VGA\n";
+  DiscoveryPaths paths{dir / "dri", dir / "sys", dir / "amdgpu.ids", dir / "pci.ids"};
+  std::ofstream(pci / "revision") << "0xcf";
+  auto result = discover(paths);
   check(result.size() == 1 && result[0].id == "0000:02:00.0", "PCI identity discovery");
   check(!result[0].by_path.empty() && result[0].driver == "amdgpu", "by-path and driver resolution");
   check(result[0].vram_percent == 50 && result[0].gpu_percent == 41, "sysfs telemetry");
+  check(result[0].name == "AMD Test GPU", "AMD marketing name uses device and revision, not shared PCI ID alone");
+  std::ofstream(pci / "revision") << "0xff";
+  check(discover(paths)[0].name == "Generic AMD GPU", "unknown AMD revision falls back to PCI device name");
+  std::ofstream(pci / "vendor") << "0x8086";
+  check(discover(paths)[0].name == "Intel Test Graphics", "PCI device name is scoped to its vendor");
+  std::ofstream(pci / "device") << "0xffff";
+  check(discover(paths)[0].name == "Intel GPU", "unknown device uses a friendly fallback without PCI identifiers");
+  std::ofstream(pci / "product_name") << "  Firmware GPU Name  \n";
+  check(discover(paths)[0].name == "Firmware GPU Name", "firmware product name takes precedence");
+  std::ofstream(pci / "gpu_busy_percent") << "invalid";
+  check(!discover(paths)[0].gpu_percent, "unavailable usage remains unknown rather than stale or zero");
   check(!result[0].accessible && !result[0].hardware_encoder && !result[0].encoder_percent,
         "regular file cannot masquerade as GPU; unknown encoder stays unknown");
   check(discover({dir / "missing", dir / "sys"}).empty(), "missing DRM directory is safe");

@@ -66,6 +66,8 @@ struct SessionGpu {
   std::optional<double> projected_encoder_percent;
   unsigned int session_count_on_gpu = 0;
   std::optional<std::string> stream_error;
+  std::optional<double> gpu_percent;
+  std::optional<std::string> codec;
 };
 
 struct Rejection {

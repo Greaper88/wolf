@@ -96,8 +96,14 @@ Automatic pool classification currently treats NVIDIA and devices reporting more
 VRAM as preferred. Unclassified/shared-memory devices are last resort. This is a conservative heuristic.
 
 The optional session `gpu` field includes identity, name, render/encoder node, VRAM bytes, encoder usage,
-projected admission usage and session count. The UI shows `max(0, session_count_on_gpu - 1)` as other users.
-The status line remains hidden until launch integration populates metadata. Old servers remain compatible.
+projected admission usage, device-wide `gpu_percent`, negotiated stream `codec` and session count.
+The UI's existing bottom bar shows the human-readable GPU name, short render node, codec,
+`GPU usage`, VRAM capacity and `Other users on GPU`. PCI identifiers and encoder utilization remain
+available to backend diagnostics but are not displayed in the bar. GPU usage is total device usage,
+including other applications; an unavailable reading remains unknown.
+The UI shows `max(0, session_count_on_gpu - 1)` as other users; this counts stream sessions,
+not distinct profiles. The status stays hidden if the server omits GPU metadata. Older servers remain
+compatible, with missing codec/usage fields displayed as unknown.
 
 Disconnecting keeps the application, GPU assignment and video context intact. Its encoder capacity
 is released after the stream pipeline stops, so another session may use the same GPU. Resume checks

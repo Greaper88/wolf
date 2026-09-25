@@ -86,6 +86,14 @@ try:
         raise SystemExit(0)
     add(0);add(1);g0,g1=gpu(0),gpu(1);assert g0!=g1,(g0,g1)
     u0=stream(0);u1=stream(1);frames(u0);frames(u1)
+    for current in sessions():
+        assert current['gpu']['codec']=='HEVC',current['gpu']
+        assert current['gpu']['name'] and '0x' not in current['gpu']['name'],current['gpu']
+        usage=current['gpu'].get('gpu_percent')
+        assert usage is None or 0 <= float(usage) <= 100,current['gpu']
+    print('PASS: session display metadata',[
+        {key:s['gpu'].get(key) for key in ('name','render_node','codec','gpu_percent')}
+        for s in sessions()],flush=True)
     print('PASS: both launchers encode on separate GPUs',g0,g1,flush=True)
     payload=dict(source_session_id=sid[0],profile_id='gpu-profile',name='Persistent test app',multi_user=False,
         stop_when_everyone_leaves=False,runner_state_folder='profile-data/gpu-profile/test-app',
@@ -109,6 +117,8 @@ try:
     time.sleep(1);after=frames(u1)
     assert max(after)>before,(before,after[-10:])
     assert gpu(1)==g0,'viewer encoder must follow app GPU'
+    current=next(s for s in sessions() if s['client_id']==sid[1])
+    assert current['gpu']['codec']=='HEVC',current['gpu']
     print('PASS: cross-device join reuses app and moves encoder to its GPU with continuing frames',flush=True)
     ok('lobbies/leave',dict(lobby_id=lobby,moonlight_session_id=sid[1]));time.sleep(1)
     frames(u1);assert gpu(1)==g1,'return must restore launcher GPU'

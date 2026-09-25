@@ -223,8 +223,25 @@ void UnixSocketServer::endpoint_StreamSessions(const HTTPRequest &req, std::shar
       else if (session.gpu_launch)
         gpu.stream_error = session.gpu_launch->reservation->error();
       gpu.encoder_percent.reset(); // A vanished/unreadable GPU must not keep a stale usage value.
+      gpu.gpu_percent.reset();
+      gpu.codec.reset();
+      if (session.gpu_route) {
+        switch (session.gpu_route->codec.load()) {
+        case 0:
+          gpu.codec = "H.264";
+          break;
+        case 1:
+          gpu.codec = "HEVC";
+          break;
+        case 2:
+          gpu.codec = "AV1";
+          break;
+        }
+      }
       for (const auto &device : devices) {
         if (device.id == gpu.id) {
+          gpu.name = device.name;
+          gpu.gpu_percent = device.gpu_percent;
           gpu.encoder_percent = device.encoder_percent;
           if (device.vram_bytes)
             gpu.vram_bytes = device.vram_bytes;

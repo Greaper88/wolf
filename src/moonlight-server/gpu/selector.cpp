@@ -208,7 +208,17 @@ Selection select(const std::vector<Device> &snapshot, const Options &o, bool ret
   return result;
 }
 SessionGpu metadata(const Device &d, std::optional<double> projected, unsigned int count) {
-  return {d.id, d.name, d.render_node, d.render_node, d.vram_bytes, d.encoder_percent, projected, count, std::nullopt};
+  return {.id = d.id,
+          .name = d.name,
+          .render_node = d.render_node,
+          .encoder_node = d.render_node,
+          .vram_bytes = d.vram_bytes,
+          .encoder_percent = d.encoder_percent,
+          .projected_encoder_percent = projected,
+          .session_count_on_gpu = count,
+          .stream_error = std::nullopt,
+          .gpu_percent = d.gpu_percent,
+          .codec = std::nullopt};
 }
 std::string Selection::error() const {
   if (device)
