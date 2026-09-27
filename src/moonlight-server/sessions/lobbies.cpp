@@ -262,8 +262,32 @@ setup_lobbies_handlers(const immer::box<state::AppState> &app_state,
           }
           auto route = session->gpu_route;
           auto current = route->target.load();
-          if (lobby->gpu_target->pipelines[route->codec.load()].empty()) {
-            fail("The app GPU cannot encode this stream's codec. Reconnect Moonlight using H.264 or HEVC");
+          const auto codec = route->codec.load();
+          if (lobby->gpu_target->pipelines[codec].empty()) {
+            constexpr std::array<std::string_view, 3> codec_names = {"H.264", "HEVC (H.265)", "AV1"};
+            std::string supported;
+            // These pipelines already reflect cached encoder verification and the app's fixed buffer mode.
+            for (std::size_t i = 0; i < codec_names.size(); ++i) {
+              if (!lobby->gpu_target->pipelines[i].empty()) {
+                if (!supported.empty())
+                  supported += " or ";
+                supported += codec_names[i];
+              }
+            }
+            const auto &device = lobby->gpu_target->launch->device;
+            const auto node = std::filesystem::path(device.render_node).filename().string();
+            const auto gpu_name = device.name.empty() ? node : fmt::format("{} ({})", device.name, node);
+            const auto reconnect = supported.empty()
+                                       ? "No compatible codecs are available for this app's current GPU session."
+                                       : fmt::format("To resume, disconnect Moonlight, select {} in its video codec "
+                                                     "settings, then reconnect. The app will stay running.",
+                                                     supported);
+            fail(fmt::format("This app's GPU, {}, cannot encode the current {} stream.\n\n{}\n\n"
+                             "Or stop the app in Wolf-UI and start it again on your current Wolf-UI GPU. "
+                             "Stopping the app may lose unsaved progress.",
+                             gpu_name,
+                             codec_names[codec],
+                             reconnect));
             return;
           }
           auto launch = current->launch;
