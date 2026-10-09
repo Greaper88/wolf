@@ -48,8 +48,16 @@ Wolf is configured via a TOML config file and some additional optional ENV varia
 |The full path to the docker socket, doesn't support tcp (yet)
 
 |NVIDIA_DRIVER_VOLUME_NAME
-|nvidia-driver-vol
-|The name of the externally created Docker Volume that holds the Nvidia drivers
+|_(automatically selected)_
+|App driver volume selected at startup. An explicit name is validated in automatic mode. Use `WOLF_NVIDIA_DRIVER_MODE=manual` for an existing unmanaged volume.
+
+|WOLF_NVIDIA_DRIVER_MODE
+|auto
+|`auto` provisions a verified app driver volume only when an NVIDIA kernel driver is loaded. `volume` requires NVIDIA; `toolkit` uses native CDI for apps; `manual` retains the explicit legacy driver-volume setup.
+
+|WOLF_NVIDIA_DRIVER_HELPER_IMAGE
+|_(this Wolf image)_
+|Override the image used for volume validation if Wolf cannot identify its own Docker container, for example with unusual hostname or socket configurations.
 
 |HOST_APPS_STATE_FOLDER
 |/etc/wolf
@@ -71,6 +79,36 @@ Wolf is configured via a TOML config file and some additional optional ENV varia
 |1000
 |The default GID that apps run as, applied to newly paired clients; existing clients keep their saved values
 |===
+
+=== Automatic NVIDIA app driver volumes
+
+On Linux x86_64, `WOLF_NVIDIA_DRIVER_MODE=auto` checks the loaded NVIDIA kernel
+driver version before Wolf starts. AMD/Intel-only systems skip provisioning.
+For NVIDIA, Wolf builds a driver-only package from the matching NVIDIA installer
+on first use, including 64-bit and 32-bit graphics libraries, CUDA, NVENC and GBM.
+The Docker daemon needs network access for this first build or a new driver
+version. A valid cached volume can be reused offline.
+
+Every startup verifies the required architectures and the volume's file/link
+manifest. Driver updates or an invalid managed volume select a new volume;
+existing volumes are retained rather than overwritten under running apps. App
+containers receive the selected volume read-only and only their assigned GPU
+device nodes. Volume checks happen at server startup, not on each app launch.
+
+An explicit `NVIDIA_DRIVER_VOLUME_NAME` is checked but never overwritten. Select
+`manual` mode to retain an unmanaged legacy volume without automatic validation.
+Provisioning or validation errors stop startup with an explicit diagnostic instead
+of silently handing apps incompatible libraries.
+
+This currently automates app drivers. Wolf's own container still needs its
+existing NVIDIA library/device setup, such as native CDI. It does not install
+host drivers, change kernel modules or configure modesetting.
+
+The development image ships CUDA 12.4 NVRTC for GStreamer's CUDA conversion;
+the host driver must support that runtime. NVIDIA testing currently covers two
+GTX 1080s with proprietary driver 580.178.04, Docker 29.8.1 and Toolkit 1.20.1.
+New configurations use the current NVENC H.264 defaults (`preset=p1`,
+`tune=ultra-low-latency`, `rc-mode=cbr`). Existing encoder templates are retained.
 
 Additional env variables useful when debugging:
 

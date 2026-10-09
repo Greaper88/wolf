@@ -115,7 +115,8 @@ EncoderProbeResult run_probe(const std::string &executable,
       (plugin != "va" && plugin != "nvcodec") || cuda < -1 || cuda > 2147483647 || (plugin == "nvcodec" && cuda < 0) ||
       (plugin == "va" && cuda != -1) ||
       (postproc != "-" &&
-       (plugin != "va" || !postproc.starts_with("va") || !postproc.ends_with("postproc") ||
+       ((plugin == "va" && (!postproc.starts_with("va") || !postproc.ends_with("postproc"))) ||
+        (plugin == "nvcodec" && postproc != "cudaconvertscale") ||
         postproc.find_first_not_of("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_") !=
             std::string::npos)))
     return failure("Invalid GPU probe response");
@@ -140,12 +141,13 @@ EncoderProbeResult isolated_probe(const std::string &executable,
   auto result = run_probe(executable, device, codec, stop, timeout);
   if (result.encoder)
     result.encoder->zero_copy_postproc.reset();
-  if (result.encoder && result.encoder->plugin == "va" && !stop.stop_requested()) {
+  if (result.encoder && !stop.stop_requested()) {
     auto dma = run_probe(executable, device, codec, stop, timeout, result.encoder->factory);
     if (dma.encoder && dma.encoder->factory == result.encoder->factory)
       result.encoder->zero_copy_postproc = dma.encoder->zero_copy_postproc;
     if (!result.encoder->zero_copy_postproc)
-      result.failures.emplace_back("Zero-copy compositor/VA encode verification failed; CPU-buffer fallback available");
+      result.failures.emplace_back(
+          "Zero-copy compositor/converter encode verification failed; CPU-buffer fallback available");
   }
   return result;
 }

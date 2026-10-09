@@ -9,3 +9,5 @@
 !docker/gstreamer.control
 !docker/startup.sh
 !docker/supervisord.conf
+!docker/nvidia-driver-volume.py
+!docker/nvidia-driver.Dockerfile

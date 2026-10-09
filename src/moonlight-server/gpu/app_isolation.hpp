@@ -70,4 +70,12 @@ inline bool mesa_selection_env(std::string_view item) {
   return item.starts_with("DRI_PRIME=") || item.starts_with("MESA_VK_DEVICE_SELECT=") ||
          item.starts_with("MESA_VK_DEVICE_SELECT_FORCE_DEFAULT_DEVICE=");
 }
+inline bool nvidia_selection_env(std::string_view item) {
+  return item.starts_with("NVIDIA_VISIBLE_DEVICES=") || item.starts_with("NVIDIA_DRIVER_CAPABILITIES=") ||
+         item.starts_with("WOLF_NVIDIA_GPU_UUID=") || item.starts_with("CUDA_VISIBLE_DEVICES=") ||
+         item.starts_with("__GLX_VENDOR_LIBRARY_NAME=") || item.starts_with("__NV_PRIME_RENDER_OFFLOAD=") ||
+         item.starts_with("__NV_PRIME_RENDER_OFFLOAD_PROVIDER=") || item.starts_with("__VK_LAYER_NV_optimus=") ||
+         item.starts_with("__EGL_VENDOR_LIBRARY_FILENAMES=") || item.starts_with("VK_DRIVER_FILES=") ||
+         item.starts_with("VK_ICD_FILENAMES=");
+}
 } // namespace wolf::gpu

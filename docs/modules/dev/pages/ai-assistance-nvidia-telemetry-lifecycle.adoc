@@ -1,0 +1,93 @@
+= NVIDIA development: CPU incident and telemetry lifecycle fix
+
+AI-Agent: ChatGPT Codex
+
+AI-Model-Version: GPT-6.1 Sol Extra High (client-displayed model label supplied by maintainer)
+
+AI-Inference-Date: 2026-10-09 05:01:29 UTC
+
+== Findings
+
+The maintainer reported successful connection after initial failures, followed by
+host CPU saturation. Process and journal inspection showed a recursive host KDE
+crash-reporting failure: over 374 `drkonqi-coredump-launcher` crashes and hundreds
+of Apport workers. The Plasma-related initial crash was `ksplashqml` inside the
+Wolf Plasma Docker cgroup, not the host `plasmashell`. The recursive launchers
+ran in host UID 1000's user manager, whose real host username is `greaper`.
+The container's passwd database had initially displayed that UID as `ubuntu`.
+
+The reported stream used 1920x1080 at 30 FPS, HEVC, CUDA producer buffers,
+`cudaconvertscale` and NVENC with no `cudaupload` stage. Wolf and Wolf-UI together
+used less than one CPU core in the initial samples. The CPU saturation was the
+host reporter storm, not evidence of a software video encoder.
+
+Wolf also crashed earlier after reaching its 1024-descriptor soft limit. Twenty
+live GPU metadata queries grew its eventfd count by 40. A disposable driver test
+reproduced one leaked eventfd per NVML initialization/shutdown/reload cycle.
+This was a separate Wolf automatic-selection telemetry lifecycle bug and explains
+the initial connection errors and subsequent restart/startup verification.
+
+== Actions and validation
+
+Runtime-masked only `greaper`'s `drkonqi-coredump-launcher.socket` and
+`drkonqi-coredump-launcher@.service`, and stopped launcher instances. The mask is
+in `/run/user/1000/systemd/user`, not a persistent system-wide change. Core capture
+and unrelated user apps were retained. Targeted Apport termination attempts
+reported zero workers stopped; the existing backlog drained naturally after the
+launcher recursion was contained. Core dumps and reports were not deleted.
+Subsequent CPU samples showed 61-75% idle, and a later sample showed 81% idle.
+
+Temporarily raised only the old live Wolf process's descriptor soft limit to
+65536, preserving its 524288 hard limit, to prevent another failure while building.
+This limit applied to that process only and ended when it was replaced.
+
+NVML now has one process-lifetime library/session with serialized initialization
+and sampling. Every poll still resolves the PCI device and reads current telemetry;
+failed device queries still clear stale readings. Initialization failures can be
+retried. Shutdown/library unloading occur at the end of the resource lifetime.
+No per-poll initialization/shutdown/reload occurs.
+
+Regression tests cover 200 concurrent mocked NVML reads using one initialization,
+fresh usage changes and stale-reading clearing. All six focused GPU suites passed.
+The server built successfully. A disposable test against both real GTX 1080s
+performed 400 concurrent inventory polls: descriptors remained 18 -> 18.
+
+The fixed local image was applied after confirming there were no running sub-apps
+or lobbies, only one launcher session. The dev Wolf restart was brief; unrelated
+containers, pairing data and profiles were retained. Both 1080s again passed
+H.264/HEVC CUDA zero-copy startup checks. Two hundred live server-info requests,
+which query the available GPU codecs and telemetry, kept total descriptors at
+56 -> 56 and eventfds at 9 -> 9.
+
+Current local image: `wolf:nvidia-gpu-selection-dev`
+
+Image ID: `sha256:d9667db01f2e9011d47073c1c53f4a0a2113884080e5232210252c4611c8f3f6`
+
+The Plasma splash/OpenGL initialization failure and the host crash launcher's
+underlying GUI failure were diagnosed from logs but not repaired by this change.
+The runtime mask contains reporter recursion; it does not fix the original GUI
+crash. The existing zero-copy stream path remains enabled. No Git/GHCR push was
+performed. The isolated builder was stopped after validation.
+
+== Tools
+
+Codex exec/command/poll tools, patch editing and the UTC clock; Bash, Python 3,
+Git and ripgrep; host process/descriptor and journal inspection; Docker stats,
+logs, inspect, exec, native CDI and BuildKit; systemctl/runuser for the runtime
+user-service mask; resource.prlimit with scoped SYS_RESOURCE capability; NVML and
+CUDA driver diagnostics; ctypes for the disposable NVML reproduction; CMake,
+Ninja, CTest, g++, clang-format 18.1.8, and addr2line for the exception-handler
+frame. No delegated agents were used. Full core contents were not inspected.
+
+== Restore the runtime crash-reporter launcher
+
+Run as host root, after repairing its underlying crash:
+
+[source,bash]
+----
+runuser -u greaper -- env XDG_RUNTIME_DIR=/run/user/1000 systemctl --user unmask --runtime drkonqi-coredump-launcher.socket drkonqi-coredump-launcher@.service
+runuser -u greaper -- env XDG_RUNTIME_DIR=/run/user/1000 systemctl --user start drkonqi-coredump-launcher.socket
+----
+
+The runtime mask also clears when that user manager/runtime directory is reset,
+including a machine reboot.

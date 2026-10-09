@@ -67,6 +67,35 @@ int main() {
   binding = {"nvh264enc", "nvcodec", Codec::h264, "/dev/dri/renderD129", 7};
   rejects([&] { bind_pipeline(binding, templates, "source", "sink"); }, "unintegrated CUDA context is rejected");
 
+  EncoderBinding nvidia{"nvh264device1enc", "nvcodec", Codec::h264, "/dev/dri/renderD130", 1};
+  std::vector<PipelineTemplate> nv_templates{{"nvcodec", "nvh264enc bitrate={bitrate} ! h264parse"}};
+  auto nv_cpu = bind_pipeline(nvidia, nv_templates, "source", "sink");
+  check(nv_cpu.find("nvh264device1enc bitrate={bitrate}") != std::string::npos &&
+            nv_cpu.find("cudaupload cuda-device-id=1") != std::string::npos &&
+            nv_cpu.find("cudaconvertscale cuda-device-id=1") != std::string::npos,
+        "NVIDIA fallback upload, conversion and encoder all bind to the verified device");
+  check(nv_cpu.find("interlace-mode=progressive") != std::string::npos,
+        "NVIDIA conversion fixes progressive output even when the producer omits interlace metadata");
+  rejects([&] { bind_pipeline(nvidia, nv_templates, "source", "sink", true); },
+          "NVIDIA zero-copy cannot be enabled without compositor verification");
+  nvidia.zero_copy_postproc = "cudaconvertscale";
+  auto nv_zero_copy = bind_pipeline(nvidia, nv_templates, "source", "sink", true);
+  check(nv_zero_copy.find("cudaupload") == std::string::npos &&
+            nv_zero_copy.find("cudaconvertscale cuda-device-id=1") != std::string::npos &&
+            nv_zero_copy.find("video/x-raw(memory:CUDAMemory)") != std::string::npos,
+        "verified NVIDIA zero-copy keeps CUDA memory and avoids CPU uploads");
+  check(nv_zero_copy.find("interlace-mode=progressive") != std::string::npos,
+        "zero-copy CUDA conversion also fixes the virtual display's interlace mode");
+  nvidia.factory = "nvh264enc";
+  rejects([&] { bind_pipeline(nvidia, nv_templates, "source", "sink"); },
+          "GPU zero's encoder cannot authorize a GPU one session");
+  nvidia.factory = "nvautogpuh264enc";
+  rejects([&] { bind_pipeline(nvidia, nv_templates, "source", "sink"); },
+          "GStreamer automatic GPU selection cannot override Wolf's assignment");
+  nvidia.factory = "nvh264device1enc";
+  nvidia.cuda_device.reset();
+  rejects([&] { bind_pipeline(nvidia, nv_templates, "source", "sink"); }, "missing CUDA identity fails closed");
+
   Admission admission;
   Device device;
   device.id = "pci-one";

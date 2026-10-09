@@ -1,6 +1,6 @@
 # Automatic GPU selection development fork:
 
-This is the `dev-gpu-selection` branch for future NVIDIA and vGPU work. For the
+This is the `dev-gpu-selection` branch with experimental NVIDIA support and ongoing vGPU work. For the
 primary AMD/Mesa release, use [`auto-gpu-selection`](https://github.com/Greaper88/wolf/tree/auto-gpu-selection)
 and the matching `ghcr.io/greaper88/wolf:latest` / `ghcr.io/greaper88/wolf-ui:latest` images.
 The development image pair below remains available for testing.
@@ -17,13 +17,18 @@ In the `config.toml` file (change only if config is pre-existing):
  -  ghcr.io/greaper88/wolf-ui:gpu-selection-dev
 
 ## Limitations
-- Automatic GPU selection currently requires verified VA-API hardware encoding.
-  Tested with AMD/Mesa; Intel GPUs must pass the startup capability checks.
-- NVIDIA-only users should continue using upstream Wolf for now.
-  Automatic NVIDIA/NVENC selection and load balancing are not yet implemented in this fork.
+- Automatic GPU selection requires startup-verified VA-API or NVENC hardware encoding.
+  AMD/Mesa and Intel use VA-API; NVIDIA uses device-bound CUDA/NVENC.
+- NVIDIA support is experimental, tested with two GTX 1080s and proprietary driver
+  580.178.04. Wolf's container needs NVIDIA library/device injection (for example,
+  native CDI with the NVIDIA Container Toolkit) and DRM modesetting enabled.
+  Version-matched 64-bit and 32-bit app driver volumes are created and checked at
+  startup. See the [driver configuration](docs/modules/user/pages/configuration.adoc).
 - Running and paused apps remain pinned to their assigned GPU.
   Load balancing applies when assigning new sessions.
-- Simultaneous multi-user lobby sharing is not supported with automatic GPU selection.
+- Multi-user lobbies use their app's pinned GPU. Compatible viewers share an
+  encoder; different stream settings require a separately admitted encoder.
+- Virtual GPU slicing and management are not implemented.
 
 # games-on-whales/wolf
 

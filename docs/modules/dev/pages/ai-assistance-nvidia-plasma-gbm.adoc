@@ -1,0 +1,105 @@
+= NVIDIA development: Plasma GBM backend path repair
+
+This temporary approach was retired after the automatic driver-volume rollout.
+The isolated GOW edits were reverted and the special Plasma image was removed.
+The validation below records the earlier investigation; current behavior is
+documented in xref:ai-assistance-nvidia-driver-volumes.adoc[].
+
+AI-Agent: ChatGPT Codex
+
+AI-Model-Version: GPT-6.1 Sol Extra High (client-displayed model label supplied by maintainer)
+
+AI-Inference-Date: 2026-10-09 05:58:30 UTC
+
+== Problem and repair
+
+The local Fedora Plasma image received the correct, isolated GTX 1080 and NVIDIA
+driver libraries through native CDI. However, CDI preserved the Ubuntu host's
+`/usr/lib/x86_64-linux-gnu` library paths. GOW's Fedora NVIDIA startup script
+checked only `/usr/lib64/libnvidia-allocator.so.1`, skipped its toolkit setup, and
+left Fedora's `/usr/lib64/gbm` without the NVIDIA GBM backend. KWin consequently
+used QPainter software compositing, and Xwayland failed to initialize glamor.
+
+Both GOW base startup scripts now resolve `libnvidia-allocator.so.1` through
+`ldconfig -p`, detect the actual injected file, and link it into the image's own
+GBM backend directory. The existing driver-volume path and JSON setup are kept.
+No driver or host desktop configuration is changed by this repair.
+
+The source is isolated in the detached `gow-nvidia-gbm-dev` worktree, based on GOW
+commit `a65d67acf287c6b1dce83aa322d9b01958abdf0a`. The original GOW checkout and
+the original `gow/plasma:local` image remain unchanged.
+
+Changed GOW files:
+
+* `images/base/build/overlay/etc/cont-init.d/30-nvidia.sh`
+* `images/base/build-fedora/overlay/etc/cont-init.d/30-nvidia.sh`
+
+== Validation
+
+Before the repair, a GBM/EGL diagnostic running as the desktop user selected the
+generic `drm` backend and failed EGL initialization. Supplying the injected GBM
+directory to that diagnostic process alone selected `nvidia` and initialized
+NVIDIA EGL successfully, confirming the path mismatch.
+
+A separate Wolf-created Plasma lobby on GPU1 (`0000:07:00.0`, `renderD129`) then
+validated the repaired image without changing the maintainer's active desktop:
+
+* Default GBM selected `nvidia` and initialized NVIDIA EGL without an override.
+* KWin reported OpenGL compositing, NVIDIA EGL, and the GTX 1080 renderer.
+* Xwayland `glxinfo -B` reported direct rendering on the GTX 1080, OpenGL 4.6.
+* Native CDI exposed only the assigned GPU UUID and its DRM/device nodes.
+* A fresh diagnostic client joined the private lobby and received 121 HEVC frame
+  indices over approximately four seconds. FFprobe decoded 120 frames at
+  640x360; the decoded image visibly showed the Plasma desktop. The stream used
+  CUDA producer buffers and the GPU1 NVENC encoder.
+* The diagnostic lobby, client and container were removed; the real user desktop
+  and launcher remained running.
+* Both edited shell scripts passed `bash -n`; the GOW patch passed
+  `git diff --check`. Ubuntu-image runtime validation was not performed here.
+
+An earlier capture attempt reused a stopped UDP receiver and received no packets.
+Recreating only the diagnostic client fixed that test setup. A capture taken
+before the lobby join showed the launcher producer and was not counted as the
+Plasma validation. The final saved capture is the successful joined-lobby test.
+
+The minimal test runner omitted Flatpak/FUSE permissions. Flatpak launch behavior
+was outside this graphics check. There was one startup framebuffer warning, but
+the compositor stayed on NVIDIA and the decoded desktop stream worked.
+
+== Local image and rollout
+
+Local image: `gow/plasma:nvidia-gbm-dev`
+
+Image ID: `sha256:2fb451f39abf2f9c3d9683e5d5c22df04d03203ea5782ca8e93152c908d266e1`
+
+Base image ID: `sha256:36ea01960f7d15c0efa8698c850299a4a08f65bb3ae5883dd02fbc0b3b523c55`
+
+The final image adds provenance labels to the same script layer validated above.
+The proposed change switches only Greaper's Plasma app image to this tag. Full
+before/after profile backups are stored with restricted permissions under
+`/etc/wolf/backups/nvidia-plasma-gbm-20261009` in the Wolf state volume. The apply
+script refuses to overwrite a profile that changed after preparation.
+
+After the maintainer explicitly authorized restarting Plasma, the image reference
+was applied and only that app was stopped/recreated. Its persistent state folder
+`profile-data/greaper/WolfPlasma` was retained. Wolf, Wolf-UI, WolfDen and unrelated
+containers stayed running. No Git/GHCR push was performed.
+
+Rollout verification time: 2026-10-09 06:12:26 UTC.
+
+New lobby ID: `21c36300-468d-45fa-9ea5-7a79a3ec8720`.
+
+The actual restarted user desktop on GPU0 (`0000:04:00.0`, `renderD128`) reported
+KWin OpenGL compositing through NVIDIA EGL, and Xwayland direct rendering on the
+GTX 1080 with OpenGL 4.6. Its sole visible GPU UUID remained
+`GPU-d6fb65b4-2323-7aa3-14f6-c059d000a15d`. The startup scan showed no software
+renderer, glamor initialization failure, or framebuffer error. The user can
+select their profile again to refresh app definitions, then resume Plasma.
+
+== Tools
+
+Codex command/exec, patch and image-viewing tools and the UTC clock; Bash, Python
+3, ctypes, Git and ripgrep; Docker BuildKit, native CDI, exec, inspect, logs and
+copy; Wolf's local Unix-socket session/lobby/profile API; ldconfig, GBM and EGL;
+KWin DBus support information through qdbus-qt6; glxinfo; GStreamer/RTSP/RTP stream
+capture; FFmpeg and FFprobe. No delegated agents were used.

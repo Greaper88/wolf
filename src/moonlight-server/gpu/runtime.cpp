@@ -93,16 +93,19 @@ Runtime::LaunchResult Runtime::retain(const std::string &app_id, const Launch &p
           false,
           {}};
 }
-std::string Runtime::resume(const Launch &launch) {
-  return launch.reservation->resume(options_, [&] {
-    auto devices = inventory_();
-    for (auto &device : devices) {
-      auto cached = cache_.lookup(device, generation_());
-      device.hardware_encoder = cached && cached->status == CapabilityCache::Status::ready &&
-                                cached->revision == launch.capabilities.revision;
-    }
-    return devices;
-  });
+std::string Runtime::resume(const Launch &launch, const Launch *replacing) {
+  return launch.reservation->resume(
+      options_,
+      [&] {
+        auto devices = inventory_();
+        for (auto &device : devices) {
+          auto cached = cache_.lookup(device, generation_());
+          device.hardware_encoder = cached && cached->status == CapabilityCache::Status::ready &&
+                                    cached->revision == launch.capabilities.revision;
+        }
+        return devices;
+      },
+      replacing ? replacing->reservation.get() : nullptr);
 }
 bool Runtime::supports(Codec codec) const {
   if (!options_.enabled())
@@ -117,7 +120,8 @@ bool Runtime::supports(Codec codec) const {
         const auto &binding = capability->codecs[static_cast<std::size_t>(codec)].encoder;
         const auto &h264 = capability->codecs[0].encoder;
         const bool zero_copy = options_.use_zero_copy && h264 && h264->zero_copy_postproc.has_value();
-        if (binding && binding->plugin == "va" && (!zero_copy || binding->zero_copy_postproc))
+        if (binding && (binding->plugin == "va" || (binding->plugin == "nvcodec" && binding->cuda_device)) &&
+            (!zero_copy || binding->zero_copy_postproc))
           return true;
       }
     }

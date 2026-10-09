@@ -1,5 +1,16 @@
 ARG BASE_IMAGE=ghcr.io/games-on-whales/gstreamer:1.26.7
 ########################################################
+# GStreamer's CUDA converter needs newer NVRTC APIs than the base image's
+# CUDA 11.0 compiler provides. Pin the same CUDA 12.4 compiler tested locally.
+# Package/checksum: NVIDIA's compute/cuda/redist/redistrib_12.4.1.json.
+FROM $BASE_IMAGE AS nvrtc-runtime
+ADD --checksum=sha256:b5e7a984fcf05d3123684d7926e595306d31fbf99f9b19e9a0d268a02fc75827 \
+    https://developer.download.nvidia.com/compute/cuda/redist/cuda_nvrtc/linux-x86_64/cuda_nvrtc-linux-x86_64-12.4.127-archive.tar.xz \
+    /tmp/nvrtc.tar.xz
+RUN python3 -c "import tarfile; tarfile.open('/tmp/nvrtc.tar.xz', 'r:xz').extractall('/opt/nvrtc', filter='data')" \
+    && rm /tmp/nvrtc.tar.xz
+
+########################################################
 FROM $BASE_IMAGE AS wolf-builder
 
 ENV DEBIAN_FRONTEND=noninteractive
@@ -110,10 +121,20 @@ RUN apt-get update -y && \
 # pulseaudio-utils ships pactl, handy for debugging audio from inside the container.
 RUN apt-get update -y && \
     apt-get install -y --no-install-recommends \
-    pulseaudio pulseaudio-utils supervisor \
+    pulseaudio pulseaudio-utils supervisor python3 \
     && rm -rf /var/lib/apt/lists/*
 
 COPY docker/supervisord.conf /etc/supervisord.conf
+COPY --from=nvrtc-runtime /opt/nvrtc/cuda_nvrtc-linux-x86_64-12.4.127-archive/lib/libnvrtc.so.12.4.127 /usr/local/nvidia/lib/
+COPY --from=nvrtc-runtime /opt/nvrtc/cuda_nvrtc-linux-x86_64-12.4.127-archive/lib/libnvrtc-builtins.so.12.4.127 /usr/local/nvidia/lib/
+COPY --from=nvrtc-runtime /opt/nvrtc/cuda_nvrtc-linux-x86_64-12.4.127-archive/LICENSE /usr/share/licenses/wolf/cuda-nvrtc/LICENSE
+RUN rm -f /usr/local/nvidia/lib/libnvrtc.so.11.0 /usr/local/nvidia/lib/libnvrtc-builtins.so.11.0 \
+    && ln -sfn libnvrtc.so.12.4.127 /usr/local/nvidia/lib/libnvrtc.so \
+    && ln -sfn libnvrtc.so.12.4.127 /usr/local/nvidia/lib/libnvrtc.so.12 \
+    && ln -sfn libnvrtc-builtins.so.12.4.127 /usr/local/nvidia/lib/libnvrtc-builtins.so \
+    && ln -sfn libnvrtc-builtins.so.12.4.127 /usr/local/nvidia/lib/libnvrtc-builtins.so.12.4 \
+    && ldconfig \
+    && python3 -c "import ctypes; n=ctypes.CDLL('libnvrtc.so'); n.nvrtcGetCUBIN; n.nvrtcGetCUBINSize"
 
 ENV GST_PLUGIN_PATH=/usr/local/lib/x86_64-linux-gnu/gstreamer-1.0/
 # Copying out our custom compositor from the build stage
@@ -125,6 +146,7 @@ ENV WOLF_CFG_FOLDER=/etc/wolf/cfg
 
 COPY --from=wolf-builder /wolf/wolf /wolf/wolf
 COPY --from=wolf-builder /wolf/fake-udev /wolf/fake-udev
+COPY docker/nvidia-driver-volume.py docker/nvidia-driver.Dockerfile /wolf/
 
 ENV GST_GL_API=gles2 \
     GST_GL_PLATFORM=egl \

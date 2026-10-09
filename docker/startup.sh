@@ -21,6 +21,22 @@ if [ -n "${WOLF_ENCODER_NODE:-}" ]; then
     export GST_GL_DRM_DEVICE=${GST_GL_DRM_DEVICE:-$WOLF_ENCODER_NODE}
 fi
 
+# Provision version-matched app drivers once at startup. The helper skips Docker
+# and NVIDIA work when no NVIDIA kernel driver is loaded. Read a plain volume
+# name instead of evaluating command output or injecting runtime shell code.
+nvidia_volume_file=$(mktemp)
+if ! python3 /wolf/nvidia-driver-volume.py --env-file "$nvidia_volume_file"; then
+    rm -f "$nvidia_volume_file"
+    exit 1
+fi
+IFS= read -r nvidia_volume_name < "$nvidia_volume_file"
+rm -f "$nvidia_volume_file"
+if [ -n "$nvidia_volume_name" ]; then
+    export NVIDIA_DRIVER_VOLUME_NAME="$nvidia_volume_name"
+else
+    unset NVIDIA_DRIVER_VOLUME_NAME
+fi
+
 # Update fake-udev if missing from the path
 export WOLF_DOCKER_FAKE_UDEV_PATH=${WOLF_DOCKER_FAKE_UDEV_PATH:-$HOST_APPS_STATE_FOLDER/fake-udev}
 cp /wolf/fake-udev $WOLF_DOCKER_FAKE_UDEV_PATH

@@ -11,6 +11,9 @@
 #include <map>
 #include <stdexcept>
 #include <thread>
+#ifdef __linux__
+#include <dlfcn.h>
+#endif
 
 using namespace wolf::gpu;
 unsigned checks = 0;
@@ -271,16 +274,41 @@ void admission_tests() {
 void nvml_tests() {
   if (!std::getenv("WOLF_GPU_TEST_NVML"))
     return;
+#ifdef __linux__
+  auto fixture = dlopen("libnvidia-ml.so.1", RTLD_NOW | RTLD_LOCAL);
+  check(fixture != nullptr, "NVML fixture is available");
+  auto init_count = reinterpret_cast<unsigned int (*)()>(dlsym(fixture, "wolf_test_nvml_init_count"));
+  auto set_gpu = reinterpret_cast<void (*)(unsigned int)>(dlsym(fixture, "wolf_test_nvml_set_gpu_percent"));
+  check(init_count && set_gpu, "NVML lifecycle and telemetry controls are available");
   auto d = device("0000:02:00.0");
   d.driver = "nvidia";
   sample_nvidia(d);
   check(d.name == "Mock GPU" && d.vram_percent == 25 && d.vram_bytes == (8ULL << 30),
         "NVML PCI-bound identity and VRAM");
   check(d.gpu_percent == 31 && d.encoder_percent == 59, "NVML encoder independent from GPU core");
+  std::vector<std::future<void>> polls;
+  for (int thread = 0; thread < 4; ++thread)
+    polls.push_back(std::async(std::launch::async, [&] {
+      for (int i = 0; i < 50; ++i) {
+        auto sampled = d;
+        sample_nvidia(sampled);
+        if (sampled.gpu_percent != 31 || sampled.encoder_percent != 59)
+          throw std::runtime_error("concurrent NVML telemetry read failed");
+      }
+    }));
+  for (auto &poll : polls)
+    poll.get();
+  check(init_count() == 1, "repeated concurrent GPU telemetry polls do not reinitialize the driver");
+  set_gpu(44);
+  sample_nvidia(d);
+  check(d.gpu_percent == 44, "persistent NVML session still reads fresh GPU usage");
+  set_gpu(31);
   d.id = "0000:99:00.0";
   d.encoder_percent.reset();
   sample_nvidia(d);
   check(!d.encoder_percent && !d.gpu_percent && !d.vram_bytes, "missing NVML PCI handle clears stale telemetry");
+  dlclose(fixture);
+#endif
 }
 void discovery_tests() {
   auto dir = std::filesystem::temp_directory_path() /

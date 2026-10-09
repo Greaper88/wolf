@@ -34,5 +34,11 @@ int main() {
   check(mesa_selection_env("DRI_PRIME=1"), "replace conflicting Mesa selection");
   check(mesa_selection_env("MESA_VK_DEVICE_SELECT=1002:67e3"), "replace ambiguous vendor selector");
   check(!mesa_selection_env("DRI_PRIME_DEBUG=1"), "retain debug environment");
+  check(nvidia_selection_env("NVIDIA_VISIBLE_DEVICES=all"), "replace all-GPU image defaults");
+  check(nvidia_selection_env("CUDA_VISIBLE_DEVICES=1"), "replace container-local CUDA ordinal guesses");
+  check(nvidia_selection_env("VK_DRIVER_FILES=/tmp/other.json"), "replace conflicting Vulkan driver defaults");
+  check(nvidia_selection_env("__EGL_VENDOR_LIBRARY_FILENAMES=/tmp/mesa.json"),
+        "replace conflicting EGL driver defaults");
+  check(!nvidia_selection_env("OTHER=NVIDIA_VISIBLE_DEVICES"), "match environment names rather than values");
   std::cout << "GPU app isolation checks passed\n";
 }

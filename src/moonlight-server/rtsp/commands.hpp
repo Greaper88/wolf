@@ -249,6 +249,11 @@ announce(const RTSP_PACKET &req, const events::StreamSession &session) {
       .client_ip = session.ip,
       .rtp_secret_payload = session.rtp_secret_payload,
   };
+  if (session.gpu_route) {
+    auto settings = video;
+    settings.gpu_route = nullptr; // The route owns this snapshot; avoid a reference cycle.
+    session.gpu_route->negotiated_video.store(std::make_shared<const events::VideoSession>(settings));
+  }
   session.event_bus->fire_event(immer::box<events::VideoSession>(video));
 
   // Audio session

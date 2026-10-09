@@ -26,6 +26,11 @@
 #include <state/serialised_config.hpp>
 #include <string_view>
 
+namespace streaming {
+class SharedVideoEncoder;
+class SharedVideoEncoders;
+} // namespace streaming
+
 namespace wolf::core::events {
 
 struct PairSignal {
@@ -112,13 +117,17 @@ struct GpuStreamTarget {
   std::array<std::string, 3> pipelines;
   std::string producer;
   std::string producer_caps;
+  std::shared_ptr<streaming::SharedVideoEncoders> shared_encoders;
+  std::shared_ptr<streaming::SharedVideoEncoder> shared_encoder;
 };
+struct VideoSession;
 struct GpuStreamRoute {
   std::shared_ptr<const GpuStreamTarget> home;
   std::atomic<std::shared_ptr<const GpuStreamTarget>> target;
   std::shared_ptr<wolf::gpu::Runtime> runtime;
   std::atomic<int> codec{0};
   std::atomic<bool> streaming{false};
+  std::atomic<std::shared_ptr<const VideoSession>> negotiated_video;
 };
 struct Lobby {
   const std::string id;

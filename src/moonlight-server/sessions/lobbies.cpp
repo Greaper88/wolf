@@ -24,7 +24,7 @@ void leave_lobby(const std::shared_ptr<events::EventBusType> &ev_bus,
     if (!disconnected && current->launch->device.id != route->home->launch->device.id) {
       auto error = route->runtime->resume(*route->home->launch);
       if (!error.empty()) {
-        current->launch->reservation->fail(error);
+        route->home->launch->reservation->fail(error);
         ev_bus->fire_event(immer::box<events::PauseStreamEvent>{events::PauseStreamEvent{session.session_id}});
         return;
       }
@@ -91,13 +91,19 @@ setup_lobbies_handlers(const immer::box<state::AppState> &app_state,
       [=](const immer::box<events::CreateLobbyEvent> &lobby_settings) {
         logs::log(logs::info, "[LOBBY] Creating new lobby");
         auto ev_bus = app_state->event_bus;
+        auto gpu_target = lobby_settings->gpu_target.get();
+        if (gpu_target && lobby_settings->multi_user) {
+          auto shared_target = std::make_shared<events::GpuStreamTarget>(*gpu_target);
+          shared_target->shared_encoders = std::make_shared<streaming::SharedVideoEncoders>();
+          gpu_target = shared_target;
+        }
 
         auto lobby = std::make_shared<events::Lobby>(
             events::Lobby{.id = lobby_settings->id,
                           .name = lobby_settings->name,
                           .started_by_profile_id = lobby_settings->profile_id,
                           .runner_state_folder = lobby_settings->runner_state_folder,
-                          .gpu_target = lobby_settings->gpu_target.get(),
+                          .gpu_target = gpu_target,
                           .icon_png_path = lobby_settings->icon_png_path,
                           .multi_user = lobby_settings->multi_user,
                           .pin = lobby_settings->pin,
@@ -238,8 +244,8 @@ setup_lobbies_handlers(const immer::box<state::AppState> &app_state,
         std::shared_ptr<const events::GpuStreamTarget> next_target;
         if (session->gpu_route || lobby->gpu_target) {
           auto fail = [&](const std::string &error) { join_lobby_event->error_message.get()->set_value(error); };
-          if (!session->gpu_route || !lobby->gpu_target || lobby->multi_user) {
-            fail("This development build supports single-user automatic GPU apps only");
+          if (!session->gpu_route || !lobby->gpu_target) {
+            fail("The launcher and app must both use automatic GPU selection");
             return;
           }
           if (!lobby->gpu_target->launch->reservation->valid() ||
@@ -247,7 +253,8 @@ setup_lobbies_handlers(const immer::box<state::AppState> &app_state,
             fail("The app or launcher is closing; wait and retry");
             return;
           }
-          if (!join_lobby_event->profile_id || *join_lobby_event->profile_id != lobby->started_by_profile_id) {
+          if (!lobby->multi_user &&
+              (!join_lobby_event->profile_id || *join_lobby_event->profile_id != lobby->started_by_profile_id)) {
             fail("Select the profile that owns this app before reconnecting");
             return;
           }
@@ -256,7 +263,7 @@ setup_lobbies_handlers(const immer::box<state::AppState> &app_state,
             fail(existing->id == lobby->id ? "" : "Return to Wolf UI before switching apps");
             return;
           }
-          if (!lobby->connected_sessions->load()->empty()) {
+          if (!lobby->multi_user && !lobby->connected_sessions->load()->empty()) {
             fail("This app is in use on another device; disconnect that device first");
             return;
           }
@@ -291,7 +298,38 @@ setup_lobbies_handlers(const immer::box<state::AppState> &app_state,
             return;
           }
           auto launch = current->launch;
-          if (launch->device.id != lobby->gpu_target->launch->device.id) {
+          std::shared_ptr<streaming::SharedVideoEncoder> shared_encoder;
+          if (lobby->multi_user) {
+            auto settings = route->negotiated_video.load();
+            if (!settings || !route->streaming.load()) {
+              fail("The video stream is not ready; reconnect and retry");
+              return;
+            }
+            auto video = *settings;
+            video.gst_pipeline = lobby->gpu_target->pipelines[codec];
+            video.render_node = lobby->gpu_target->launch->device.render_node;
+            auto shared = streaming::prepare_shared_video(video, *lobby->gpu_target, *current, app_state->gpu_runtime);
+            if (!shared.error.empty()) {
+              fail(shared.error);
+              return;
+            }
+            shared_encoder = shared.encoder;
+            if (shared_encoder) {
+              launch = shared_encoder->launch;
+            } else {
+              // A custom pipeline that cannot be split safely still gets a private encoder on the app GPU.
+              auto held = app_state->gpu_runtime->retain("viewer:" + state::gen_uuid(), *lobby->gpu_target->launch);
+              auto error = held.launch ? app_state->gpu_runtime->resume(
+                                             *held.launch,
+                                             current->shared_encoder ? nullptr : current->launch.get())
+                                       : held.error;
+              if (!error.empty()) {
+                fail(error);
+                return;
+              }
+              launch = held.launch;
+            }
+          } else if (launch->device.id != lobby->gpu_target->launch->device.id) {
             auto admitted = app_state->gpu_runtime->prepare(
                 "viewer:" + std::to_string(session->session_id) + ":" + lobby->id,
                 lobby->gpu_target->launch->device.id);
@@ -305,6 +343,7 @@ setup_lobbies_handlers(const immer::box<state::AppState> &app_state,
           }
           auto target = std::make_shared<events::GpuStreamTarget>(*lobby->gpu_target);
           target->launch = launch;
+          target->shared_encoder = shared_encoder;
           next_target = target;
         }
         logs::log(logs::info, "[LOBBY] Session {} joining lobby {}", session->session_id, lobby->id);
@@ -317,7 +356,7 @@ setup_lobbies_handlers(const immer::box<state::AppState> &app_state,
 
         if (next_target) {
           session->gpu_route->target.store(next_target);
-          if (!session->gpu_route->streaming.load())
+          if (!next_target->shared_encoder && !session->gpu_route->streaming.load())
             next_target->launch->reservation->pause();
         }
 
@@ -451,6 +490,9 @@ setup_lobbies_handlers(const immer::box<state::AppState> &app_state,
                  ranges::views::filter([&](const auto &id) { return *id != std::to_string(moonlight_session_id); }) |
                  ranges::to<immer::vector<immer::box<std::string>>>();
         });
+        if (lobby->stop_when_everyone_leaves && lobby->connected_sessions->load()->empty())
+          app_state->event_bus->fire_event(
+              immer::box<events::StopLobbyEvent>{events::StopLobbyEvent{.lobby_id = lobby->id}});
         return;
       }
       // Fire the LeaveLobbyEvent so that it can also be picked up by WolfUI via SSE

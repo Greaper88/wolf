@@ -126,8 +126,10 @@ auto initialize(std::string_view config_file, std::string_view pkey_filename, st
                     "[GPU] Startup verification {} {}: {}",
                     device.render_node,
                     name,
-                    !result.encoder                      ? "hardware encode unavailable"
-                    : result.encoder->zero_copy_postproc ? "zero-copy verified (DMA-BUF -> VA)"
+                    !result.encoder ? "hardware encode unavailable"
+                    : result.encoder->zero_copy_postproc
+                        ? (result.encoder->plugin == "nvcodec" ? "zero-copy verified (CUDA -> NVENC)"
+                                                               : "zero-copy verified (DMA-BUF -> VA)")
                     : require_zero_copy ? "excluded: WOLF_GPU_REQUIRE_ZERO_COPY, no verified zero-copy path"
                                         : "hardware encode verified; CPU-buffer fallback (zero-copy unavailable)");
           return result;

@@ -1,0 +1,176 @@
+= AI assistance disclosure: local NVIDIA automatic GPU selection
+
+AI-Agent: ChatGPT Codex
+
+AI-Model-Version: GPT-6.1 Sol Extra High (client-displayed model label)
+
+AI-Inference-Date: 2026-10-09 03:07:11 UTC
+
+The model label was supplied by the maintainer in a client screenshot.
+The serving model variant is not independently exposed to the agent.
+The timestamp records preparation of this disclosure; implementation and validation
+span preceding turns. Earlier disclosures retain their original session labels.
+
+== Contribution
+
+The maintainer requested a local NVIDIA development instance after installing the
+NVIDIA Container Toolkit. Work is on `dev-gpu-selection`; the primary branch and
+concurrent installer, GOW and WolfDen work were preserved.
+
+The five outstanding upstream stable commits were reviewed and merged locally
+as `e196356`, retaining the CUDA context validity/lifetime fixes. The development
+worktree also includes the latest existing co-op sharing implementation copied from
+the primary worktree. These copied changes and the NVIDIA changes are uncommitted.
+No Git or registry publication was performed.
+
+NVIDIA discovery now records a GPU UUID using NVML. CUDA contexts and encoder
+factories bind to the physical PCI identity through the CUDA Driver API rather
+than PCI sorting or a fallback to device zero. Fallback upload and conversion
+bind to the same device as NVENC. Startup checks cache actual encoding and
+compositor-to-CUDA zero-copy results. Failed zero-copy checks keep a verified
+CPU-buffer hardware-encoding fallback unless an administrator requires zero-copy.
+No Pascal generation blacklist was added.
+
+The Docker runner requests one assigned GPU through native CDI using its UUID,
+filters conflicting selector settings, restricts device exposure, and chooses
+NVIDIA Vulkan, EGL and GLX drivers. A configured driver-volume path remains
+available. Native CDI was tested on this host's Docker 29.8.1 and toolkit 1.20.1;
+this is not a compatibility claim for older Docker versions.
+
+== Tools used
+
+* Codex execution orchestration (`functions.exec`, `exec_command`, `write_stdin`),
+  patch editing (`apply_patch`), the UTC clock, and the asynchronous user question tool.
+* Bash, Git, ripgrep, standard filesystem/process tools and Python 3 for inspection,
+  source/config edits, backups, metadata and Unix-socket API checks.
+* Git fetch, diff/log inspection and a local merge for upstream reconciliation.
+* CMake, Ninja, the configured Makefile generator, CTest, Catch2 and ccache in the
+  existing isolated build container. clang-format 18.1.8 formatted C++ changes.
+* Docker Engine, native NVIDIA CDI, Docker Compose, Docker exec/inspect/logs/cp,
+  and BuildKit for builds, temporary hardware checks and local deployment.
+* GStreamer 1.26.7 (`gst-launch-1.0`, `gst-inspect-1.0`), gst-wayland-display
+  0.4.0-016b4fc, FFmpeg, CUDA Driver API, NVML and `nvidia-smi` for GPU/encoder tests.
+* `vulkaninfo` and `eglinfo` for device enumeration and hardware graphics checks.
+* Codex web search/open and command-line HTTP downloads to consult official NVIDIA
+  documentation and inspect the pinned gst-wayland-display source. That Rust source
+  was not edited or rebuilt.
+* Host module parameters, process/device inspection and read-only `lsinitramfs`
+  inspection to diagnose the disabled NVIDIA modesetting setup.
+
+No delegated agents were used for this implementation session.
+
+== Build and validation
+
+The server and Catch2 binary built successfully. All six focused GPU suites passed;
+12 selected session/API/sharing cases passed with 188 assertions. One opt-in hardware
+sharing case was skipped. These are targeted checks, not the complete test suite.
+
+Both GTX 1080s encoded H.264 and HEVC in explicit host tests and in real compositor
+pipelines using CPU buffers, device-bound CUDA upload/conversion and the matching
+NVENC factory. Vulkan enumeration selected only the assigned GTX 1080 when the
+NVIDIA ICD was forced. Surfaceless EGL selected NVIDIA hardware OpenGL. Toolkit
+CDI exposed one assigned NVIDIA UUID in each isolated diagnostic container.
+
+The local image is `wolf:nvidia-gpu-selection-dev`. It uses the existing
+`wolf:lobby-sharing-repair-20261003` runtime layers with the freshly built server,
+CUDA 12.4 NVRTC libraries and diagnostic graphics tools. It is not a from-scratch
+rebuild of every runtime dependency. The paired UI image remains the existing
+`wolf-ui:gpu-selection-dev` co-op build.
+
+The root Compose override was backed up and changed to the new local image,
+with native CDI visibility of both NVIDIA cards for Wolf itself. Only the two
+1080s are in the initial test pool: a local blacklist excludes the Intel iGPU and
+RX 7600 by PCI identity. Removing that local blacklist restores the mixed pool.
+The saved legacy NVENC H.264 preset was updated after backing up config.toml.
+Existing profile and pairing data were retained.
+
+The stack started, Wolf and WolfDen returned HTTP 200, and the socket API returned
+200 with no sessions/lobbies. Startup checks accepted H.264/HEVC on both 1080s
+with CPU-buffer fallback and found no AV1 support.
+
+A disposable Wolf-UI session exercised the actual Docker runner. Its generated
+request selected the assigned GPU UUID and mapped only its graphics devices, but
+Godot exited because Vulkan could not obtain a Wayland presentation queue.
+The session and container were cleaned up by Wolf; no user session was stopped.
+
+== Host modesetting repair and final validation
+
+Before the boot repair, the loaded `nvidia_drm` parameter was `modeset=N`. The host modprobe configuration
+specified `modeset=1`, but that configuration file was absent from the
+original initramfs. The development Wolf server was stopped before checking module
+usage; NVIDIA DRM's use count reached zero, and nvidia-smi showed no GPU processes.
+
+Automatic approval review nevertheless rejected unloading the live NVIDIA DRM
+module because of possible graphics/RDP disruption without explicit authorization.
+No module was unloaded or reloaded. The maintainer explicitly approved boot-image
+preparation. The first rebuild exposed why the setting was absent: this host uses
+dracut with `hostonly="no"`, whose base module copies `/etc/modprobe.d` only in
+host-only mode. A narrowly scoped dracut configuration was added at
+`/etc/dracut.conf.d/91-wolf-nvidia-kms.conf` to include the existing NVIDIA options
+file in portable images. The original NVIDIA modprobe file and portable storage-driver coverage were not changed.
+The maintainer confirmed that portability is intentional because the installation
+moves between machines.
+
+The original running-kernel initramfs was backed up outside the space-limited
+`/boot` partition before rebuilding. The final `update-initramfs -u` completed,
+and both the archive file list and extracted file content verified inclusion of
+`options nvidia_drm modeset=1`. Dracut warned that it could not fsfreeze `/boot`
+from the helper container; the build completed and the wrapper synced the image.
+At preparation time the running module remained `N`; the agent did not reboot
+the machine. The maintainer subsequently rebooted and reported returning to the
+chat. Post-reboot inspection verified `modeset=Y` and `fbdev=Y`. Boot refresh verified at 2026-10-09 02:32:43 UTC.
+
+Before modesetting was enabled, the CUDA zero-copy compositor probe failed in
+GBM buffer allocation before CUDA import. After the reboot, both GTX 1080s passed
+the H.264 and HEVC zero-copy checks, verifying CUDA memory at both source and
+encoder input and actual encoded output. The earlier failure was a host setup
+issue, not evidence of a Pascal generation limitation.
+The maintainer's report of successful zero-copy on a Quadro RTX 4000 is historical
+human evidence, not an automated test on the currently installed hardware.
+
+Final live validation at 2026-10-09 03:07:11 UTC:
+
+* Fixed the remaining VA-only codec advertisement gate to include verified,
+  device-bound NVENC codecs. Unit tests cover NVIDIA advertisement in zero-copy
+  and fallback modes while leaving unavailable AV1 unadvertised.
+* A real stream attempt exposed non-fixed `interlace-mode` choices at the CUDA
+  conversion boundary. Exact GStreamer 1.26.7 source and focused caps logging
+  identified this negotiation failure. NVIDIA conversion now explicitly selects
+  progressive scan for Wolf's virtual displays and retains color metadata.
+  Pipeline regressions cover both fallback and zero-copy paths. All six focused
+  GPU suites passed after these changes, and the server rebuilt successfully.
+* Live Wolf-UI launched with Vulkan through Wolf's actual Docker runner on each
+  GTX 1080. Each app requested only its selected CDI UUID, `nvidia-smi` listed
+  only that GPU, and producer caps were `video/x-raw(memory:CUDAMemory)`.
+* Loopback RTSP/UDP tests received 119 H.264 frame indices on PCI 04:00.0 and
+  119 HEVC frame indices on PCI 07:00.0 in four seconds each. Reconstructed video
+  decoded with FFprobe: 119 H.264 frames and 118 HEVC frames, all 640x360. These
+  tests verify valid continuous video through the session pipeline; they do not
+  claim an interactive Android Moonlight or game test.
+* Both GPUs passed startup H.264/HEVC zero-copy checks; AV1 remains unavailable.
+  The live Moonlight server advertises HEVC. `WOLF_GPU_REQUIRE_ZERO_COPY` remains
+  false, retaining the requested default fallback policy.
+* Temporary verbose GStreamer settings were removed. Both disposable UI sessions
+  and containers were cleaned up. The builder was stopped. Wolf and WolfDen
+  remain running on the local dev images with zero active test sessions/lobbies.
+
+The final image is `wolf:nvidia-gpu-selection-dev`, manifest image ID
+`sha256:05d21e74302e55ac6498dd433094c55b0ef1f4671e4abe8d510f0697eba5c4ea`.
+New code and disclosures remain local; no Git or GHCR push was performed.
+
+NVIDIA validation is limited to the two GTX 1080s with driver 580.178.04,
+Docker 29.8.1 and toolkit 1.20.1. The local Compose blacklist still limits the
+initial dev pool to these NVIDIA cards. Broader driver/card/game compatibility
+and NVIDIA co-op lobby sharing await further testing. Primary branch and
+concurrent installer/GOW/WolfDen source changes were not modified.
+
+Rollback files:
+
+* `/root/wolf/docker-compose.override.yml.before-20261008-nvidia-dev`
+* `/mnt/raid/wolf/cfg/config.toml.before-20261008-nvidia-dev`
+* `/home/Greaper88/Documents/GitHub/wolf-nvidia-dev/boot-backup/initrd.img-7.0.0-38-generic.before-nvidia-dev-20261008`
+
+The new dracut include can be removed when rolling back the boot configuration.
+
+Source patches, prepared override, build inputs and deployment metadata are kept
+in `/home/Greaper88/Documents/GitHub/wolf-nvidia-dev`.

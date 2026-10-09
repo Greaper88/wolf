@@ -1,4 +1,5 @@
 #include <gpu/app_isolation.hpp>
+#include <gpu/discovery.hpp>
 #include <immer/array_transient.hpp>
 #include <immer/map_transient.hpp>
 #include <platforms/hw.hpp>
@@ -69,7 +70,30 @@ void start_runner(std::shared_ptr<events::Runner> runner,
     logs::log(logs::info, "[GPU] App {} pinned to {} (DRI_PRIME={})", args->session_id, render_node, *prime);
   }
   if (gpu_vendor == NVIDIA) {
-    if (auto driver_volume = utils::get_env("NVIDIA_DRIVER_VOLUME_NAME")) {
+    auto pci = get_gpu_pci_id(render_node);
+    auto inventory = wolf::gpu::discover();
+    auto selected = std::find_if(inventory.begin(), inventory.end(), [&](const auto &device) {
+      return pci && device.id == *pci && device.nvidia_uuid.has_value();
+    });
+    if (selected == inventory.end()) {
+      logs::log(logs::error,
+                "[GPU] Cannot isolate app {}: NVIDIA UUID unavailable for {}",
+                args->session_id,
+                render_node);
+      return;
+    }
+    full_env.set("WOLF_NVIDIA_GPU_UUID", *selected->nvidia_uuid);
+    full_env.set("__GLX_VENDOR_LIBRARY_NAME", "nvidia");
+    full_env.set("__EGL_VENDOR_LIBRARY_FILENAMES", "/usr/share/glvnd/egl_vendor.d/10_nvidia.json");
+    auto volume = utils::get_env("NVIDIA_DRIVER_VOLUME_NAME");
+    full_env.set("VK_DRIVER_FILES",
+                 volume && *volume ? "/usr/share/vulkan/icd.d/nvidia_icd.json" : "/etc/vulkan/icd.d/nvidia_icd.json");
+    full_env.set("VK_ICD_FILENAMES",
+                 volume && *volume ? "/usr/share/vulkan/icd.d/nvidia_icd.json" : "/etc/vulkan/icd.d/nvidia_icd.json");
+    full_env.set("__NV_PRIME_RENDER_OFFLOAD", "1");
+    full_env.set("__VK_LAYER_NV_optimus", "NVIDIA_only");
+    full_env.set("CUDA_VISIBLE_DEVICES", *selected->nvidia_uuid);
+    if (auto driver_volume = utils::get_env("NVIDIA_DRIVER_VOLUME_NAME"); driver_volume && *driver_volume) {
       logs::log(logs::info, "Mounting nvidia driver {}:/usr/nvidia", driver_volume);
       mounted_paths.push_back({driver_volume, "/usr/nvidia"});
     }

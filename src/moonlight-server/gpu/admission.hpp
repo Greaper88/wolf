@@ -32,7 +32,10 @@ public:
     void cancel();
     // Keep the app pinned; release encoder demand only after the pipeline has torn down.
     void pause();
-    std::string resume(const Options &options, const std::function<std::vector<Device>()> &sample);
+    // replacing is the joining viewer's dedicated encoder, which retires before the new one starts.
+    std::string resume(const Options &options,
+                       const std::function<std::vector<Device>()> &sample,
+                       const Reservation *replacing = nullptr);
     void fail(const std::string &message);
     std::string error() const;
     std::uint64_t begin_encoder();
@@ -40,6 +43,7 @@ public:
     // Preserve admission only while replacing the same viewer encoder on the same GPU.
     void end_encoder(std::uint64_t epoch, bool handoff = false);
     bool valid() const;
+    bool encoding() const;
     const SessionGpu &gpu() const {
       return metadata_;
     }

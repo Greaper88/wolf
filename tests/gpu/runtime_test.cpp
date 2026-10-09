@@ -236,6 +236,33 @@ int main(int argc, char **argv) {
       check(!fallback.launch->zero_copy, "fallback uses CPU buffers on its pinned GPU");
     check(runtime.supports(Codec::av1) == !required, "strict policy never advertises unverified zero-copy codec");
   }
+  for (bool zero_copy : {false, true}) {
+    auto nvidia = d;
+    nvidia.driver = "nvidia";
+    Runtime runtime(
+        Options{},
+        [&] { return std::vector{nvidia}; },
+        [] { return "nv1"; },
+        [&](const Device &device, Codec codec, std::stop_token) {
+          if (codec == Codec::av1)
+            return EncoderProbeResult{};
+          EncoderBinding binding{codec == Codec::h264 ? "nvh264enc" : "nvh265enc",
+                                 "nvcodec",
+                                 codec,
+                                 device.render_node,
+                                 0};
+          if (zero_copy)
+            binding.zero_copy_postproc = "cudaconvertscale";
+          return EncoderProbeResult{binding, {}};
+        });
+    eventually([&] {
+      auto c = runtime.capabilities(nvidia);
+      return c && c->status == CapabilityCache::Status::ready;
+    });
+    check(runtime.supports(Codec::h264) && runtime.supports(Codec::hevc),
+          "Moonlight advertises verified NVIDIA codecs in zero-copy and fallback modes");
+    check(!runtime.supports(Codec::av1), "NVIDIA hardware without AV1 never advertises it");
+  }
   auto encoded = isolated_probe("/proc/self/exe", d, Codec::h264);
   check(encoded.encoder && encoded.encoder->render_node == d.render_node,
         "isolated process returns device-bound result");

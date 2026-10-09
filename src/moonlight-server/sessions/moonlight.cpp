@@ -96,6 +96,8 @@ setup_moonlight_handlers(const immer::box<state::AppState> &app_state,
         auto stopped = state::get_session_by_id(app_state->running_sessions->load(), ev->session_id);
         if (stopped && stopped->gpu_launch)
           stopped->gpu_launch->reservation->cancel();
+        if (stopped && stopped->gpu_route)
+          stopped->gpu_route->target.store(stopped->gpu_route->home);
         // Remove session from app state so that HTTP/S applist gets updated
         // This should effectively destroy the virtual Wayland session since it holds the last reference
         app_state->running_sessions->update([&ev](const immer::vector<events::StreamSession> &ses_v) {
