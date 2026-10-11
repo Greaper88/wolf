@@ -5,6 +5,8 @@
 
 // Standalone diagnostic; no sessions, containers or process-wide GPU environment changes.
 int main(int argc, char **argv) {
+  if (argc > 1 && std::string_view(argv[1]) == "--wolf-ray-tracing-probe")
+    return wolf::gpu::ray_tracing_child(argc, argv);
   if (argc > 1 && std::string_view(argv[1]) == "--wolf-gpu-probe")
     return wolf::gpu::probe_child(argc, argv);
   gst_init(&argc, &argv);

@@ -147,6 +147,7 @@ ENV WOLF_CFG_FOLDER=/etc/wolf/cfg
 COPY --from=wolf-builder /wolf/wolf /wolf/wolf
 COPY --from=wolf-builder /wolf/fake-udev /wolf/fake-udev
 COPY docker/nvidia-driver-volume.py docker/nvidia-driver.Dockerfile /wolf/
+COPY src/moonlight-server/gpu/ray-tracing-probe.py /wolf/
 
 ENV GST_GL_API=gles2 \
     GST_GL_PLATFORM=egl \

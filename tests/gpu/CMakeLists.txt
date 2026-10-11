@@ -1,5 +1,6 @@
 cmake_minimum_required(VERSION 3.16)
 project(wolf_gpu_policy_tests LANGUAGES CXX)
+configure_file(../../src/moonlight-server/gpu/ray-tracing-probe.py ${CMAKE_CURRENT_BINARY_DIR}/ray-tracing-probe.py COPYONLY)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 find_package(Threads REQUIRED)

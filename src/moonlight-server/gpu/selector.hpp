@@ -27,6 +27,8 @@ struct Options {
   bool manual_override = false;
   bool use_zero_copy = true;
   bool require_zero_copy = false;
+  bool prefer_ray_tracing = false;
+  bool allow_last_resort = true;
 
   bool enabled() const {
     return auto_select && !manual_override;
@@ -52,8 +54,9 @@ struct Device {
   std::optional<double> encoder_percent;
   unsigned int active_sessions = 0;
   unsigned int pending_sessions = 0;
-  unsigned int retained_sessions = 0;     // Apps still resident; no encoder demand while disconnected.
-  std::optional<std::string> nvidia_uuid; // NVML identity used for one physical CDI device.
+  unsigned int retained_sessions = 0;       // Apps still resident; no encoder demand while disconnected.
+  std::optional<std::string> nvidia_uuid;   // NVML identity used for one physical CDI device.
+  std::optional<bool> hardware_ray_tracing; // Cached hardware + Vulkan verification; unknown is not support.
 };
 
 // Additive /sessions response field. Null telemetry means unavailable, never zero.
@@ -85,6 +88,7 @@ struct Selection {
 std::string normalize_identifier(std::string value);
 bool blacklisted(const Device &device, const Options &options);
 bool matches(const Device &device, const std::vector<std::string> &identifiers);
+bool is_last_resort(const Device &device, const Options &options);
 std::optional<double> projected_encoder(const Device &device);
 Selection
 select(const std::vector<Device> &snapshot, const Options &options, bool retry = false, bool existing_app = false);

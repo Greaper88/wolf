@@ -16,6 +16,11 @@ In the Docker launch or Compose:
 In the `config.toml` file (change only if config is pre-existing):
  -  ghcr.io/greaper88/wolf-ui:gpu-selection-dev
 
+Optional selection preferences: `WOLF_GPU_PREFER_RAY_TRACING=FALSE` and
+`WOLF_GPU_ALLOW_LAST_RESORT=TRUE`. Enable RT preference to favor verified RT
+cards; disable last-resort use to exclude fallback cards. Individual GPUs can
+be excluded with the existing `WOLF_GPU_BLACKLIST` Compose setting.
+
 ## Limitations
 - Automatic GPU selection requires startup-verified VA-API or NVENC hardware encoding.
   AMD/Mesa and Intel use VA-API; NVIDIA uses device-bound CUDA/NVENC.

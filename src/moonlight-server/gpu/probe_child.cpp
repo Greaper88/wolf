@@ -6,6 +6,21 @@
 #include <unistd.h>
 #endif
 namespace wolf::gpu {
+int ray_tracing_child(int argc, char **argv) {
+#ifdef __linux__
+  if (argc == 5) {
+    // Replace this isolated child: the existing parent deadline also covers
+    // Python and native driver calls, without leaving another process behind.
+    std::error_code error;
+    auto executable = std::filesystem::read_symlink("/proc/self/exe", error);
+    if (error)
+      return 2;
+    auto script = (executable.parent_path() / "ray-tracing-probe.py").string();
+    execlp("python3", "python3", script.c_str(), argv[2], argv[3], argv[4], nullptr);
+  }
+#endif
+  return 2;
+}
 int probe_child(int argc, char **argv) {
 #ifdef __linux__
   if (argc != 6 && argc != 7)

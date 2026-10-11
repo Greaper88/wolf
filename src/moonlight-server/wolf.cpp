@@ -111,6 +111,10 @@ auto initialize(std::string_view config_file, std::string_view pkey_filename, st
   auto gpu_options = wolf::gpu::read_options();
   std::shared_ptr<wolf::gpu::Runtime> gpu_runtime;
   if (gpu_options.enabled()) {
+    logs::log(logs::info,
+              "[GPU] Selection policy: prefer ray tracing={}, allow last resort={}",
+              gpu_options.prefer_ray_tracing,
+              gpu_options.allow_last_resort);
     gpu_runtime = std::make_shared<wolf::gpu::Runtime>(
         gpu_options,
         [] { return wolf::gpu::discover(); },
@@ -132,6 +136,17 @@ auto initialize(std::string_view config_file, std::string_view pkey_filename, st
                                                                : "zero-copy verified (DMA-BUF -> VA)")
                     : require_zero_copy ? "excluded: WOLF_GPU_REQUIRE_ZERO_COPY, no verified zero-copy path"
                                         : "hardware encode verified; CPU-buffer fallback (zero-copy unavailable)");
+          return result;
+        },
+        [](const wolf::gpu::Device &device, std::stop_token stop) {
+          auto result = wolf::gpu::isolated_ray_tracing_probe("/proc/self/exe", device, stop);
+          logs::log(logs::info,
+                    "[GPU] Ray-tracing verification {}: {} ({})",
+                    device.render_node,
+                    result.supported.value_or(false) ? "hardware + Vulkan verified"
+                    : result.supported               ? "unavailable; last resort"
+                                                     : "unverified; last resort",
+                    result.reason);
           return result;
         });
   }
@@ -307,6 +322,8 @@ void run() {
 }
 
 int main(int argc, char *argv[]) try {
+  if (argc > 1 && std::string_view(argv[1]) == "--wolf-ray-tracing-probe")
+    return wolf::gpu::ray_tracing_child(argc, argv);
   if (argc > 1 && std::string_view(argv[1]) == "--wolf-gpu-probe")
     return wolf::gpu::probe_child(argc, argv);
   logs::init(logs::parse_level(utils::get_env("WOLF_LOG_LEVEL", "INFO")));

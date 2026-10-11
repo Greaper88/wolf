@@ -23,6 +23,15 @@ template <typename F> void eventually(F condition) {
   }
 }
 int main(int argc, char **argv) {
+  if (argc > 1 && std::string(argv[1]) == "--wolf-ray-tracing-probe") {
+    if (std::string(argv[3]) == "hang")
+      for (;;)
+        pause();
+    std::string reply = std::string(argv[3]) == "bad"       ? "WOLF_RT_V1 5 invalid\n"
+                        : std::string(argv[3]) == "unknown" ? "WOLF_RT_V1 -1 driver-query-failed\n"
+                                                            : "WOLF_RT_V1 1 hardware-and-vulkan-device-verified\n";
+    return write(3, reply.data(), reply.size()) == static_cast<ssize_t>(reply.size()) ? 0 : 2;
+  }
   if (argc > 1 && std::string(argv[1]) == "--wolf-gpu-probe") {
     if (std::string(argv[3]) == "hang" || (argc == 7 && std::string(argv[3]) == "dma-hang")) {
       for (;;)
@@ -263,6 +272,61 @@ int main(int argc, char **argv) {
           "Moonlight advertises verified NVIDIA codecs in zero-copy and fallback modes");
     check(!runtime.supports(Codec::av1), "NVIDIA hardware without AV1 never advertises it");
   }
+  for (bool prefer : {false, true}) {
+    Options policy;
+    policy.prefer_ray_tracing = prefer;
+    policy.allow_last_resort = false;
+    std::atomic<unsigned> ray_queries = 0;
+    std::atomic<bool> supported = true;
+    Runtime runtime(
+        policy,
+        [&] { return std::vector{d}; },
+        [] { return "rt-generation"; },
+        [](const Device &device, Codec codec, std::stop_token) {
+          return EncoderProbeResult{EncoderBinding{"vah264enc", "va", codec, device.render_node, std::nullopt}, {}};
+        },
+        [&](const Device &, std::stop_token) {
+          ++ray_queries;
+          return RayTracingResult{supported.load(), "mock-hardware-query"};
+        });
+    eventually([&] {
+      auto c = runtime.capabilities(d);
+      return c && c->status == CapabilityCache::Status::ready;
+    });
+    check(ray_queries == (prefer ? 1 : 0), "RT probe is opt-in and runs once per cached device");
+    for (int i = 0; i < 10; ++i) {
+      auto launch = runtime.prepare("ray-session-" + std::to_string(i));
+      check(launch.launch && runtime.supports(Codec::hevc),
+            "cached RT support authorizes selection and codec advertisement");
+    }
+    check(ray_queries == (prefer ? 1 : 0), "launches and advertisement do not query RT drivers");
+    auto revision = runtime.capabilities(d)->revision;
+    supported = false;
+    runtime.invalidate(d.id);
+    eventually([&] {
+      auto c = runtime.capabilities(d);
+      return c && c->status == CapabilityCache::Status::ready && c->revision != revision;
+    });
+    check(ray_queries == (prefer ? 2 : 0), "invalidation refreshes RT capability together with encoder results");
+    check((runtime.prepare("after-refresh").launch != nullptr) == !prefer,
+          "disabled fallback excludes failed RT cards only when preference is enabled");
+    check(runtime.supports(Codec::hevc) == !prefer, "strict codec advertisement excludes fallback GPUs");
+  }
+  auto ray = isolated_ray_tracing_probe("/proc/self/exe", d);
+  check(ray.supported == true, "isolated RT reply is accepted");
+  auto ray_device = d;
+  ray_device.id = "unknown";
+  check(!isolated_ray_tracing_probe("/proc/self/exe", ray_device).supported.has_value(), "probe failure stays unknown");
+  ray_device.id = "bad";
+  check(!isolated_ray_tracing_probe("/proc/self/exe", ray_device).supported.has_value(),
+        "malformed RT response is rejected");
+  ray_device.id = "hang";
+  auto started = std::chrono::steady_clock::now();
+  check(!isolated_ray_tracing_probe("/proc/self/exe", ray_device, {}, std::chrono::milliseconds(40))
+             .supported.has_value(),
+        "hung RT child times out");
+  check(std::chrono::steady_clock::now() - started < std::chrono::seconds(1),
+        "RT deadline bounds launch-independent driver work");
   auto encoded = isolated_probe("/proc/self/exe", d, Codec::h264);
   check(encoded.encoder && encoded.encoder->render_node == d.render_node,
         "isolated process returns device-bound result");

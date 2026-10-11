@@ -13,13 +13,12 @@ extern char **environ;
 
 namespace wolf::gpu {
 namespace {
-EncoderProbeResult run_probe(const std::string &executable,
-                             const Device &device,
-                             Codec codec,
-                             std::stop_token stop,
-                             std::chrono::milliseconds timeout,
-                             const std::string &zero_copy_encoder = {}) {
-  auto failure = [](const char *reason) { return EncoderProbeResult{std::nullopt, {reason}}; };
+struct ChildResult {
+  std::string reply;
+  std::string error;
+};
+ChildResult run_child(std::vector<std::string> args, std::stop_token stop, std::chrono::milliseconds timeout) {
+  auto failure = [](const char *reason) { return ChildResult{{}, reason}; };
 #ifdef __linux__
   if (stop.stop_requested())
     return failure("GPU verification cancelled");
@@ -52,22 +51,13 @@ EncoderProbeResult run_probe(const std::string &executable,
   error |= posix_spawn_file_actions_addclose(&actions, output);
   error |= posix_spawn_file_actions_addopen(&actions, STDOUT_FILENO, "/dev/null", O_WRONLY, 0);
   error |= posix_spawn_file_actions_addopen(&actions, STDERR_FILENO, "/dev/null", O_WRONLY, 0);
-  auto codec_arg = std::to_string(static_cast<int>(codec));
-  std::vector<std::string> args{executable,
-                                "--wolf-gpu-probe",
-                                device.render_node,
-                                device.id,
-                                device.driver,
-                                codec_arg};
-  if (!zero_copy_encoder.empty())
-    args.push_back(zero_copy_encoder);
   std::vector<char *> argv;
   for (auto &arg : args)
     argv.push_back(arg.data());
   argv.push_back(nullptr);
   pid_t pid = -1;
   if (!error)
-    error = posix_spawn(&pid, executable.c_str(), &actions, nullptr, argv.data(), environ);
+    error = posix_spawn(&pid, args.front().c_str(), &actions, nullptr, argv.data(), environ);
   posix_spawn_file_actions_destroy(&actions);
   close(output);
   if (error) {
@@ -105,8 +95,31 @@ EncoderProbeResult run_probe(const std::string &executable,
   auto length = read(input, buffer, sizeof(buffer) - 1);
   close(input);
   if (!WIFEXITED(status) || WEXITSTATUS(status) != 0 || length <= 0 || length >= 1024)
-    return failure("GPU hardware encode verification failed");
-  std::istringstream reply(std::string(buffer, length));
+    return failure("GPU capability probe failed");
+  return {std::string(buffer, length), {}};
+#else
+  return failure("Isolated GPU probing is unavailable on this platform");
+#endif
+}
+EncoderProbeResult run_probe(const std::string &executable,
+                             const Device &device,
+                             Codec codec,
+                             std::stop_token stop,
+                             std::chrono::milliseconds timeout,
+                             const std::string &zero_copy_encoder = {}) {
+  auto failure = [](const std::string &reason) { return EncoderProbeResult{std::nullopt, {reason}}; };
+  std::vector<std::string> args{executable,
+                                "--wolf-gpu-probe",
+                                device.render_node,
+                                device.id,
+                                device.driver,
+                                std::to_string(static_cast<int>(codec))};
+  if (!zero_copy_encoder.empty())
+    args.push_back(zero_copy_encoder);
+  auto child = run_child(std::move(args), stop, timeout);
+  if (!child.error.empty())
+    return failure(child.error);
+  std::istringstream reply(child.reply);
   std::string marker, factory, plugin, postproc, extra;
   long long cuda = -1;
   if (!(reply >> marker >> factory >> plugin >> cuda >> postproc) || (reply >> extra) || marker != "WOLF_GPU_V2" ||
@@ -127,11 +140,25 @@ EncoderProbeResult run_probe(const std::string &executable,
                          cuda < 0 ? std::nullopt : std::make_optional(static_cast<unsigned int>(cuda)),
                          postproc == "-" ? std::nullopt : std::make_optional(postproc)},
           {}};
-#else
-  return failure("Isolated GPU probing is unavailable on this platform");
-#endif
 }
 } // namespace
+
+RayTracingResult isolated_ray_tracing_probe(const std::string &executable,
+                                            const Device &device,
+                                            std::stop_token stop,
+                                            std::chrono::milliseconds timeout) {
+  auto child =
+      run_child({executable, "--wolf-ray-tracing-probe", device.render_node, device.id, device.driver}, stop, timeout);
+  if (!child.error.empty())
+    return {std::nullopt, child.error};
+  std::istringstream reply(child.reply);
+  std::string marker, reason, extra;
+  int value = -2;
+  if (!(reply >> marker >> value >> reason) || (reply >> extra) || marker != "WOLF_RT_V1" || value < -1 || value > 1 ||
+      reason.size() > 256 || reason.find_first_not_of("abcdefghijklmnopqrstuvwxyz0123456789-") != std::string::npos)
+    return {std::nullopt, "Invalid ray-tracing probe response"};
+  return {value == -1 ? std::nullopt : std::make_optional(value == 1), reason};
+}
 
 EncoderProbeResult isolated_probe(const std::string &executable,
                                   const Device &device,

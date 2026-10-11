@@ -19,6 +19,7 @@ public:
     Status status = Status::pending;
     Results codecs;
     std::uint64_t revision = 0;
+    RayTracingResult ray_tracing;
   };
   struct Ticket {
     std::string id;
@@ -27,11 +28,12 @@ public:
   // generation must change after a driver reset/update or GStreamer registry refresh.
   // Device nodes must be canonical discovery paths, not user-supplied aliases.
   std::optional<Ticket> begin(const Device &device, const std::string &generation);
-  bool complete(const Ticket &ticket, Results results);
+  bool complete(const Ticket &ticket, Results results, RayTracingResult ray_tracing = {});
   using Probe = std::function<EncoderProbeResult(const Device &, Codec)>;
+  using RayProbe = std::function<RayTracingResult(const Device &)>;
   // Run on the startup/refresh worker with an isolated, deadline-limited probe callback.
   // No cache lock is held during driver work; exceptions become cached failures.
-  bool verify(const Device &device, const std::string &generation, const Probe &probe);
+  bool verify(const Device &device, const std::string &generation, const Probe &probe, const RayProbe &ray_probe = {});
   std::optional<Snapshot> lookup(const Device &device, const std::string &generation) const;
   bool usable(const Device &device, const std::string &generation) const;
   // Encoder failure: invalidate immediately, then enqueue a new background probe.

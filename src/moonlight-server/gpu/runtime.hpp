@@ -11,7 +11,8 @@ public:
   using Inventory = Admission::Snapshot;
   using Generation = std::function<std::string()>;
   using Probe = std::function<EncoderProbeResult(const Device &, Codec, std::stop_token)>;
-  Runtime(Options options, Inventory inventory, Generation generation, Probe probe);
+  using RayProbe = std::function<RayTracingResult(const Device &, std::stop_token)>;
+  Runtime(Options options, Inventory inventory, Generation generation, Probe probe, RayProbe ray_probe = {});
   ~Runtime();
   Runtime(const Runtime &) = delete;
   Runtime &operator=(const Runtime &) = delete;
@@ -44,6 +45,7 @@ private:
   Inventory inventory_;
   Generation generation_;
   Probe probe_;
+  RayProbe ray_probe_;
   CapabilityCache cache_;
   Admission admission_;
   std::mutex mutex_;

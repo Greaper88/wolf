@@ -13,4 +13,9 @@ EncoderProbeResult isolated_probe(const std::string &executable,
                                   std::chrono::milliseconds timeout = std::chrono::seconds(5));
 // Internal child-process command. Writes a small result to descriptor 3; never starts the server.
 int probe_child(int argc, char **argv);
+RayTracingResult isolated_ray_tracing_probe(const std::string &executable,
+                                            const Device &device,
+                                            std::stop_token stop = {},
+                                            std::chrono::milliseconds timeout = std::chrono::seconds(5));
+int ray_tracing_child(int argc, char **argv);
 } // namespace wolf::gpu

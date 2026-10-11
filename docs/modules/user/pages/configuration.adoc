@@ -67,6 +67,22 @@ Wolf is configured via a TOML config file and some additional optional ENV varia
 |/dev/dri/renderD128
 |The default render node used for virtual desktops; see: <<_multiple_gpu>>
 
+|WOLF_GPU_PREFER_RAY_TRACING
+|FALSE
+|Prefer GPUs with verified dedicated RT hardware and usable Vulkan RT features. Other or unverified GPUs enter the last-resort pool. Checks are cached at startup/refresh and skipped when this preference is off.
+
+|WOLF_GPU_ALLOW_LAST_RESORT
+|TRUE
+|Allow new assignments to the last-resort pool when no eligible preferred GPU remains. FALSE excludes this pool, including automatically classified integrated/shared-memory GPUs and admin-designated devices.
+
+|WOLF_GPU_BLACKLIST
+|_(empty)_
+|Comma-separated PCI addresses, render nodes or by-path aliases to exclude from automatic selection. Use this Compose setting to exclude individual GPUs rather than adding card-specific code rules.
+
+|WOLF_GPU_LAST_RESORT
+|_(empty)_
+|Comma-separated device identifiers to place in the last-resort pool, even if they otherwise qualify for the preferred pool.
+
 |WOLF_DOCKER_FAKE_UDEV_PATH
 |$HOST_APPS_STATE_FOLDER/fake-udev
 |The path on the host for the fake-udev CLI tool
@@ -79,6 +95,48 @@ Wolf is configured via a TOML config file and some additional optional ENV varia
 |1000
 |The default GID that apps run as, applied to newly paired clients; existing clients keep their saved values
 |===
+
+=== Ray-tracing preference and last-resort GPUs
+
+[source,yaml]
+----
+services:
+  wolf:
+    environment:
+      WOLF_GPU_PREFER_RAY_TRACING: "FALSE"
+      WOLF_GPU_ALLOW_LAST_RESORT: "TRUE"
+      # Optional: exclude a particular card using its stable PCI address.
+      # WOLF_GPU_BLACKLIST: "0000:0a:00.0"
+----
+
+These defaults preserve existing automatic selection. Enable RT preference to
+favor verified RT GPUs; non-RT and unverified cards remain fallback candidates.
+Turn off last-resort use to make that preference strict. Turning off last-resort
+use alone excludes existing fallback classifications without requiring RT on
+ordinary discrete GPUs. Codec, hardware-encoder and load checks always apply.
+An explicitly blacklisted GPU stays excluded regardless of either option.
+Within each RT/non-RT capability group, ordinary discrete GPUs keep priority over
+existing integrated/shared-memory or admin-designated fallback cards. A verified
+RT fallback card still precedes a non-RT card when fallback use is allowed.
+
+The RT check queries the exact physical device, verifies dedicated hardware
+(AMD graphics IP or NVIDIA's OptiX RT-core property) and enables the reported
+Vulkan acceleration-structure and ray-query/pipeline features on a headless
+logical device. Intel ANV's hardware RT feature path is recognized as well.
+Extension names or card model names alone do not certify hardware RT. Missing
+libraries, unsupported queries, timeouts or driver failures remain unverified;
+the startup log explains the result. This is a capability check, not a game
+benchmark or guarantee that every RT title works with a particular app image.
+
+Results share the encoder cache's device/generation invalidation. App launches
+use cached results, and no additional RT driver query runs with the default
+preference off. Existing running/paused apps stay pinned and their reconnects
+do not reapply the new-assignment fallback restriction. Memory, encoder and
+explicit blacklist gates still protect reconnects.
+
+Set these options on Wolf's container and recreate it to change the policy.
+They do not affect the legacy path selected by `WOLF_GPU_AUTO_SELECT=FALSE` or
+an explicit `WOLF_RENDER_NODE`/`WOLF_ENCODER_NODE` override.
 
 === Automatic NVIDIA app driver volumes
 

@@ -2,6 +2,10 @@
 #include "selector.hpp"
 
 namespace wolf::gpu {
+struct RayTracingResult {
+  std::optional<bool> supported;
+  std::string reason;
+};
 enum class Codec {
   h264,
   hevc,
