@@ -17,6 +17,7 @@ add_executable(wolftests main.cpp)
 set(SRC_LIST
         main.cpp
         testControl.cpp
+        testDockerHotplug.cpp
         testCrypto.cpp
         testGSTPlugin.cpp
         testSharedVideo.cpp

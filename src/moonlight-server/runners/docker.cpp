@@ -1,7 +1,70 @@
+#include <cctype>
 #include <gpu/app_isolation.hpp>
 #include <runners/docker.hpp>
 
 namespace wolf::core::docker {
+
+boost::json::object with_hotplug_capabilities(boost::json::object options) {
+  auto &host = options["HostConfig"];
+  if (host.is_null())
+    host = boost::json::object{};
+  auto &caps = host.as_object()["CapAdd"];
+  if (caps.is_null())
+    caps = boost::json::array{};
+
+  // Custom app templates can omit the permissions in Wolf's default templates.
+  // fake-udev needs NET_ADMIN to multicast udev events; device nodes need MKNOD.
+  for (const auto *required : {"NET_ADMIN", "MKNOD"}) {
+    auto matches = [required](const auto &cap) {
+      auto name = std::string(cap.as_string());
+      std::transform(name.begin(), name.end(), name.begin(), [](unsigned char c) { return std::toupper(c); });
+      return name == "ALL" || name == "CAP_ALL" || name == required || name == std::string("CAP_") + required;
+    };
+    if (std::any_of(caps.as_array().begin(), caps.as_array().end(), matches))
+      continue;
+    // Preserve explicit restrictions instead of silently overriding a hardened app.
+    if (auto dropped = host.as_object().if_contains("CapDrop");
+        dropped && dropped->is_array() &&
+        std::any_of(dropped->as_array().begin(), dropped->as_array().end(), matches)) {
+      logs::log(logs::warning, "[DOCKER] Controller hotplug requires {}, but the app explicitly drops it", required);
+      continue;
+    }
+    caps.as_array().push_back(required);
+  }
+  return options;
+}
+
+std::vector<std::string>
+hotplug_command(const std::map<std::string, std::string> &udev_event, const std::string &encoded_event, bool remove) {
+  auto node = udev_event.find("DEVNAME");
+  if (node == udev_event.end())
+    return {"fake-udev", "-m", encoded_event};
+
+  if (remove) {
+    // Cleanup must still run when notification fails, without hiding that failure.
+    return {"/bin/bash",
+            "-c",
+            "status=0; fake-udev -m \"$2\" || status=$?; rm -f -- \"$1\" || exit $?; exit \"$status\"",
+            "wolf-unplug",
+            node->second,
+            encoded_event};
+  }
+
+  // A previous failed unplug may have left this node behind. Reuse a matching
+  // character device, replace stale nodes, and always send the new add event.
+  // Pass values as arguments so paths and event contents are never shell code.
+  return {"/bin/bash",
+          "-c",
+          "mkdir -p -- \"$(dirname -- \"$1\")\" && { "
+          "if [ ! -c \"$1\" ] || [ \"$(stat -c '%t:%T' -- \"$1\")\" != \"$(printf '%x:%x' \"$2\" \"$3\")\" ]; then "
+          "rm -f -- \"$1\" && mknod -- \"$1\" c \"$2\" \"$3\" || exit $?; fi; "
+          "chmod 777 -- \"$1\" && fake-udev -m \"$4\"; }",
+          "wolf-plug",
+          node->second,
+          udev_event.at("MAJOR"),
+          udev_event.at("MINOR"),
+          encoded_event};
+}
 
 void create_udev_hw_files(std::filesystem::path base_hw_db_path,
                           std::vector<std::pair<std::string, std::vector<std::string>>> udev_hw_db_entries) {
@@ -251,6 +314,9 @@ void RunDocker::run(std::string_view session_id,
     }
   }
 
+  if (use_fake_udev)
+    final_json_opts = boost::json::serialize(with_hotplug_capabilities(utils::parse_json(final_json_opts).as_object()));
+
   logs::log(logs::debug, "[DOCKER] Container options: {}", final_json_opts);
 
   Container new_container = {.id = "",
@@ -310,14 +376,9 @@ void RunDocker::run(std::string_view session_id,
             for (auto udev_ev : ev->udev_events) {
               udev_ev["ACTION"] = "remove";
               std::string udev_msg = base64_encode(map_to_string(udev_ev));
-              std::string cmd;
-              if (udev_ev.count("DEVNAME") == 0) {
-                cmd = fmt::format("fake-udev -m {}", udev_msg);
-              } else {
-                cmd = fmt::format("fake-udev -m {} && rm {}", udev_msg, udev_ev["DEVNAME"]);
-              }
-              logs::log(logs::debug, "[DOCKER] Executing command: {}", cmd);
-              docker_api.exec(container_id, {"/bin/bash", "-c", cmd}, "root");
+              auto cmd = hotplug_command(udev_ev, udev_msg, true);
+              logs::log(logs::debug, "[DOCKER] Executing command: {}", utils::join(cmd, " "));
+              docker_api.exec(container_id, std::vector<std::string_view>(cmd.begin(), cmd.end()), "root");
             }
           }
         });
@@ -332,20 +393,10 @@ void RunDocker::run(std::string_view session_id,
           }
 
           for (auto udev_ev : device_ev->get().udev_events) {
-            std::string cmd;
             std::string udev_msg = base64_encode(map_to_string(udev_ev));
-            if (udev_ev.count("DEVNAME") == 0) {
-              cmd = fmt::format("fake-udev -m {}", udev_msg);
-            } else {
-              cmd = fmt::format("mkdir -p /dev/input && mknod {} c {} {} && chmod 777 {} && fake-udev -m {}",
-                                udev_ev["DEVNAME"],
-                                udev_ev["MAJOR"],
-                                udev_ev["MINOR"],
-                                udev_ev["DEVNAME"],
-                                udev_msg);
-            }
-            logs::log(logs::debug, "[DOCKER] Executing command: {}", cmd);
-            docker_api.exec(container_id, {"/bin/bash", "-c", cmd}, "root");
+            auto cmd = hotplug_command(udev_ev, udev_msg, false);
+            logs::log(logs::debug, "[DOCKER] Executing command: {}", utils::join(cmd, " "));
+            docker_api.exec(container_id, std::vector<std::string_view>(cmd.begin(), cmd.end()), "root");
           }
         }
       }

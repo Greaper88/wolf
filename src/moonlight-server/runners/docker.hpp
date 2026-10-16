@@ -20,6 +20,11 @@ using namespace ranges::views;
 using namespace utils;
 using namespace wolf::core;
 
+boost::json::object with_hotplug_capabilities(boost::json::object options);
+
+std::vector<std::string>
+hotplug_command(const std::map<std::string, std::string> &udev_event, const std::string &encoded_event, bool remove);
+
 class RunDocker : public events::Runner {
 public:
   static RunDocker from_cfg(std::shared_ptr<events::EventBusType> ev_bus, const wolf::config::AppDocker &runner_cfg) {
