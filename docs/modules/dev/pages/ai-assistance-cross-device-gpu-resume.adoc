@@ -1,0 +1,138 @@
+= Cross-device resume on an existing app's GPU
+
+AI-Agent: ChatGPT Codex +
+AI-Model-Version: GPT-6 family; exact serving version and reasoning setting unavailable +
+AI-Inference-Date: 2026-10-17 03:21:07 UTC
+
+== Problem and evidence
+
+A client reconnecting to its profile's persistent Steam app could receive
+`GPU too busy or unavailable` when its new Wolf-UI launcher was assigned a
+different GPU. The rejected request explicitly reported `GPU core saturated`
+on the app's original GPU. This was an admission-policy rejection before an
+encoder was started, rather than evidence of an encoder or driver failure.
+
+The direct reconnect path already admitted an encoder for an existing app
+without treating that app's rendering load as a new workload. The single-user
+lobby join path used fresh-app admission when moving a viewer between GPUs,
+so switching devices could bypass the earlier reconnect fix.
+
+== Change
+
+The cross-GPU viewer now retains the persistent app's verified GPU binding and
+uses the existing-app resume admission path. The app, compositor, buffer mode
+and rendering GPU stay in place; the viewer's encoder follows the app.
+
+Current device accessibility, blacklist, cached capability, memory, encoder
+capacity and codec checks still apply. The change does not renegotiate an
+incompatible Moonlight codec or move a running game to another GPU. Profile
+ownership and the single-user lobby's connected-viewer exclusion remain.
+
+== Validation
+
+* The server compiled successfully using the existing container build environment.
+* All five standalone GPU CTest suites passed, including the new regression for
+  a retained app at 99% core usage and explicit VRAM/encoder exhaustion checks.
+* In an isolated server with two AMD Radeon Pro W6600 GPUs, the old image
+  reproduced the exact `GPU core saturated` rejection when a second client
+  resumed the first client's persistent app.
+* The corrected image passed the same real HEVC/RTP test: the second client
+  moved to the app GPU, video frame numbers continued advancing, leaving the
+  app restored the launcher's GPU, and the app survived the original launcher
+  shutting down. Both GPUs required verified zero-copy encoding.
+* The 99% core reading came from an ordinary fixture file bind-mounted over the
+  telemetry file only inside the disposable server. Host sysfs was never written.
+* The test also verifies wrong-profile rejection and rejection of another viewer
+  while the single-user app is in use.
+* clang-format 18.1.8, Python syntax checks and `git diff --check` passed.
+
+Initial mixed NVIDIA/AMD runs did not complete the handoff. Their startup
+verification intermittently excluded a device or its requested codec before
+the join could be tested. Retained logs include these unsuccessful runs; they
+are not counted as successful reconnect tests. Standalone H.264 hardware and
+zero-copy probes passed on both the W6600 and Quadro RTX 4000, but those probes
+alone do not establish that the full mixed-device handoff works.
+
+During those checks, the live Steam app was consuming approximately four
+logical CPUs and three Wolf-UI launchers were running. Heavy live workload is a
+possible contributor to startup probe failures; it has not been proven to be
+their cause. No probe deadlines, capability checks, drivers or live settings
+were changed to make a test pass.
+
+After explicit authorization to close the running apps, the live sessions and
+Steam app were stopped through the API and Wolf was paused. The same isolated
+HEVC test then ran with an AMD W6600 app GPU and NVIDIA Quadro RTX 4000 launcher
+GPU. The old image reproduced the core-saturation rejection. The fixed image
+passed the complete handoff, including advancing video frames at the simulated
+99% app-GPU load, preserved profile exclusivity, return to the launcher GPU,
+and the persistent app surviving its original launcher. Both GPU pipelines used
+verified zero-copy. No deadline or capability policy was relaxed for this rerun.
+
+Hardware test scripts and results are retained in the sibling local
+`wolf-cross-gpu-reconnect-validation` folder; their test clients are synthetic.
+Selected live status and deployment metadata are recorded separately. No source
+commit, remote push or image publication was performed during local validation.
+
+== Authorized local rollout
+
+The verified image was applied at 2026-10-17 02:57:02 UTC using the existing
+`wolf:nvidia-gpu-selection-dev` image reference. Its image ID is
+`sha256:41730a4c1afa9bc6f88b103b78477ab95d3426e67ebb6672a342a400d98f5f81`;
+the separate `wolf:cross-gpu-reconnect-dev` tag identifies the same image.
+Both Compose invocation styles were checked before recreating only Wolf.
+Compose files and persistent app/profile files were preserved.
+
+The prior image is retained as
+`wolf:before-cross-device-resume-20261017-025448Z`. Disposable test servers were
+removed, and the build container was returned to its stopped state.
+
+Live startup reused the verified NVIDIA 615.71.09 driver volume. H.264 and HEVC
+zero-copy verification passed on the Quadro RTX 4000 and both W6600 cards.
+The Intel GPU verified hardware H.264/HEVC encoding with CPU-buffer fallback;
+all four GPUs remain available. Session and lobby API responses returned 200
+with the earlier connection-close fix intact, and no old app lobbies remained.
+
+A subsequent real-client reconnect confirmed the same behavior: Wolf-UI began
+on the RTX 4000, then joined the existing Steam app on the W6600 without
+recreating that app. Its HEVC encoder changed from `nvh265enc` with CUDA memory
+to `varenderD130h265enc` with DMA-BUF/VA memory and no CPU `videoconvert`. When
+Steam stopped, the launcher stream returned to NVIDIA. The checked reconnect
+window contained no GPU-admission or codec rejections.
+
+== Development publication
+
+The maintainer requested publication to `dev-gpu-selection` and
+`ghcr.io/greaper88/wolf:gpu-selection-dev`. The existing API connection fix is a
+separate prerequisite commit because it is already present in the tested
+runtime. The branch also includes its previously prepared controller reconnect
+commit. The primary branch and its `latest` image are outside this publication.
+
+The publication retains the verified runtime and executable, adding current
+source-revision and AI provenance labels plus copies of both disclosures under
+`/usr/share/doc/wolf/`. The tested Wolf executable's SHA-256 is
+`41fece1b1d282d00d42105e7aee25abf94f943edd265ea9e0370d1bef7626976`.
+The development tag and a full-commit `sha-` tag identify the published image.
+The companion image reference remains
+`ghcr.io/greaper88/wolf-ui:gpu-selection-dev`.
+
+Only the image-publishing workflow run triggered by this push may be canceled
+to prevent a second build from overwriting the manually published, tested
+runtime. Source validation workflows are left enabled. Publication does not
+restart or alter the current live sessions. Temporary registry credentials are
+passed through standard input and removed after publication; they are not
+included in image layers, repository files or validation output.
+
+== Tools
+
+Codex terminal execution, patch and UTC clock tools; Git, GitHub CLI and ripgrep; Docker
+image inspection, logs, copy, container start/exec/run, local image build and
+disposable-container cleanup, image tagging/push and registry manifest checks;
+NVIDIA native CDI for the isolated mixed-device
+fixture; Python 3 with Unix-socket HTTP, RTSP and UDP/RTP test clients; CMake,
+Ninja, the C++ build toolchain, CTest and clang-format 18.1.8. The formatter was
+installed only in the build container, with no host package or runtime-image
+dependency changes. No subagents or external web research were used.
+
+Private API responses were reduced to relevant status fields when inspecting
+the live server; session encryption keys and profile PINs were not included in
+validation output or this document.

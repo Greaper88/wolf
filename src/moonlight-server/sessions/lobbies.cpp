@@ -330,13 +330,16 @@ setup_lobbies_handlers(const immer::box<state::AppState> &app_state,
               launch = held.launch;
             }
           } else if (launch->device.id != lobby->gpu_target->launch->device.id) {
-            auto admitted = app_state->gpu_runtime->prepare(
+            // The app is already rendering on its pinned GPU. Switching a
+            // launcher from another GPU adds only an encoder, so use the same
+            // admission rules as a direct reconnect to the existing app.
+            auto admitted = app_state->gpu_runtime->retain(
                 "viewer:" + std::to_string(session->session_id) + ":" + lobby->id,
-                lobby->gpu_target->launch->device.id);
-            if (!admitted.launch) {
-              fail("GPU too busy or unavailable. Wait and retry, or force-close the app and restart it "
-                   "(unsaved data may be lost). " +
-                   admitted.error);
+                *lobby->gpu_target->launch);
+            auto error = admitted.launch ? app_state->gpu_runtime->resume(*admitted.launch, current->launch.get())
+                                         : admitted.error;
+            if (!error.empty()) {
+              fail(error);
               return;
             }
             launch = admitted.launch;
