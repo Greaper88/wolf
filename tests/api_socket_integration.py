@@ -36,7 +36,7 @@ def connect_api(path, body=None):
     return conn
 
 
-def read_headers(conn):
+def read_headers(conn, expected_connection=None):
     data = b""
     while b"\r\n\r\n" not in data:
         block = conn.recv(4096)
@@ -44,6 +44,11 @@ def read_headers(conn):
         data += block
     headers, rest = data.split(b"\r\n\r\n", 1)
     assert headers.startswith(b"HTTP/1.0 200"), headers
+    if expected_connection is not None:
+        connections = [line.split(b":", 1)[1].strip().lower()
+                       for line in headers.split(b"\r\n")[1:]
+                       if line.lower().startswith(b"connection:")]
+        assert connections == [expected_connection], headers
     return rest
 
 
@@ -106,12 +111,21 @@ with socket.socket(socket.AF_UNIX) as listener:
     listener.bind(FAKE_DOCKER)
     listener.listen()
     try:
+        # Normal replies must not invite reuse of the single-request socket.
+        # A buffered response can otherwise reach a client before EOF does.
+        for _ in range(3):
+            with connect_api("/api/v1/sessions") as conn:
+                data = bytearray(read_headers(conn, b"close"))
+                while block := conn.recv(4096):
+                    data.extend(block)
+                assert json.loads(data)["success"] is True
+        print("PASS: ordinary API replies explicitly close their connections", flush=True)
         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
             if "--disconnect-only" in sys.argv:
                 check_pull(listener, pool, True)
             else:
                 with connect_api("/api/v1/events") as sse:
-                    events = read_headers(sse)
+                    events = read_headers(sse, b"keep-alive")
                     check_pull(listener, pool, False)
                     check_pull(listener, pool, True)
                     # A later request must still work after the failed response stream.
@@ -136,6 +150,7 @@ with socket.socket(socket.AF_UNIX) as listener:
         with connect_api("/api/v1/nonexistent") as conn:
             response = conn.recv(4096)
             assert response.startswith(b"HTTP/1.0 404"), response
+            assert b"\r\nConnection: close\r\n" in response, response
         print("PASS: API remains responsive and sends its 404 response", flush=True)
     finally:
         os.unlink(FAKE_DOCKER)
