@@ -186,6 +186,7 @@ void run_control(int port,
         case ENET_EVENT_TYPE_NONE:
           break;
         case ENET_EVENT_TYPE_CONNECT:
+          client_session->connected->store(true);
           logs::log(logs::debug, "[ENET] connected client: {}:{}", client_ip, client_port);
           connected_clients.update([peer = event.peer, client_session](const enet_clients_map &m) {
             return m.set(peer, client_session.value());
@@ -194,6 +195,7 @@ void run_control(int port,
               immer::box<ResumeStreamEvent>(ResumeStreamEvent{.session_id = client_session->session_id}));
           break;
         case ENET_EVENT_TYPE_DISCONNECT:
+          client_session->connected->store(false);
           logs::log(logs::debug, "[ENET] disconnected client: {}:{}", client_ip, client_port);
           connected_clients.update([peer = event.peer](const enet_clients_map &m) { return m.erase(peer); });
           event_bus->fire_event(

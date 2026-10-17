@@ -8,6 +8,7 @@
 #include <rfl/toml.hpp>
 #include <sessions/handlers.hpp>
 #include <state/config.hpp>
+#include <streaming/streaming.hpp>
 
 using Catch::Matchers::ContainsSubstring;
 using Catch::Matchers::Equals;
@@ -805,4 +806,196 @@ TEST_CASE("SSE APIs", "[API]") {
   REQUIRE(event.has_value());
   REQUIRE_THAT(event->event, Equals("wolf::core::events::IDRRequestEvent"));
   REQUIRE_THAT(event->data, Equals("{\"session_id\":\"42\"}"));
+}
+
+TEST_CASE("Dashboard reports retained apps without confusing owners and viewers", "[dashboard]") {
+  auto sessions = std::make_shared<immer::atom<immer::vector<events::StreamSession>>>();
+  auto lobbies = std::make_shared<immer::atom<immer::vector<events::Lobby>>>();
+  auto profiles = std::make_shared<immer::atom<state::ProfilesList>>();
+  profiles->update([](const auto &current) {
+    return current.push_back(immer::box<events::Profile>{
+        events::Profile{.id = "owner", .name = "Owner", .pin = std::vector<short>{1, 2, 3, 4}}});
+  });
+  state::AppState state{.config = immer::box<state::Config>{state::Config{.profiles = profiles}},
+                        .event_bus = std::make_shared<events::EventBusType>(),
+                        .lobbies = lobbies,
+                        .running_sessions = sessions};
+  auto route = std::make_shared<events::GpuStreamRoute>();
+  route->streaming.store(true);
+  route->codec.store(1);
+  route->profile_id.store(std::make_shared<const std::string>("viewer"));
+  route->negotiated_video.store(std::make_shared<const events::VideoSession>(
+      events::VideoSession{.display_mode = {.width = 1920, .height = 1080, .refreshRate = 60}, .bitrate_kbps = 20000}));
+  events::StreamSession session{.app = std::make_shared<events::App>(events::App{.base = {.title = "Wolf UI"}}),
+                                .gpu_route = route,
+                                .aes_key = "SECRET_AES_KEY",
+                                .aes_iv = "SECRET_AES_IV",
+                                .session_id = 42,
+                                .ip = "PRIVATE_CLIENT_ADDRESS"};
+  session.connected->store(true);
+  session.monitoring->video.store(std::make_shared<const events::StreamVideoStatus>(
+      events::StreamVideoStatus{.codec = "HEVC", .bitrate_kbps = 20000, .width = 1920, .height = 1080, .fps = 60}));
+  sessions->update([&](const auto &current) { return current.push_back(session); });
+  events::Lobby lobby{.id = "desktop", .name = "Plasma", .started_by_profile_id = "owner"};
+  lobby.connected_sessions->update(
+      [](const auto &current) { return current.push_back(immer::box<std::string>{"42"}); });
+  lobbies->update([&](const auto &current) { return current.push_back(lobby); });
+  state.active_containers->update([](const auto &current) {
+    return current.set("container",
+                       events::DockerContainerCreated{.container_id = "container",
+                                                      .session_id = "desktop",
+                                                      .name = "WolfPlasma_desktop",
+                                                      .image = "plasma:test",
+                                                      .render_node = "/dev/dri/renderD130"});
+  });
+  std::vector<wolf::gpu::Device> devices{
+      {.id = "amd", .render_node = "/dev/dri/renderD130", .name = "AMD", .gpu_percent = 0}};
+  auto status = make_status(state, devices);
+  REQUIRE(status.containers.size() == 1);
+  REQUIRE(status.containers[0].profile_id == "owner");
+  REQUIRE(status.containers[0].gpu_id == "amd");
+  REQUIRE(status.sessions[0].profile_id == "viewer");
+  REQUIRE(status.sessions[0].app == "Plasma");
+  REQUIRE(status.sessions[0].connected == true);
+  REQUIRE(status.sessions[0].codec == "HEVC");
+  REQUIRE(status.sessions[0].bitrate_kbps == 20000);
+  REQUIRE(status.sessions[0].width == 1920);
+  REQUIRE(status.gpus[0].gpu_percent == 0);
+  REQUIRE_FALSE(status.gpus[0].encoder_percent);
+  auto json = rfl::json::write(status);
+  REQUIRE(json.find("SECRET_") == std::string::npos);
+  REQUIRE(json.find("PRIVATE_CLIENT") == std::string::npos);
+  REQUIRE(json.find("\"pin\"") == std::string::npos);
+
+  session.connected->store(false); // The video thread may still be tearing down.
+  status = make_status(state, devices);
+  REQUIRE_FALSE(status.sessions[0].streaming);
+  REQUIRE_FALSE(status.sessions[0].codec);
+  REQUIRE_FALSE(status.sessions[0].bitrate_kbps);
+  REQUIRE_FALSE(status.sessions[0].width);
+  REQUIRE(status.containers.size() == 1);
+
+  sessions->store({}); // The retained desktop remains visible after the client session disappears.
+  status = make_status(state, devices);
+  REQUIRE(status.sessions.empty());
+  REQUIRE(status.containers[0].profile_id == "owner");
+}
+
+TEST_CASE("Dashboard follows container lifecycle events", "[dashboard]") {
+  auto app_state = immer::box<state::AppState>(
+      state::AppState{.event_bus = std::make_shared<events::EventBusType>(),
+                      .running_sessions = std::make_shared<immer::atom<immer::vector<events::StreamSession>>>()});
+  auto handlers = sessions::setup_moonlight_handlers(app_state, "/tmp", {});
+  app_state->event_bus->fire_event(
+      immer::box<events::DockerContainerCreated>{events::DockerContainerCreated{.container_id = "app",
+                                                                                .session_id = "42",
+                                                                                .name = "Steam",
+                                                                                .render_node = "/dev/dri/renderD128"}});
+  REQUIRE(app_state->active_containers->load()->size() == 1);
+  app_state->event_bus->fire_event(
+      immer::box<events::DockerContainerStopped>{events::DockerContainerStopped{.container_id = "app"}});
+  REQUIRE(app_state->active_containers->load()->empty());
+}
+
+namespace {
+struct DashboardVideoWorker {
+  std::shared_ptr<events::EventBusType> bus = std::make_shared<events::EventBusType>();
+  std::jthread worker;
+  explicit DashboardVideoWorker(events::VideoSession settings) {
+    worker = std::jthread([this, settings](std::stop_token stop) {
+      // Repeat cancellation to also cover startup before its event handlers are installed.
+      std::jthread cancellation([this, stop, id = settings.session_id](std::stop_token done) {
+        while (!done.stop_requested()) {
+          if (stop.stop_requested())
+            bus->fire_event(immer::box<events::StopStreamEvent>{events::StopStreamEvent{id}});
+          std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+      });
+      boost::asio::io_context io;
+      auto socket = std::make_shared<streaming::udp::socket>(io, streaming::udp::endpoint(streaming::udp::v4(), 0));
+      streaming::start_streaming_video(immer::box<events::VideoSession>(settings),
+                                       bus,
+                                       "127.0.0.1",
+                                       12345,
+                                       std::make_shared<immer::atom<gst_video_context::gst_context_ptr>>(),
+                                       socket);
+    });
+  }
+  void stop() {
+    if (worker.joinable()) {
+      worker.request_stop();
+      worker.join();
+    }
+  }
+  ~DashboardVideoWorker() {
+    stop();
+  }
+};
+template <typename F> bool dashboard_eventually(F ready) {
+  auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+  while (!ready()) {
+    if (std::chrono::steady_clock::now() >= deadline)
+      return false;
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  }
+  return true;
+}
+} // namespace
+
+TEST_CASE("Dashboard monitors route-less video workers and clears retiring streams", "[dashboard]") {
+  auto sessions = std::make_shared<immer::atom<immer::vector<events::StreamSession>>>();
+  state::AppState state{.config = immer::box<state::Config>{state::Config{
+                            .profiles = std::make_shared<immer::atom<state::ProfilesList>>()}},
+                        .lobbies = std::make_shared<immer::atom<immer::vector<events::Lobby>>>(),
+                        .running_sessions = sessions};
+  events::StreamSession session{.app = std::make_shared<events::App>(events::App{.base = {.title = "Desktop"}}),
+                                .session_id = 42};
+  session.connected->store(true);
+  session.monitoring->profile_id.store(std::make_shared<const std::string>("manual-user"));
+  sessions->update([&](const auto &current) { return current.push_back(session); });
+  std::vector<wolf::gpu::Device> devices{{.id = "manual-gpu", .render_node = "/dev/dri/renderD128"}};
+  REQUIRE_FALSE(make_status(state, devices).sessions[0].streaming);
+  events::VideoSession settings{.monitoring = session.monitoring,
+                                .monitoring_codec = std::string("HEVC"),
+                                .display_mode = {.width = 1920, .height = 1080, .refreshRate = 60},
+                                .gst_pipeline = "videotestsrc is-live=true ! fakesink sync=true",
+                                .render_node = "/dev/dri/renderD128",
+                                .session_id = 42,
+                                .packet_size = 1392,
+                                .bitrate_kbps = 12000};
+  REQUIRE_FALSE(settings.gpu_route.get());
+  REQUIRE_FALSE(make_status(state, devices).sessions[0].streaming); // Negotiation is not a running worker.
+  DashboardVideoWorker first(settings);
+  REQUIRE(dashboard_eventually([&] { return session.monitoring->video.load() != nullptr; }));
+  auto status = make_status(state, devices);
+  REQUIRE(status.sessions[0].streaming);
+  REQUIRE(status.sessions[0].codec == "HEVC");
+  REQUIRE(status.sessions[0].bitrate_kbps == 12000);
+  REQUIRE(status.sessions[0].width == 1920);
+  REQUIRE(status.sessions[0].height == 1080);
+  REQUIRE(status.sessions[0].fps == 60);
+  REQUIRE(status.sessions[0].gpu_id == "manual-gpu");
+  REQUIRE(status.sessions[0].profile_id == "manual-user");
+
+  session.connected->store(false); // A retiring worker must not present active negotiation.
+  status = make_status(state, devices);
+  REQUIRE_FALSE(status.sessions[0].streaming);
+  REQUIRE_FALSE(status.sessions[0].codec);
+  REQUIRE_FALSE(status.sessions[0].bitrate_kbps);
+  REQUIRE_FALSE(status.sessions[0].width);
+  session.connected->store(true);
+
+  auto old_snapshot = session.monitoring->video.load();
+  DashboardVideoWorker replacement(settings);
+  REQUIRE(dashboard_eventually([&] { return session.monitoring->video.load() != old_snapshot; }));
+  auto replacement_snapshot = session.monitoring->video.load();
+  first.stop();
+  REQUIRE(session.monitoring->video.load() == replacement_snapshot);
+  REQUIRE(make_status(state, devices).sessions[0].streaming);
+  replacement.stop();
+  REQUIRE_FALSE(session.monitoring->video.load());
+  status = make_status(state, devices);
+  REQUIRE_FALSE(status.sessions[0].streaming);
+  REQUIRE_FALSE(status.sessions[0].codec);
+  REQUIRE_FALSE(status.sessions[0].bitrate_kbps);
 }

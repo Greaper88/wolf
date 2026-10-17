@@ -79,6 +79,14 @@ setup_moonlight_handlers(const immer::box<state::AppState> &app_state,
    * This way we can accumulate devices here until the docker container is up and running
    */
   auto plugged_devices_queue = std::make_shared<immer::atom<session_devices>>();
+  handlers.push_back(app_state->event_bus->register_handler<immer::box<events::DockerContainerCreated>>(
+      [containers = app_state->active_containers](const immer::box<events::DockerContainerCreated> &ev) {
+        containers->update([&](const auto &current) { return current.set(ev->container_id, *ev); });
+      }));
+  handlers.push_back(app_state->event_bus->register_handler<immer::box<events::DockerContainerStopped>>(
+      [containers = app_state->active_containers](const immer::box<events::DockerContainerStopped> &ev) {
+        containers->update([&](const auto &current) { return current.erase(ev->container_id); });
+      }));
   handlers.push_back(app_state->event_bus->register_handler<immer::box<events::PauseStreamEvent>>(
       [app_state](const immer::box<events::PauseStreamEvent> &ev) {
         auto session = state::get_session_by_id(app_state->running_sessions->load(), ev->session_id);

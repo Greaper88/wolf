@@ -336,12 +336,15 @@ void RunDocker::run(std::string_view session_id,
     logs::log(logs::debug, "[DOCKER] Starting container: {}", *docker_container);
 
     std::string inspected_hostname;
-    if (auto inspected = docker_api.get_by_id(container_id)) {
+    if (auto inspected = docker_api.get_by_id(container_id); inspected && inspected->status == RUNNING) {
       inspected_hostname = inspected->hostname;
       this->ev_bus->fire_event(immer::box<events::DockerContainerCreated>{events::DockerContainerCreated{
           .container_id = container_id,
           .hostname = inspected->hostname,
           .session_id = std::string(session_id),
+          .name = new_container.name,
+          .image = new_container.image,
+          .render_node = std::string(render_node),
       }});
     } else {
       logs::log(logs::warning, "[DOCKER] Unable to inspect container {} for hostname", container_id);

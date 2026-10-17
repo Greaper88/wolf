@@ -385,6 +385,15 @@ setup_lobbies_handlers(const immer::box<state::AppState> &app_state,
         }
         // TODO: hotplug pen_tablet
 
+        // A shared lobby's owner is not necessarily this viewer's profile.
+        session->monitoring->profile_id.store(join_lobby_event->profile_id
+                                                  ? std::make_shared<const std::string>(*join_lobby_event->profile_id)
+                                                  : nullptr);
+        if (session->gpu_route)
+          session->gpu_route->profile_id.store(join_lobby_event->profile_id
+                                                   ? std::make_shared<const std::string>(*join_lobby_event->profile_id)
+                                                   : nullptr);
+
         // Update the lobby with the new session
         lobby->connected_sessions->update([session](const immer::vector<immer::box<std::string>> &connected_sessions) {
           return connected_sessions.push_back({std::to_string(session->session_id)});

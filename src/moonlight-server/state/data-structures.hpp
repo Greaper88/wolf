@@ -159,6 +159,9 @@ using SessionsAtoms = std::shared_ptr<immer::atom<immer::vector<events::StreamSe
  * The whole application state as a composition of immutable datastructures
  */
 struct AppState {
+  // Only running Wolf app containers, updated by Docker lifecycle events.
+  std::shared_ptr<immer::atom<immer::map<std::string, events::DockerContainerCreated>>> active_containers =
+      std::make_shared<immer::atom<immer::map<std::string, events::DockerContainerCreated>>>();
   std::shared_ptr<std::recursive_mutex> gpu_transitions = std::make_shared<std::recursive_mutex>();
   /**
    * The stored (and user modifiable) configuration

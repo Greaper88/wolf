@@ -597,6 +597,32 @@ SharedVideoResult prepare_shared_video(const events::VideoSession &settings,
   return {encoder, error};
 }
 
+struct VideoMonitoringActivity {
+  std::shared_ptr<events::StreamMonitoring> monitoring;
+  std::shared_ptr<const events::StreamVideoStatus> snapshot;
+  explicit VideoMonitoringActivity(const events::VideoSession &video) : monitoring(video.monitoring.get()) {
+    if (!monitoring)
+      return;
+    auto launch = video.gpu_launch.get();
+    snapshot = std::make_shared<const events::StreamVideoStatus>(
+        events::StreamVideoStatus{.codec = video.monitoring_codec.get(),
+                                  .bitrate_kbps = video.bitrate_kbps,
+                                  .width = video.display_mode.width,
+                                  .height = video.display_mode.height,
+                                  .fps = video.display_mode.refreshRate,
+                                  .render_node = video.render_node,
+                                  .gpu_id = launch ? std::optional<std::string>(launch->device.id) : std::nullopt});
+    monitoring->video.store(snapshot);
+  }
+  ~VideoMonitoringActivity() {
+    if (monitoring) {
+      auto expected = snapshot;
+      // A retiring connection must not clear a newer worker's snapshot.
+      monitoring->video.compare_exchange_strong(expected, nullptr);
+    }
+  }
+};
+
 static void stream_video_once(immer::box<events::VideoSession> video_session,
                               const std::shared_ptr<events::EventBusType> &event_bus,
                               std::string client_ip,
@@ -646,6 +672,7 @@ static void stream_video_once(immer::box<events::VideoSession> video_session,
   std::shared_ptr<NeedContextData> ctx_data_ptr = std::make_shared<NeedContextData>(
       NeedContextData{.device_path = video_session->render_node, .gst_context = video_context});
   std::jthread feed;
+  std::unique_ptr<VideoMonitoringActivity> monitoring;
   run_pipeline(
       pipeline,
       [video_session, event_bus, udp_sink, ctx_data_ptr, activity, shared, &feed, &sequence](auto pipeline) {
@@ -792,7 +819,8 @@ static void stream_video_once(immer::box<events::VideoSession> video_session,
           gst_object_unref(pay);
         }
       },
-      [&] { return interrupted() || (shared && !shared->healthy()); });
+      [&] { return interrupted() || (shared && !shared->healthy()); },
+      [&] { monitoring = std::make_unique<VideoMonitoringActivity>(*video_session); });
   // Replacing an existing encoder is not admission of another stream. Keep its slot
   // while switching producers on this exact reservation, even if the app now loads the GPU.
   // A disconnect, failed stream, or move to another GPU still releases encoder demand.
@@ -855,6 +883,7 @@ void start_streaming_video(immer::box<events::VideoSession> initial,
       break;
     }
     auto video = *initial;
+    video.monitoring_codec = std::string(std::array{"H.264", "HEVC", "AV1"}[route->codec.load()]);
     video.gpu_launch = target->launch;
     video.video_context = target->context;
     video.gst_pipeline = target->pipelines[route->codec.load()];

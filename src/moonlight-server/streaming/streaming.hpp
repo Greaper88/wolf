@@ -88,7 +88,8 @@ static bool run_pipeline(
         &on_pipeline_ready,
     bool strict = false,
     const std::function<void(gstreamer::gst_element_ptr)> &on_stopped = {},
-    const std::function<bool()> &interrupted = {}) {
+    const std::function<bool()> &interrupted = {},
+    const std::function<void()> &on_started = {}) {
   GError *error = nullptr;
   gstreamer::gst_element_ptr pipeline(gst_parse_launch(pipeline_desc.c_str(), &error), [](const auto &pipeline) {
     logs::log(logs::trace, "~pipeline");
@@ -159,6 +160,8 @@ static bool run_pipeline(
     cleanup();
     return false;
   }
+  if (on_started)
+    on_started();
   GST_DEBUG_BIN_TO_DOT_FILE_WITH_TS(reinterpret_cast<GstBin *>(pipeline.get()),
                                     GST_DEBUG_GRAPH_SHOW_ALL,
                                     "pipeline-start");

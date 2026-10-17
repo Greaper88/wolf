@@ -1,6 +1,7 @@
 #pragma once
 
 #include <api/http_server.hpp>
+#include <api/status.hpp>
 #include <deque>
 #include <events/events.hpp>
 #include <events/reflectors.hpp>
@@ -195,6 +196,8 @@ public:
   void broadcast_event(const std::string &event_type, const std::string &event_json);
 
 private:
+  void endpoint_Status(const HTTPRequest &req, std::shared_ptr<UnixSocket> socket);
+
   void endpoint_Events(const HTTPRequest &req, std::shared_ptr<UnixSocket> socket);
 
   void endpoint_PendingPairRequest(const HTTPRequest &req, std::shared_ptr<UnixSocket> socket);

@@ -201,6 +201,14 @@ void UnixSocketServer::endpoint_RemoveProfile(const HTTPRequest &req, std::share
   }
 }
 
+void UnixSocketServer::endpoint_Status(const HTTPRequest &req, std::shared_ptr<UnixSocket> socket) {
+  try {
+    send_http(socket, 200, rfl::json::write(make_status(*state_->app_state, wolf::gpu::discover())));
+  } catch (const std::exception &) {
+    send_http(socket, 500, rfl::json::write(GenericErrorResponse{.error = "Live status unavailable"}));
+  }
+}
+
 void UnixSocketServer::endpoint_StreamSessions(const HTTPRequest &req, std::shared_ptr<UnixSocket> socket) {
   auto res = StreamSessionListResponse{.success = true};
   auto sessions = state_->app_state->running_sessions->load();
@@ -365,6 +373,15 @@ void UnixSocketServer::endpoint_StreamSessionStart(const HTTPRequest &req, std::
     if (auto session = state::get_session_by_id(sessions.get(), session_id)) {
       auto video_session = start_req.value().video_session;
       video_session.session_id = session_id; // Can't be JSON encoded
+      video_session.monitoring = session->monitoring;
+      if (!video_session.gst_pipeline.empty()) {
+        if (video_session.gst_pipeline == session->app->av1_gst_pipeline)
+          video_session.monitoring_codec = std::string("AV1");
+        else if (video_session.gst_pipeline == session->app->hevc_gst_pipeline)
+          video_session.monitoring_codec = std::string("HEVC");
+        else if (video_session.gst_pipeline == session->app->h264_gst_pipeline)
+          video_session.monitoring_codec = std::string("H.264");
+      }
       video_session.gpu_route = session->gpu_route;
       video_session.gpu_launch = session->gpu_launch;
       video_session.video_context = session->video_context;

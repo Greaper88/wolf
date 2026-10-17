@@ -42,3 +42,18 @@ We have a set of pre-built containers that are optimised to work with our flow i
 We use https://gstreamer.freedesktop.org/[GStreamer] to encode the video and audio streams and send them to the client. We have automatic support for HW acceleration using CUDA, QuickSync and VAAPI but thanks to GStreamer we can easily add more encoders into the mix, without having to write a single line of code! The full encoding pipeline is described in a string that can be overridden by users just by changing the `config.toml` file.
 
 We've implemented a couple of custom GStreamer plugins in order to properly split, RTP encode and add https://en.wikipedia.org/wiki/Error_correction_code[FEC] to the resulting buffers into the format that Moonlight expects; they live in here: https://github.com/games-on-whales/wolf/tree/stable/src/moonlight-server/gst-plugin[src/moonlight-server/gst-plugin].
+== Read-only dashboard status
+
+`GET /api/v1/status` returns version 1 monitoring data for Wolf Den: GPU identity and
+utilization, cached verified codecs, current control connections, negotiated video
+settings, profile names, and running Wolf app containers. It does not return stream
+keys, addresses, profile PINs, environment variables or runner configuration.
+
+GPU usage is sampled on request; capability results come from the existing runtime
+cache and do not trigger probes. Container state follows Docker lifecycle events,
+including retained lobbies with no connected viewers. A container's render GPU is
+independent of a viewer's current encoding GPU. Video bitrate is the negotiated
+encoder target in kbps, not measured network throughput; disconnected sessions do
+not report old video settings as active. Missing telemetry is unavailable, not zero.
+Den polls only while Home has a connected browser viewer and shares a short cache
+across viewers. This endpoint adds no background monitoring thread.

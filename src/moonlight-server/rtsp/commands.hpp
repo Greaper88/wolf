@@ -223,6 +223,10 @@ announce(const RTSP_PACKET &req, const events::StreamSession &session) {
 
   // Video session
   events::VideoSession video = {
+      .monitoring = session.monitoring,
+      .monitoring_codec = std::string(video_format_av1    ? "AV1"
+                                      : video_format_hevc ? "HEVC"
+                                                          : "H.264"),
       .gpu_route = session.gpu_route,
       .gpu_launch = session.gpu_launch,
       .video_context = session.video_context,

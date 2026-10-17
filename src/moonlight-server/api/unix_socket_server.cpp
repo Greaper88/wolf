@@ -27,6 +27,14 @@ UnixSocketServer::UnixSocketServer(boost::asio::io_context &io_context,
                     // TODO: json_schema = rfl::json::to_schema<EventsVariant>()
                     .handler = [this](auto req, auto socket) { endpoint_Events(req, socket); }});
 
+  state_->http.add(HTTPMethod::GET,
+                   "/api/v1/status",
+                   {.summary = "Read live GPU, connection and app container status",
+                    .description = "Read-only monitoring. Bitrate is the negotiated encoder target in kbps. "
+                                   "Missing telemetry means unavailable. No pairing or stream secrets are returned.",
+                    .response_description = {{200, {.json_schema = rfl::json::to_schema<StatusResponse>()}}},
+                    .handler = [this](auto req, auto socket) { endpoint_Status(req, socket); }});
+
   /**
    * Pairing API
    */

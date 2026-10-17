@@ -1,0 +1,74 @@
+= Wolf Den monitoring status API
+
+AI-Agent: ChatGPT Codex +
+AI-Model-Version: GPT-6 family; exact serving version and reasoning setting unavailable +
+AI-Inference-Date: 2026-10-17
+
+== Scope
+
+The maintainer requested a Home dashboard with GPU activity, active users,
+connection and negotiated encoding details, and running app containers with
+GPU assignments. The dashboard should refresh only while someone views Home.
+
+`GET /api/v1/status` exposes versioned monitoring data for Wolf Den. It combines
+fresh GPU utilization readings with the existing cached encoder verification
+results. Reading status does not run encoder probes or change admission policy.
+Connection state follows the Moonlight control channel, video details follow
+active video workers, and container state follows Docker lifecycle events.
+App rendering and stream encoding GPUs are reported independently. Retained
+lobbies continue to appear under their owning profiles after viewers disconnect.
+
+The response includes only monitoring fields and profile names. It omits stream
+keys, client addresses, profile PINs, environment variables, and runner settings.
+Unavailable driver metrics remain unavailable. Video bitrate is the encoder's
+negotiated target in kbps. Den shares its cached snapshot across viewers, marks
+old readings when requests fail, and stops polling when Home is closed or its
+browser disconnects.
+
+The publication review also covers active streams without automatic GPU routing.
+Their monitoring uses the same worker lifecycle as automatic sessions; a manual
+GPU session must not be presented as connected without video when it is streaming.
+A pending diagnostic change records the GPU and reason when reconnect admission
+is rejected. It does not change admission decisions.
+
+The Linux test workflow now installs the standard GStreamer base and ugly plugin
+packages. The previous revision's CI log showed two existing shared-video tests
+failing because `x264enc` was absent. These packages provide their software
+encoder test dependency; this does not change the runtime image or hardware
+encoder selection.
+
+== Validation
+
+The initial dashboard passed 35 Wolf Den tests and 22 Wolf API, protocol,
+connection and shared-video test cases (414 assertions). Browser checks covered
+populated, empty, unavailable and unsupported-server states. Closing Home left
+its request count unchanged over the following 25 seconds. The deployed status
+endpoint detected all four host GPUs and returned cached H.264/HEVC support.
+
+The final publication passed 23 test cases with 437 assertions, including
+route-independent video monitoring, worker teardown and a late old worker
+exiting after a new stream starts.
+Final build and regression results are retained in the sibling local
+`wolf-den-results/dashboard-20261017` validation directory.
+
+== Publication
+
+The requested Wolf channel is `dev-gpu-selection`, published as
+`ghcr.io/greaper88/wolf:gpu-selection-dev` and a full-commit `sha-` tag.
+Wolf Den is published independently from its `main` branch.
+
+The Wolf image uses the existing verified runtime environment and the executable
+built from this source revision. The publication adds source-revision and AI
+provenance labels and this disclosure under `/usr/share/doc/wolf/`. Only the
+image workflow triggered by this source push may be canceled to avoid a second
+publisher overwriting the tested image. Source validation workflows remain enabled.
+Publishing does not restart the live stack. Temporary registry credentials are
+passed through standard input and removed after use.
+
+== Tools
+
+Codex terminal execution and patching, parallel agents for Wolf review and Den
+publication, Git/GitHub CLI, ripgrep, Python 3, SHA-256 verification, Docker
+Engine/BuildKit, the existing CMake/Ninja/C++ build environment, Catch2,
+clang-format 18, the .NET SDK and xUnit, and browser UI automation. Private live
+session responses are not included in this disclosure or public image metadata.
