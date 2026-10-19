@@ -64,6 +64,26 @@ between existing detached test servers. Both affected API cases passed in
 isolation, and the complete per-case CTest run avoided the shared-socket race.
 No live service was restarted or deployed during implementation.
 
+== Preserve the deployed reconnect repair
+
+Deployment preflight found that the live `wolf:reconnect-timeout-dev` image
+contained an already tested, uncommitted handshake repair based on `257ae69`.
+Its source changes were copied separately onto the NUMA branch before deployment;
+the original development worktree and its uncommitted edits were preserved.
+
+Unclaimed GPU admissions retain their 30-second monotonic deadline and expire
+back to a retained app assignment. The app's GPU pin survives expiration;
+active encoders and cancelled teardown keep their capacity protection. RTP
+timeouts check current connection credentials under the HTTPS resume transition
+lock, preventing an old waiter from pausing a newer connection or active worker.
+The existing clock-injected admission and stale-handshake session regressions
+were included with the combined source. No admission thresholds or GPU isolation
+rules were relaxed to introduce NUMA placement.
+
+The combined server and test binaries rebuilt successfully. Seven GPU CTests,
+seven shared-video/handshake cases (119 assertions), eight NUMA cases (125
+assertions), and eight isolated API/reconnect cases passed before packaging.
+
 == Tools
 
 Codex terminal execution and patching, parallel implementation/review agents,

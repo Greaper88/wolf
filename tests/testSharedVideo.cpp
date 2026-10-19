@@ -270,6 +270,59 @@ TEST_CASE("Shared video waits for keyframes and isolates slow viewers", "[shared
   REQUIRE(GST_BUFFER_OFFSET(gst_sample_get_buffer(queue.pop(0ms).get())) == 9);
 }
 
+TEST_CASE("An expired video handshake cannot pause a newer connection", "[shared-video][sessions]") {
+  TestGpuRuntime gpu;
+  auto home = gpu.target("timeout-launcher", gpu.a.id);
+  auto bus = std::make_shared<events::EventBusType>();
+  auto running = std::make_shared<immer::atom<immer::vector<events::StreamSession>>>();
+  auto app_state = immer::box<state::AppState>(state::AppState{.event_bus = bus, .running_sessions = running});
+  std::vector<std::size_t> paused;
+  auto observe = bus->register_handler<immer::box<events::PauseStreamEvent>>(
+      [&](const immer::box<events::PauseStreamEvent> &event) { paused.push_back(event->session_id); });
+
+  events::StreamSession viewer{};
+  viewer.session_id = 42;
+  viewer.gpu_launch = home->launch;
+  viewer.gpu_route = std::make_shared<events::GpuStreamRoute>();
+  viewer.gpu_route->home = home;
+  viewer.gpu_route->target.store(home);
+  viewer.rtp_secret_payload.fill('a');
+  const auto first_handshake = viewer.rtp_secret_payload;
+  running->update([&](auto) { return immer::vector<events::StreamSession>{viewer}; });
+
+  // HTTPS resume replaces the connection credentials while keeping the launcher and its GPU pin.
+  viewer.rtp_secret_payload.fill('b');
+  running->update([&](auto) { return immer::vector<events::StreamSession>{viewer}; });
+  sessions::pause_timed_out_video(app_state, viewer.session_id, first_handshake);
+  REQUIRE(paused.empty());
+  REQUIRE(viewer.gpu_launch->reservation->valid());
+
+  sessions::pause_timed_out_video(app_state, viewer.session_id, viewer.rtp_secret_payload);
+  REQUIRE(paused == std::vector<std::size_t>{viewer.session_id});
+  paused.clear();
+
+  viewer.gpu_route->streaming.store(true);
+  sessions::pause_timed_out_video(app_state, viewer.session_id, viewer.rtp_secret_payload);
+  REQUIRE(paused.empty()); // A duplicate ANNOUNCE waiter cannot terminate the established worker.
+  viewer.gpu_route->streaming.store(false);
+
+  const auto previous_handshake = viewer.rtp_secret_payload;
+  running->update([](auto) { return immer::vector<events::StreamSession>{}; });
+  sessions::pause_timed_out_video(app_state, viewer.session_id, previous_handshake);
+  REQUIRE(paused.empty());
+  viewer.rtp_secret_payload.fill('c');
+  running->update([&](auto) { return immer::vector<events::StreamSession>{viewer}; });
+  sessions::pause_timed_out_video(app_state, viewer.session_id, previous_handshake);
+  REQUIRE(paused.empty()); // Reusing a Moonlight client ID does not revive its previous handshake.
+  sessions::pause_timed_out_video(app_state, viewer.session_id, viewer.rtp_secret_payload);
+  REQUIRE(paused == std::vector<std::size_t>{viewer.session_id});
+  paused.clear();
+
+  viewer.gpu_launch->reservation->cancel();
+  sessions::pause_timed_out_video(app_state, viewer.session_id, viewer.rtp_secret_payload);
+  REQUIRE(paused.empty());
+}
+
 TEST_CASE("Shared VA video continues after a high frame rate viewer joins", "[shared-video][hardware]") {
   const auto node = std::getenv("WOLF_TEST_SHARED_VA_NODE");
   if (!node)
