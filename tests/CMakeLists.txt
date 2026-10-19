@@ -21,6 +21,8 @@ set(SRC_LIST
         testCrypto.cpp
         testGSTPlugin.cpp
         testSharedVideo.cpp
+        testNumaStreaming.cpp
+        testDockerNuma.cpp
         testMoonlight.cpp
         testRTSP.cpp
         testWolfAPI.cpp
@@ -121,9 +123,16 @@ catch_discover_tests(wolftests
 
 # Dependency-free policy/provider regression suite.
 add_subdirectory(gpu)
+if(TARGET wolf-numa-run)
+  add_dependencies(wolftests wolf-numa-run gpu_numa_tests)
+endif()
 
 find_package(Python3 COMPONENTS Interpreter)
 if(Python3_Interpreter_FOUND)
+  if(TARGET wolf-numa-run)
+    add_test(NAME numa_bootstrap_tests
+             COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_SOURCE_DIR}/gpu/numa_bootstrap_test.py $<TARGET_FILE:wolf-numa-run>)
+  endif()
   add_test(NAME ray_tracing_probe_tests
            COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_SOURCE_DIR}/gpu/ray_tracing_probe_test.py)
   add_test(NAME nvidia_driver_volume_policy_tests

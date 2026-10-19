@@ -1,0 +1,117 @@
+= GPU-local CPU and memory placement
+
+Wolf follows the selected GPU's Linux DRM/PCI NUMA topology. No socket, CPU
+number, GPU model, or motherboard layout is hardcoded. Automatic GPU selection
+chooses the GPU; NUMA placement follows that choice for both automatic and
+manually selected GPUs.
+
+== Loose and strict modes
+
+[cols="1,3,3",options="header"]
+|===
+|WOLF_NUMA_MODE |CPU placement |RAM placement
+|loose (default)
+|Start execution on GPU-local CPUs, then immediately restore the full permitted
+CPU mask. The scheduler can use remote cores as load changes.
+|Prefer the GPU's local node with `MPOL_PREFERRED`; remote RAM remains available
+when local allocation cannot be satisfied.
+|strict
+|Restrict execution to GPU-local CPU threads.
+|Restrict new allocations to the GPU-local memory node with `MPOL_BIND` and
+Docker memory cpusets. A full local node can cause allocation failure despite
+free RAM elsewhere.
+|===
+
+Linux CPU affinity is a hard allowed mask, not a soft preferred-core API. Loose
+mode therefore seeds initial local execution without retaining that mask. It
+provides best effort CPU locality, not a guarantee that the scheduler will keep
+running near the GPU. Both modes preserve explicit operator CPU/memory limits;
+loose mode can borrow only within those limits. Neither mode reserves exclusive
+cores or creates per-session RAM quotas.
+
+[source,yaml]
+----
+services:
+  wolf:
+    cap_add:
+      - SYS_NICE
+    environment:
+      WOLF_NUMA_AWARE: "true"
+      WOLF_NUMA_MODE: "loose" # or "strict"
+----
+
+Merge this into the saved Compose service's existing capabilities and environment
+settings, then recreate Wolf through Compose. `WOLF_NUMA_AWARE=false` disables
+placement. Mode values are case insensitive; other values are configuration
+errors. Existing apps must be stopped and relaunched to receive new settings.
+
+== App containers and host processes
+
+Strict Docker guests receive the GPU-local `HostConfig.CpusetCpus` and
+`HostConfig.CpusetMems`, intersected with app-specific restrictions. Incompatible
+restrictions reject the launch rather than silently executing remotely.
+
+Loose Docker guests retain all CPUs and RAM permitted to Wolf, intersected with
+any explicit app restrictions. A small static launcher seeds local execution,
+sets the preferred memory node, then executes the app's original entrypoint and
+command. It preserves argument boundaries, environment, user, working directory,
+PID, signals, and exit status; app images need no `numactl` package or shell.
+Wolf copies the launcher into its shared state folder and mounts it read-only.
+The image/default command merge follows Docker's normal entrypoint rules.
+Manual builds must also build `wolf-numa-run` and install it as an executable
+in `HOST_APPS_STATE_FOLDER/wolf-numa-run` before launching Docker apps.
+
+Loose guests add `SYS_NICE` to permit memory-policy syscalls under Docker's
+standard seccomp profile. Explicit `CapDrop` settings remain authoritative;
+if these or a custom security profile block policy setup, the launcher reports
+degraded locality and runs the original app. It does not relax custom CPU/memory
+limits. Strict guest cpusets work independently of memory-policy syscalls and
+do not need this launcher or added capability.
+
+Host-process runners inherit the scoped thread policy at process creation.
+Docker guests receive their policy inside the guest because the Docker daemon's
+children do not inherit Wolf's calling-thread policy.
+
+== Compositors and streaming workers
+
+Wolf applies the selected mode to compositor creation, video producers, encoders,
+and GStreamer's reusable task threads, restoring prior settings when a worker
+leaves a pipeline. Shared lobby apps retain their original GPU. A viewer's video
+pipeline follows the current encoder GPU across lobby transitions. In manual
+split render/encode configurations, each part follows its respective GPU.
+Audio workers receive their GPU's policy at startup; an existing audio pipeline
+retains its startup locality when its producer is switched later.
+
+Docker's default seccomp profile can block `get_mempolicy` and `set_mempolicy` in
+Wolf itself. `SYS_NICE` on the Wolf service permits these calls with Docker's
+default profile. Without permission, Wolf reports memory-policy setup failures
+explicitly; it can still seed CPU execution in loose mode or pin CPUs in strict
+mode. Guest cgroup restrictions are independent of this host-thread limitation.
+Existing shared pages, file caches, global driver workers, VRAM, and allocations
+made before placement are not moved by this policy.
+
+== Discovery and diagnostics
+
+A nonnegative PCI `numa_node` is authoritative. Wolf checks ancestors when the
+endpoint is unknown and can safely fall back to the only memory node on a
+single-node system. Unknown locality on a multi-node system produces a diagnostic
+and leaves placement unchanged rather than guessing node zero. Known locality
+excluded by operator constraints rejects strict placement; loose mode reports
+the conflict and continues within the available resources.
+
+`[NUMA]` logs identify mode, device, local node, eligible resource masks, and policy
+failures. Inspect `HostConfig.CpusetCpus`, `HostConfig.CpusetMems`, and
+`/proc/self/status` inside an app to check its eligible resources. For the memory
+policy and actual anonymous allocations, inspect `/proc/<pid>/numa_maps`:
+loose mappings show `prefer=static:N`, strict mappings show `bind=static:N`.
+Shared/file-backed mappings can reflect allocations made by another process.
+
+The development dual-Xeon host's W6600 pair currently resolves to node 0
+(`0-13,28-41`), and its Quadro RTX 4000 pair to node 1 (`14-27,42-55`). Loose mode
+keeps all permitted CPUs and both memory nodes eligible; strict mode confines
+each app to its GPU's node. This is a validation example, not a configured rule.
+
+References: https://www.kernel.org/doc/html/latest/admin-guide/cgroup-v2.html[Linux cpusets],
+https://www.kernel.org/doc/html/latest/admin-guide/mm/numa_memory_policy.html[NUMA memory policies],
+https://docs.docker.com/engine/security/seccomp/[Docker seccomp], and
+https://gstreamer.freedesktop.org/documentation/application-development/advanced/threads.html[GStreamer task threads].

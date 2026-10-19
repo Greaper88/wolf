@@ -6,6 +6,7 @@
 #include <docker/formatters.hpp>
 #include <events/events.hpp>
 #include <fmt/core.h>
+#include <gpu/numa.hpp>
 #include <helpers/logger.hpp>
 #include <helpers/utils.hpp>
 #include <platforms/hw.hpp>
@@ -21,6 +22,14 @@ using namespace utils;
 using namespace wolf::core;
 
 boost::json::object with_hotplug_capabilities(boost::json::object options);
+
+// Intersect app restrictions with the selected GPU's locality before Docker creates the guest.
+boost::json::object with_numa_placement(boost::json::object options,
+                                        const wolf::numa::Placement &placement,
+                                        wolf::numa::Mode mode = wolf::numa::read_mode());
+boost::json::object with_numa_bootstrap(boost::json::object options,
+                                        const boost::json::object &image_config,
+                                        const wolf::numa::Placement &placement);
 
 std::vector<std::string>
 hotplug_command(const std::map<std::string, std::string> &udev_event, const std::string &encoded_event, bool remove);

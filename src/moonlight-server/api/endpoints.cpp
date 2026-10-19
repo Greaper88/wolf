@@ -564,6 +564,13 @@ void UnixSocketServer::endpoint_LobbyCreate(const wolf::api::HTTPRequest &req, s
       event->video_settings.runner_render_node = held.launch->device.render_node;
       event->video_settings.video_producer_buffer_caps = target->producer_caps;
     }
+    try {
+      state::validate_gpu_locality(event->video_settings.runner_render_node);
+      state::validate_gpu_locality(event->video_settings.wayland_render_node);
+    } catch (const std::exception &error) {
+      send_http(socket, 503, rfl::json::write(GenericErrorResponse{.error = error.what()}));
+      return;
+    }
     auto create_lobby_ev = events::CreateLobbyEvent{
         .gpu_target = target,
         .id = lobby_id,
@@ -599,6 +606,8 @@ void UnixSocketServer::endpoint_LobbyCreate(const wolf::api::HTTPRequest &req, s
     if (result == std::future_status::timeout) {
       logs::log(logs::warning, "[API] Lobby setup timed out");
       send_http(socket, 500, rfl::json::write(GenericErrorResponse{.error = "Lobby setup timed out"}));
+    } else if (!setup_over_future.get()) {
+      send_http(socket, 503, rfl::json::write(GenericErrorResponse{.error = "Lobby setup failed; check Wolf's logs"}));
     } else {
       auto res = LobbyCreateResponse{.lobby_id = lobby_id};
       send_http(socket, 200, rfl::json::write(res));

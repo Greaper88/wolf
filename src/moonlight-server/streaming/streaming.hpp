@@ -4,6 +4,7 @@
 #include <core/virtual-display.hpp>
 #include <events/events.hpp>
 #include <fmt/format.h>
+#include <gpu/numa.hpp>
 #include <gst-plugin/gstrtpmoonlightpay_audio.hpp>
 #include <gst-plugin/gstrtpmoonlightpay_video.hpp>
 #include <gst-plugin/video.hpp>
@@ -18,6 +19,38 @@ namespace streaming {
 
 using namespace wolf::core;
 using boost::asio::ip::udp;
+
+// Applies placement to construction allocations and threads spawned by a GPU worker.
+// Resolution conflicts fail startup; unavailable topology keeps the existing policy.
+class GpuLocality {
+  wolf::numa::Mode mode_;
+  std::optional<wolf::numa::Placement> placement_;
+  wolf::numa::ThreadScope thread_;
+
+public:
+  GpuLocality(std::string_view render_node, std::string_view worker);
+  const std::optional<wolf::numa::Placement> &placement() const {
+    return placement_;
+  }
+  wolf::numa::Mode mode() const {
+    return mode_;
+  }
+};
+
+// GStreamer can reuse task-pool threads created by an unrelated GPU pipeline.
+// Keep this alive until the pipeline reaches NULL so each task restores its policy on LEAVE.
+class PipelineNumaPolicy {
+  struct State;
+  std::unique_ptr<State> state_;
+
+public:
+  PipelineNumaPolicy(GstBus *bus,
+                     const std::optional<wolf::numa::Placement> &placement,
+                     wolf::numa::Mode mode = wolf::numa::read_mode());
+  ~PipelineNumaPolicy();
+  PipelineNumaPolicy(const PipelineNumaPolicy &) = delete;
+  PipelineNumaPolicy &operator=(const PipelineNumaPolicy &) = delete;
+};
 
 struct WaylandDisplayReady {
   /**
@@ -65,7 +98,8 @@ void start_audio_producer(const std::string &session_id,
                           const std::shared_ptr<events::EventBusType> &event_bus,
                           int channel_count,
                           const std::string &sink_name,
-                          const std::string &server_name);
+                          const std::string &server_name,
+                          std::string_view render_node = {});
 
 void start_streaming_video(immer::box<events::VideoSession> video_session,
                            const std::shared_ptr<events::EventBusType> &event_bus,
@@ -80,7 +114,8 @@ void start_streaming_audio(immer::box<events::AudioSession> audio_session,
                            unsigned short client_port,
                            std::shared_ptr<udp::socket> audio_socket,
                            const std::string &sink_name,
-                           const std::string &server_name);
+                           const std::string &server_name,
+                           std::string_view render_node = {});
 
 static bool run_pipeline(
     const std::string &pipeline_desc,

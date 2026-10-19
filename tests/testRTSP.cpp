@@ -268,6 +268,44 @@ state::SessionsAtoms test_init_state() {
       immer::vector<events::StreamSession>{session});
 }
 
+#ifdef __linux__
+TEST_CASE("RTSP encoder locality follows manual split nodes and retained automatic GPUs", "[RTSP][numa]") {
+  struct EncoderEnvironment {
+    std::optional<std::string> original;
+    EncoderEnvironment() {
+      if (const auto value = std::getenv("WOLF_ENCODER_NODE"))
+        original = value;
+    }
+    ~EncoderEnvironment() {
+      if (original)
+        setenv("WOLF_ENCODER_NODE", original->c_str(), 1);
+      else
+        unsetenv("WOLF_ENCODER_NODE");
+    }
+  } environment;
+  auto sessions = test_init_state();
+  auto session = sessions->load()->front();
+  session.app->render_node = "/dev/dri/renderD130";
+  std::string selected;
+  auto observer = session.event_bus->register_handler<immer::box<events::VideoSession>>(
+      [&](const immer::box<events::VideoSession> &video) { selected = video->render_node; });
+  const RTSP_PACKET request{.seq_number = 1,
+                            .payloads = {{"a", "x-nv-video[0].clientViewportWd:1920"},
+                                         {"a", "x-nv-video[0].clientViewportHt:1080"},
+                                         {"a", "x-nv-video[0].maxFPS:60"}}};
+  unsetenv("WOLF_ENCODER_NODE");
+  REQUIRE(rtsp::commands::announce(request, session).response.status_code == 200);
+  REQUIRE(selected == "/dev/dri/renderD130");
+  setenv("WOLF_ENCODER_NODE", "/dev/dri/renderD128", 1);
+  REQUIRE(rtsp::commands::announce(request, session).response.status_code == 200);
+  REQUIRE(selected == "/dev/dri/renderD128");
+  session.gpu_launch = std::make_shared<const wolf::gpu::Runtime::Launch>();
+  REQUIRE(rtsp::commands::announce(request, session).response.status_code == 200);
+  REQUIRE(selected == "/dev/dri/renderD130");
+  observer.unregister();
+}
+#endif
+
 TEST_CASE("Commands (Payload matching)", "[RTSP]") {
   constexpr int port = 8080;
   boost::asio::io_context ioc;

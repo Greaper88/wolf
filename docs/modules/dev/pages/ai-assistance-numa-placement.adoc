@@ -1,0 +1,71 @@
+= GPU-local session resource placement
+
+AI-Agent: ChatGPT Codex +
+AI-Model-Version: GPT-6 family; exact serving version and reasoning setting unavailable +
+AI-Inference-Date: 2026-10-19
+
+== Scope
+
+The maintainer requested GPU-local CPU and RAM placement based on the multi-GPU
+development branch, with selectable loose and strict policies. This change starts
+from `dev-gpu-selection` commit `257ae696a6dd602ef42f3daafe10f3db3c00534d`.
+Existing worktrees and their uncommitted changes remain separate.
+
+`WOLF_NUMA_MODE=loose` defaults to initial local CPU execution with full permitted
+CPU eligibility restored immediately, plus `MPOL_PREFERRED` for RAM fallback.
+`strict` retains a local CPU mask and binds new RAM allocations to that node.
+`WOLF_NUMA_AWARE=false` disables placement. Neither mode changes GPU admission,
+reserves exclusive CPU cores, or overrides explicit operator resource limits.
+
+DRM/PCI discovery resolves locality at the existing selected render-node boundaries.
+Docker guests receive mode-appropriate resource cpusets. A static, read-only
+launcher applies loose guest policy before executing the original image/app
+command. It preserves Docker's effective entrypoint/command merge and explicit
+capability drops. Host workers use scoped allocation policy and affinity;
+GStreamer task ENTER/LEAVE callbacks cover reusable streaming threads.
+
+Session/lobby render workers, routed and shared encoders, host-process runners,
+and audio startup receive the policy. Manual split encoders honor
+`WOLF_ENCODER_NODE`. Existing audio pipelines retain startup locality across
+later producer switches. Existing/shared allocations and global driver threads
+are outside the scoped allocation policy.
+
+== Validation
+
+Dependency-free tests cover sparse topology, CPU/memory restrictions, unknown
+nodes, ancestor and single-memory-node fallback, large resource IDs, both modes,
+process inheritance, exact restoration, and construction rollback. Catch2
+regressions cover Docker masks/commands, reusable GStreamer workers, real streaming
+tasks, failure propagation, and manual versus automatic encoder node selection.
+The static guest launcher's Python tests cover policies, CPU eligibility, literal
+arguments, PID, environment, working directory, signals, and exit status.
+
+Disposable tests on the dual-Xeon development host resolved both W6600 GPUs to
+node 0 and both Quadro RTX 4000 GPUs to node 1. Loose scopes kept all 56 CPUs
+eligible and preferred the selected node; strict scopes used its local CPU list.
+Fresh 32 MiB anonymous mappings placed all 8192 pages on the expected node.
+The production static launcher also passed as a non-root guest with `SYS_NICE`.
+Docker's default seccomp denied explicit memory-policy syscalls without that
+capability; diagnostics reported the reduced enforcement instead of claiming
+success. Strict Docker CPU/memory cpusets worked independently.
+
+Local evidence is retained in the sibling `wolf-numa-validation` directory.
+CMake/Ninja built `wolf`, `wolftests`, the GPU tests, and the static launcher.
+All 72 nonhardware CTest cases passed in separate processes: 71 with networking
+disabled and the existing icon-download API test with networking enabled. One
+explicit VA hardware test was excluded. The NUMA Catch2 subset separately passed
+125 assertions in eight cases with `SYS_NICE`; the standalone helper passed 76
+Linux checks and 17 simulated non-Linux checks. All seven launcher tests passed
+with `SYS_NICE`, including under a non-root guest user; default seccomp explicitly
+skipped three memory-policy-dependent checks.
+
+The initial aggregate Catch2 invocation encountered an API startup/socket race
+between existing detached test servers. Both affected API cases passed in
+isolation, and the complete per-case CTest run avoided the shared-socket race.
+No live service was restarted or deployed during implementation.
+
+== Tools
+
+Codex terminal execution and patching, parallel implementation/review agents,
+Git, ripgrep, primary Linux/Docker/GStreamer documentation, Docker Engine,
+the cached CMake/Ninja/GCC build environment, Catch2, Python 3, and clang-format 18.

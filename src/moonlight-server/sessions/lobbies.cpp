@@ -123,15 +123,25 @@ setup_lobbies_handlers(const immer::box<state::AppState> &app_state,
                        ev_bus,
                        on_ready,
                        gst_context = lobby->gpu_target ? lobby->gpu_target->context : app_state->gst_context]() {
-            streaming::start_video_producer(lobby->id,
-                                            lobby_settings->video_settings.video_producer_buffer_caps,
-                                            lobby_settings->video_settings.wayland_render_node,
-                                            {.width = lobby_settings->video_settings.width,
-                                             .height = lobby_settings->video_settings.height,
-                                             .refreshRate = lobby_settings->video_settings.refresh_rate},
-                                            gst_context,
-                                            on_ready,
-                                            ev_bus);
+            try {
+              streaming::start_video_producer(lobby->id,
+                                              lobby_settings->video_settings.video_producer_buffer_caps,
+                                              lobby_settings->video_settings.wayland_render_node,
+                                              {.width = lobby_settings->video_settings.width,
+                                               .height = lobby_settings->video_settings.height,
+                                               .refreshRate = lobby_settings->video_settings.refresh_rate},
+                                              gst_context,
+                                              on_ready,
+                                              ev_bus);
+            } catch (const std::exception &error) {
+              logs::log(logs::error, "[NUMA] Lobby video producer startup failed: {}", error.what());
+              try {
+                lobby_settings->on_setup_over.get()->set_value(false);
+              } catch (const std::future_error &) {
+                // The producer can fail after setup has already completed.
+              }
+              ev_bus->fire_event(immer::box<events::StopLobbyEvent>{events::StopLobbyEvent{.lobby_id = lobby->id}});
+            }
           }).detach();
 
           auto w_display_ready = on_ready->get_future().then(
@@ -140,6 +150,17 @@ setup_lobbies_handlers(const immer::box<state::AppState> &app_state,
                 if (lobby->gpu_target && !lobby->gpu_target->launch->reservation->valid())
                   return;
 
+                std::unique_ptr<streaming::GpuLocality> locality;
+                try {
+                  locality = std::make_unique<streaming::GpuLocality>(
+                      lobby_settings->video_settings.wayland_render_node,
+                      "lobby compositor");
+                } catch (const std::exception &error) {
+                  logs::log(logs::error, "[NUMA] Lobby compositor startup failed: {}", error.what());
+                  lobby_settings->on_setup_over.get()->set_value(false);
+                  ev_bus->fire_event(immer::box<events::StopLobbyEvent>{events::StopLobbyEvent{.lobby_id = lobby->id}});
+                  return;
+                }
                 auto wl_state =
                     virtual_display::create_wayland_display(ready.wayland_plugin, ready.wayland_socket_name);
                 // Set the wayland display
@@ -212,13 +233,18 @@ setup_lobbies_handlers(const immer::box<state::AppState> &app_state,
             lobby->audio_sink->store(v_device);
 
             // Start Gstreamer producer pipeline
-            std::thread([lobby, audio_server = audio_server->server, ev_bus, channel_count]() {
-              auto sink_name = fmt::format("{}{}.monitor", VIRTUAL_SINK_PREFIX, lobby->id);
-              streaming::start_audio_producer(lobby->id,
-                                              ev_bus,
-                                              channel_count,
-                                              sink_name,
-                                              audio::get_server_name(audio_server));
+            std::thread([lobby, lobby_settings, audio_server = audio_server->server, ev_bus, channel_count]() {
+              try {
+                auto sink_name = fmt::format("{}{}.monitor", VIRTUAL_SINK_PREFIX, lobby->id);
+                streaming::start_audio_producer(lobby->id,
+                                                ev_bus,
+                                                channel_count,
+                                                sink_name,
+                                                audio::get_server_name(audio_server),
+                                                lobby_settings->video_settings.wayland_render_node);
+              } catch (const std::exception &error) {
+                logs::log(logs::error, "[NUMA] Lobby audio producer startup failed: {}", error.what());
+              }
             }).detach();
           }
         }
