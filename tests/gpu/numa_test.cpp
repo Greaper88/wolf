@@ -87,8 +87,8 @@ struct Fixture {
     std::error_code ignored;
     fs::remove_all(root, ignored);
   }
-  Resolution get() const {
-    return resolve(render.string(), paths);
+  Resolution get(Mode mode = Mode::on) const {
+    return resolve(render.string(), paths, mode);
   }
 };
 
@@ -99,9 +99,9 @@ void discovery_tests() {
   check(local.placement->cpus == std::vector<unsigned>({1, 2, 33}), "process cpuset limits local CPUs and SMT IDs");
   check(local.placement->memory_nodes == std::vector<unsigned>({2}), "RAM constrained to GPU-local node");
   check(local.placement->allowed_cpus == std::vector<unsigned>({1, 2, 33, 36, 37}),
-        "loose guest allowance retains remote CPUs within the leader's restrictions");
+        "guest allowance preserves the leader's full CPU restrictions");
   check(local.placement->allowed_memory_nodes == std::vector<unsigned>({2, 8}),
-        "loose guest allowance retains remote RAM within the leader's restrictions");
+        "guest allowance retains remote RAM within the leader's restrictions");
   write(f.device / "numa_node", "8\n");
   local = f.get();
   check(local.placement && local.placement->cpus == std::vector<unsigned>({36, 37}), "second GPU maps independently");
@@ -134,13 +134,14 @@ void discovery_tests() {
   check(f.get().conflict, "missing process memory allowance is not silently ignored");
   write(f.paths.status, "Cpus_allowed_list:\tbogus\nMems_allowed_list:\t8\n");
   check(f.get().conflict, "malformed process allowance is reported");
-  auto missing = resolve("/dev/dri/renderD900", f.paths);
+  auto missing = resolve("/dev/dri/renderD900", f.paths, Mode::on);
   check(!missing.placement && !missing.conflict, "missing GPU topology stays unavailable");
-  check(!resolve("/dev/nvidia0", f.paths).placement, "arbitrary device path is not interpreted as a DRM node");
+  check(!resolve("/dev/nvidia0", f.paths, Mode::on).placement,
+        "arbitrary device path is not interpreted as a DRM node");
   fs::create_directories(f.root / "dev/dri/by-path");
   fs::create_symlink(f.render, f.root / "dev/dri/by-path/pci-0000:81:00.0-render");
   write(f.paths.status, "Cpus_allowed_list:\t0-39\nMems_allowed_list:\t8\n");
-  check(resolve((f.root / "dev/dri/by-path/pci-0000:81:00.0-render").string(), f.paths).placement.has_value(),
+  check(resolve((f.root / "dev/dri/by-path/pci-0000:81:00.0-render").string(), f.paths, Mode::on).placement.has_value(),
         "stable by-path GPU links resolve to the canonical render node");
   write(f.paths.nodes / "has_memory", "63,127\n");
   write(f.paths.status, "Cpus_allowed_list:\t1023-1025,4095,8191\nMems_allowed_list:\t63,127\n");
@@ -156,6 +157,46 @@ void discovery_tests() {
   }
 }
 
+void automatic_tests() {
+  Fixture f;
+  auto result = f.get(Mode::automatic);
+  check(result.placement && result.placement->node == 2, "auto enables usable GPU locality on a multi-node host");
+  write(f.paths.status, "Cpus_allowed_list:\t0-39\nMems_allowed_list:\t2\n");
+  result = f.get(Mode::automatic);
+  check(result.placement.has_value(), "auto counts physical memory nodes rather than only permitted memory nodes");
+  write(f.paths.status, "Cpus_allowed_list:\t4-7\nMems_allowed_list:\t2,8\n");
+  result = f.get(Mode::automatic);
+  check(!result.placement && !result.conflict && !result.reason.empty(),
+        "auto falls back normally when local CPU resources are excluded");
+  check(f.get(Mode::on).conflict, "explicit on retains known CPU conflicts");
+  write(f.paths.status, "Cpus_allowed_list:\t0-39\nMems_allowed_list:\t8\n");
+  result = f.get(Mode::automatic);
+  check(!result.placement && !result.conflict, "auto falls back normally when local RAM is excluded");
+  check(f.get(Mode::on).conflict, "explicit on retains known memory conflicts");
+  write(f.paths.status, "Cpus_allowed_list:\t0-39\nMems_allowed_list:\t2,8\n");
+  write(f.paths.nodes / "has_memory", "2\n");
+  result = f.get(Mode::automatic);
+  check(!result.placement && !result.conflict && result.reason.find("one memory node") != std::string::npos,
+        "auto leaves a single memory node host unchanged");
+  check(f.get(Mode::on).placement.has_value(), "explicit on can apply placement on a single-node host");
+  fs::remove(f.paths.nodes / "has_memory");
+  write(f.paths.nodes / "node2/meminfo", "Node 2 MemTotal: 65536 kB\n");
+  write(f.paths.nodes / "node8/meminfo", "Node 8 MemTotal: 0 kB\n");
+  check(!f.get(Mode::automatic).placement, "auto ignores CPU-only nodes when detecting non-uniform memory");
+  write(f.paths.nodes / "node8/meminfo", "Node 8 MemTotal: 65536 kB\n");
+  check(f.get(Mode::automatic).placement.has_value(), "auto detects memory nodes through meminfo fallback");
+  write(f.device / "numa_node", "-1\n");
+  result = f.get(Mode::automatic);
+  check(!result.placement && !result.conflict && !result.reason.empty(), "auto does not guess an unknown GPU node");
+  write(f.paths.nodes / "has_memory", "broken topology\n");
+  result = f.get(Mode::automatic);
+  check(!result.placement && !result.conflict && !result.reason.empty(), "auto safely skips invalid topology");
+  check(f.get(Mode::on).conflict, "explicit on reports invalid topology");
+  result = resolve("invalid GPU", {f.root / "missing", f.root / "missing", f.root / "missing"}, Mode::off);
+  check(!result.placement && !result.conflict && result.reason == "NUMA placement is disabled",
+        "off bypasses topology discovery entirely");
+}
+
 void scope_tests() {
   auto cpus = parse_list(status_field("/proc/thread-self/status", "Cpus_allowed_list"));
   auto memory = parse_list(status_field("/proc/thread-self/status", "Mems_allowed_list"));
@@ -168,7 +209,7 @@ void scope_tests() {
   const bool readable = syscall(SYS_get_mempolicy, &before_mode, before_mask.data(), bits, nullptr, 0UL) == 0;
 #endif
   {
-    ThreadScope scope(chosen, Mode::strict);
+    ThreadScope scope(chosen);
     check(scope.cpu_applied() && scope.cpu_error().empty(), "current thread affinity applied");
     check(parse_list(status_field("/proc/thread-self/status", "Cpus_allowed_list")) == chosen.cpus,
           "scoped thread stays on selected local CPU");
@@ -178,14 +219,14 @@ void scope_tests() {
       std::vector<unsigned long> bound_mask(before_mask.size(), 0);
       int bound_mode = -1;
       check(syscall(SYS_get_mempolicy, &bound_mode, bound_mask.data(), bits, nullptr, 0UL) == 0 &&
-                (bound_mode & ~MPOL_MODE_FLAGS) == MPOL_BIND,
-            "scoped allocation policy binds RAM rather than merely preferring it");
+                (bound_mode & ~MPOL_MODE_FLAGS) == MPOL_PREFERRED,
+            "scoped allocation policy prefers local RAM with remote fallback");
       std::vector<unsigned long> expected(bound_mask.size(), 0);
       auto word_bits = sizeof(unsigned long) * CHAR_BIT;
       expected[memory.front() / word_bits] = 1UL << (memory.front() % word_bits);
       check(bound_mask == expected, "scoped RAM policy selects only the intended memory node");
       {
-        ThreadScope nested(chosen, Mode::strict);
+        ThreadScope nested(chosen);
         check(nested.cpu_applied() && nested.memory_applied(), "nested explicit scope can save a non-default policy");
       }
       int nested_mode = -1;
@@ -193,24 +234,32 @@ void scope_tests() {
       check(syscall(SYS_get_mempolicy, &nested_mode, nested_mask.data(), bits, nullptr, 0UL) == 0 &&
                 nested_mode == bound_mode && nested_mask == bound_mask,
             "nested scope restores previous non-default memory policy");
+      auto child = std::async(std::launch::async, [&] {
+        int mode = -1;
+        std::vector<unsigned long> mask(before_mask.size(), 0);
+        const auto result = syscall(SYS_get_mempolicy, &mode, mask.data(), bits, nullptr, 0UL);
+        return result == 0 && mode == bound_mode && mask == bound_mask &&
+               parse_list(status_field("/proc/thread-self/status", "Cpus_allowed_list")) == chosen.cpus;
+      });
+      check(child.get(), "child inherits local CPU affinity and preferred RAM policy");
     }
 #endif
     if (!scope.memory_applied())
       std::cout << "Memory policy unavailable in this environment: " << scope.memory_error() << '\n';
     {
-      ThreadScope nested(std::optional<Placement>{}, Mode::strict);
+      ThreadScope nested(std::optional<Placement>{});
       check(!nested.cpu_applied() && !nested.memory_applied(), "unknown placement scope leaves policy unchanged");
     }
     Placement excluded = chosen;
     excluded.cpus = {cpus.back()};
     if (cpus.back() != cpus.front()) {
       {
-        ThreadScope nested(excluded, Mode::strict, true);
+        ThreadScope nested(excluded, true);
         check(!nested.cpu_applied() && !nested.cpu_error().empty(), "explicit nested CPU restriction is respected");
         check(!nested.memory_applied(), "CPU placement failure does not silently change RAM placement");
       }
       {
-        ThreadScope moved(excluded, Mode::strict);
+        ThreadScope moved(excluded);
         check(moved.cpu_applied(), "reused worker can expand its inherited affinity to another resolved GPU");
         check(parse_list(status_field("/proc/thread-self/status", "Cpus_allowed_list")) == excluded.cpus,
               "reused worker runs on new GPU's selected CPUs");
@@ -235,7 +284,7 @@ void scope_tests() {
   try {
     auto invalid = chosen;
     invalid.memory_nodes = {std::numeric_limits<unsigned>::max()};
-    ThreadScope scope(invalid, Mode::strict);
+    ThreadScope scope(invalid);
   } catch (const std::invalid_argument &) {
     failed = true;
   }
@@ -249,100 +298,32 @@ void scope_tests() {
         "CPU affinity restored even if memory setup cannot finish");
 }
 
-void loose_scope_tests() {
-  const auto cpus = parse_list(status_field("/proc/thread-self/status", "Cpus_allowed_list"));
-  const auto memory = parse_list(status_field("/proc/thread-self/status", "Mems_allowed_list"));
-  const Placement chosen{static_cast<int>(memory.front()), {cpus.front()}, {memory.front()}};
-#if defined(SYS_get_mempolicy)
-  constexpr unsigned bits = 32768;
-  std::vector<unsigned long> before_mask(bits / (sizeof(unsigned long) * CHAR_BIT), 0);
-  int before_mode = 0;
-  const bool readable = syscall(SYS_get_mempolicy, &before_mode, before_mask.data(), bits, nullptr, 0UL) == 0;
-#endif
-  {
-    ThreadScope scope(chosen, Mode::loose);
-    check(scope.cpu_applied() && scope.cpu_error().empty(), "loose CPU seed and eligibility restoration succeed");
-    check(parse_list(status_field("/proc/thread-self/status", "Cpus_allowed_list")) == cpus,
-          "loose mode keeps every original CPU eligible while active");
-    check(scope.memory_applied() == scope.memory_error().empty(), "loose RAM preference reports syscall result");
-#if defined(SYS_get_mempolicy)
-    if (scope.memory_applied()) {
-      std::vector<unsigned long> preferred_mask(before_mask.size(), 0);
-      int preferred_mode = -1;
-      check(syscall(SYS_get_mempolicy, &preferred_mode, preferred_mask.data(), bits, nullptr, 0UL) == 0 &&
-                (preferred_mode & ~MPOL_MODE_FLAGS) == MPOL_PREFERRED,
-            "loose RAM policy prefers local memory with remote fallback");
-      std::vector<unsigned long> expected(before_mask.size(), 0);
-      const auto word_bits = sizeof(unsigned long) * CHAR_BIT;
-      expected[memory.front() / word_bits] = 1UL << (memory.front() % word_bits);
-      check(preferred_mask == expected, "loose RAM preference selects the intended GPU node");
-      auto child = std::async(std::launch::async, [&] {
-        int mode = -1;
-        std::vector<unsigned long> mask(before_mask.size(), 0);
-        const auto result = syscall(SYS_get_mempolicy, &mode, mask.data(), bits, nullptr, 0UL);
-        return result == 0 && mode == preferred_mode && mask == preferred_mask &&
-               parse_list(status_field("/proc/thread-self/status", "Cpus_allowed_list")) == cpus;
-      });
-      check(child.get(), "loose child inherits RAM preference and full CPU eligibility");
-    }
-#endif
-  }
-  check(parse_list(status_field("/proc/thread-self/status", "Cpus_allowed_list")) == cpus,
-        "loose scope leaves original CPU eligibility unchanged");
-#if defined(SYS_get_mempolicy)
-  if (readable) {
-    std::vector<unsigned long> after_mask(before_mask.size(), 0);
-    int after_mode = -1;
-    check(syscall(SYS_get_mempolicy, &after_mode, after_mask.data(), bits, nullptr, 0UL) == 0 &&
-              after_mode == before_mode && after_mask == before_mask,
-          "loose scope restores original memory policy");
-  }
-#endif
-}
-
 void environment_tests() {
-  auto original = std::getenv("WOLF_NUMA_AWARE");
-  std::optional<std::string> saved = original ? std::optional<std::string>(original) : std::nullopt;
-  unsetenv("WOLF_NUMA_AWARE");
-  check(enabled(), "NUMA placement defaults on");
-  setenv("WOLF_NUMA_AWARE", "false", 1);
-  check(!enabled(), "placement can be disabled");
-  setenv("WOLF_NUMA_AWARE", "TRUE", 1);
-  check(enabled(), "placement can be enabled");
-  setenv("WOLF_NUMA_AWARE", "maybe", 1);
-  bool invalid = false;
-  try {
-    enabled();
-  } catch (const std::invalid_argument &) {
-    invalid = true;
-  }
-  check(invalid, "invalid placement switch is rejected");
-  if (saved)
-    setenv("WOLF_NUMA_AWARE", saved->c_str(), 1);
-  else
-    unsetenv("WOLF_NUMA_AWARE");
-  auto mode_original = std::getenv("WOLF_NUMA_MODE");
-  const auto mode_saved = mode_original ? std::optional<std::string>(mode_original) : std::nullopt;
+  const auto original = std::getenv("WOLF_NUMA_MODE");
+  const auto saved = original ? std::optional<std::string>(original) : std::nullopt;
   unsetenv("WOLF_NUMA_MODE");
-  check(read_mode() == Mode::loose, "NUMA mode defaults loose");
-  setenv("WOLF_NUMA_MODE", "StRiCt", 1);
-  check(read_mode() == Mode::strict, "strict mode is parsed case-insensitively");
-  setenv("WOLF_NUMA_MODE", "LOOSE", 1);
-  check(read_mode() == Mode::loose, "loose mode is parsed case-insensitively");
-  check(std::string(mode_name(Mode::loose)) == "loose" && std::string(mode_name(Mode::strict)) == "strict",
+  check(read_mode() == Mode::automatic && enabled(), "NUMA mode defaults to automatic detection");
+  for (const auto &entry :
+       {std::pair{"AuTo", Mode::automatic}, std::pair{"ON", Mode::on}, std::pair{"oFf", Mode::off}}) {
+    setenv("WOLF_NUMA_MODE", entry.first, 1);
+    check(read_mode() == entry.second, "NUMA modes are parsed case-insensitively");
+    check(enabled() == (entry.second != Mode::off), "only off disables placement before topology discovery");
+  }
+  check(std::string(mode_name(Mode::automatic)) == "auto" && std::string(mode_name(Mode::on)) == "on" &&
+            std::string(mode_name(Mode::off)) == "off",
         "mode names match configuration values");
-  for (const auto *value : {"", "true", "preferred", "maybe"}) {
+  for (const auto *value : {"", "true", "preferred", "maybe", "loose", "strict"}) {
     setenv("WOLF_NUMA_MODE", value, 1);
-    bool invalid_mode = false;
+    bool invalid = false;
     try {
       read_mode();
     } catch (const std::invalid_argument &) {
-      invalid_mode = true;
+      invalid = true;
     }
-    check(invalid_mode, "unrecognized mode values are rejected");
+    check(invalid, "unrecognized mode values are rejected");
   }
-  if (mode_saved)
-    setenv("WOLF_NUMA_MODE", mode_saved->c_str(), 1);
+  if (saved)
+    setenv("WOLF_NUMA_MODE", saved->c_str(), 1);
   else
     unsetenv("WOLF_NUMA_MODE");
 }
@@ -354,8 +335,8 @@ int main() {
     list_tests();
 #ifdef __linux__
     discovery_tests();
+    automatic_tests();
     scope_tests();
-    loose_scope_tests();
     environment_tests();
 #else
     check(!resolve("/dev/dri/renderD128").placement, "unsupported platforms preserve no-op placement");

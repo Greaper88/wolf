@@ -50,52 +50,72 @@ class GuestNumaBootstrap(unittest.TestCase):
         cls.allowed_cpus = sorted(os.sched_getaffinity(0))
         memory = next(line.split(":", 1)[1].strip() for line in Path("/proc/self/status").read_text().splitlines()
                       if line.startswith("Mems_allowed_list:"))
-        cls.node = parse_list(memory)[0]
-        local_path = Path(f"/sys/devices/system/node/node{cls.node}/cpulist")
-        local = parse_list(local_path.read_text()) if local_path.exists() else cls.allowed_cpus
-        cls.local_cpus = sorted(set(local) & set(cls.allowed_cpus))
-        if not cls.local_cpus:
+        for node in parse_list(memory):
+            local_path = Path(f"/sys/devices/system/node/node{node}/cpulist")
+            local = parse_list(local_path.read_text()) if local_path.exists() else cls.allowed_cpus
+            cls.local_cpus = sorted(set(local) & set(cls.allowed_cpus))
+            if cls.local_cpus:
+                cls.node = node
+                break
+        else:
             raise unittest.SkipTest("No allowed CPUs on an allowed memory node")
 
-    def command(self, mode, *args):
-        return [BOOTSTRAP, mode, str(self.node), str(self.local_cpus[0]), "--", *args]
+    def command(self, *args):
+        return [BOOTSTRAP, str(self.node), str(self.local_cpus[0]), "--", *args]
 
-    def probe(self, mode):
-        result = subprocess.run(self.command(mode, sys.executable, "-c", PROBE),
+    def probe(self):
+        result = subprocess.run(self.command(sys.executable, "-c", PROBE),
                                 text=True, capture_output=True)
-        if mode == "strict" and result.returncode == 125 and "failed:" in result.stderr:
-            self.skipTest("Strict memory policy syscall is unavailable in this test environment")
         self.assertEqual(result.returncode, 0, result.stderr)
         return json.loads(result.stdout), result.stderr
 
-    def test_loose_keeps_all_original_cpus_eligible(self):
-        result, diagnostic = self.probe("loose")
-        self.assertEqual(result["cpus"], self.allowed_cpus)
-        self.assertIn("loose mode", diagnostic)
-
-    def test_strict_limits_cpus_to_local_selection(self):
-        result, diagnostic = self.probe("strict")
+    def test_limits_cpus_to_local_selection(self):
+        result, diagnostic = self.probe()
         self.assertEqual(result["cpus"], self.local_cpus[:1])
-        self.assertIn("strict mode", diagnostic)
+        self.assertIn("CPUs bound locally", diagnostic)
 
-    def test_loose_preferred_memory_policy_survives_exec(self):
-        result, diagnostic = self.probe("loose")
+    def test_preferred_memory_policy_survives_exec(self):
+        result, diagnostic = self.probe()
         if "set_mempolicy failed" in diagnostic:
             self.skipTest("Memory policy syscall is unavailable in this test environment")
         self.assertTrue(result["policy"].startswith("prefer"), result)
         self.assertEqual(result["policy"].split(":")[-1], str(self.node))
 
-    def test_strict_memory_policy_survives_exec(self):
-        result, diagnostic = self.probe("strict")
-        if "set_mempolicy failed" in diagnostic:
+    def test_unavailable_memory_preference_keeps_local_cpus_and_executes(self):
+        # A valid launcher argument outside Linux's possible NUMA nodes forces
+        # memory-policy failure independently of the Docker seccomp profile.
+        result = subprocess.run([BOOTSTRAP, "1048575", str(self.local_cpus[0]), "--",
+                                 sys.executable, "-c", PROBE], text=True, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["cpus"], self.local_cpus[:1])
+        self.assertIn("set_mempolicy failed", result.stderr)
+        self.assertIn("preference unavailable", result.stderr)
+
+    def test_descendants_inherit_cpu_and_memory_policy(self):
+        source = "import subprocess, sys; subprocess.run([sys.executable, '-c', sys.argv[1]], check=True)"
+        result = subprocess.run(self.command(sys.executable, "-c", source, PROBE),
+                                text=True, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        descendant = json.loads(result.stdout)
+        self.assertEqual(descendant["cpus"], self.local_cpus[:1])
+        if "set_mempolicy failed" in result.stderr:
             self.skipTest("Memory policy syscall is unavailable in this test environment")
-        self.assertTrue(result["policy"].startswith("bind"), result)
-        self.assertEqual(result["policy"].split(":")[-1], str(self.node))
+        self.assertTrue(descendant["policy"].startswith("prefer"), descendant)
+        self.assertEqual(descendant["policy"].split(":")[-1], str(self.node))
+
+    def test_unavailable_local_cpus_do_not_execute_payload(self):
+        excluded = max(self.allowed_cpus) + 1
+        result = subprocess.run([BOOTSTRAP, str(self.node), str(excluded), "--",
+                                 sys.executable, "-c", "print('must not run')"],
+                                text=True, capture_output=True)
+        self.assertEqual(result.returncode, 125)
+        self.assertEqual(result.stdout, "")
+        self.assertIn("refusing to execute", result.stderr)
 
     def test_exec_preserves_pid_arguments_environment_and_working_directory(self):
         with tempfile.TemporaryDirectory() as working:
             args = ["space in argument", "literal $() ; *"]
-            process = subprocess.Popen(self.command("loose", sys.executable, "-c", PROBE, *args),
+            process = subprocess.Popen(self.command(sys.executable, "-c", PROBE, *args),
                                        cwd=working, env={**os.environ, "NUMA_TEST_MARKER": "preserved"},
                                        text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             output, diagnostic = process.communicate(timeout=10)
@@ -107,11 +127,11 @@ class GuestNumaBootstrap(unittest.TestCase):
             self.assertEqual(result["argv"], args)
 
     def test_exit_status_and_signals_reach_original_program(self):
-        result = subprocess.run(self.command("loose", sys.executable, "-c", "raise SystemExit(37)"),
+        result = subprocess.run(self.command(sys.executable, "-c", "raise SystemExit(37)"),
                                 capture_output=True)
         self.assertEqual(result.returncode, 37)
         source = "import signal, time; signal.signal(signal.SIGTERM, lambda *_: exit(23)); print('ready', flush=True); time.sleep(10)"
-        process = subprocess.Popen(self.command("loose", sys.executable, "-c", source),
+        process = subprocess.Popen(self.command(sys.executable, "-c", source),
                                    text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         try:
             self.assertEqual(process.stdout.readline().strip(), "ready")
@@ -124,11 +144,10 @@ class GuestNumaBootstrap(unittest.TestCase):
                 process.communicate()
 
     def test_invalid_arguments_do_not_execute_payload(self):
-        for mode, node, cpus in [("invalid", "0", "0"), ("loose", "-1", "0"),
-                                 ("loose", "0", ""), ("strict", "0", "3-1"),
-                                 ("loose", "0", "0,"), ("loose", "0", "1048576")]:
-            with self.subTest(mode=mode, node=node, cpus=cpus):
-                result = subprocess.run([BOOTSTRAP, mode, node, cpus, "--", sys.executable,
+        for node, cpus in [("invalid", "0"), ("-1", "0"), ("0", ""), ("0", "3-1"),
+                           ("0", "0,"), ("0", "1048576")]:
+            with self.subTest(node=node, cpus=cpus):
+                result = subprocess.run([BOOTSTRAP, node, cpus, "--", sys.executable,
                                          "-c", "print('must not run')"], capture_output=True, text=True)
                 self.assertEqual(result.returncode, 125)
                 self.assertEqual(result.stdout, "")

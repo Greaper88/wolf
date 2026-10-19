@@ -109,8 +109,7 @@ void start_runner(std::shared_ptr<events::Runner> runner,
   mounted_paths.push_back(
       {std::filesystem::path(args->host->host_base_state_folder) / "fake-udev", "/usr/bin/fake-udev"});
   mounted_paths.push_back({std::filesystem::path(args->app_host_state_folder) / "udev", "/run/udev/"});
-  if (wolf::numa::enabled() && wolf::numa::read_mode() == wolf::numa::Mode::loose &&
-      wolf::numa::resolve(render_node).placement)
+  if (wolf::numa::resolve(render_node).placement)
     mounted_paths.push_back(
         {std::filesystem::path(args->host->host_base_state_folder) / "wolf-numa-run", "/run/wolf-numa-run"});
 

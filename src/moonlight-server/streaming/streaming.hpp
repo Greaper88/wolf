@@ -23,7 +23,6 @@ using boost::asio::ip::udp;
 // Applies placement to construction allocations and threads spawned by a GPU worker.
 // Resolution conflicts fail startup; unavailable topology keeps the existing policy.
 class GpuLocality {
-  wolf::numa::Mode mode_;
   std::optional<wolf::numa::Placement> placement_;
   wolf::numa::ThreadScope thread_;
 
@@ -31,9 +30,6 @@ public:
   GpuLocality(std::string_view render_node, std::string_view worker);
   const std::optional<wolf::numa::Placement> &placement() const {
     return placement_;
-  }
-  wolf::numa::Mode mode() const {
-    return mode_;
   }
 };
 
@@ -44,9 +40,7 @@ class PipelineNumaPolicy {
   std::unique_ptr<State> state_;
 
 public:
-  PipelineNumaPolicy(GstBus *bus,
-                     const std::optional<wolf::numa::Placement> &placement,
-                     wolf::numa::Mode mode = wolf::numa::read_mode());
+  PipelineNumaPolicy(GstBus *bus, const std::optional<wolf::numa::Placement> &placement);
   ~PipelineNumaPolicy();
   PipelineNumaPolicy(const PipelineNumaPolicy &) = delete;
   PipelineNumaPolicy &operator=(const PipelineNumaPolicy &) = delete;

@@ -111,9 +111,7 @@ auto initialize(std::string_view config_file, std::string_view pkey_filename, st
   auto running_sessions = std::make_shared<immer::atom<immer::vector<events::StreamSession>>>();
   auto gpu_options = wolf::gpu::read_options();
   // Validate configuration before any detached session workers can read it.
-  logs::log(logs::info, "[NUMA] GPU-local session placement: {}", wolf::numa::enabled() ? "enabled" : "disabled");
-  if (wolf::numa::enabled())
-    logs::log(logs::info, "[NUMA] Placement mode: {}", wolf::numa::mode_name(wolf::numa::read_mode()));
+  logs::log(logs::info, "[NUMA] Placement mode: {}", wolf::numa::mode_name(wolf::numa::read_mode()));
   std::shared_ptr<wolf::gpu::Runtime> gpu_runtime;
   if (gpu_options.enabled()) {
     logs::log(logs::info,

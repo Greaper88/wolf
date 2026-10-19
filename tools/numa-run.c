@@ -76,16 +76,14 @@ static void policy_failure(const char *operation) {
 }
 
 int main(int argc, char **argv) {
-  if (argc < 6 || (strcmp(argv[1], "loose") != 0 && strcmp(argv[1], "strict") != 0) || strcmp(argv[4], "--") != 0 ||
-      !argv[5][0]) {
-    fprintf(stderr, "Usage: wolf-numa-run <loose|strict> <node> <local-cpulist> -- <command> [args...]\n");
+  if (argc < 5 || strcmp(argv[3], "--") != 0 || !argv[4][0]) {
+    fprintf(stderr, "Usage: wolf-numa-run <node> <local-cpulist> -- <command> [args...]\n");
     return 125;
   }
-  const int strict = strcmp(argv[1], "strict") == 0;
-  const char *node_text = argv[2];
+  const char *node_text = argv[1];
   unsigned node;
   if (!parse_number(&node_text, &node) || *node_text) {
-    fprintf(stderr, "[NUMA] Invalid guest NUMA node: %s\n", argv[2]);
+    fprintf(stderr, "[NUMA] Invalid guest NUMA node: %s\n", argv[1]);
     return 125;
   }
   const size_t local_bytes = MAX_RESOURCE_BITS / CHAR_BIT;
@@ -94,15 +92,15 @@ int main(int argc, char **argv) {
     fprintf(stderr, "[NUMA] Cannot allocate guest CPU mask: %s\n", strerror(errno));
     return 125;
   }
-  if (!parse_cpus(argv[3], local)) {
-    fprintf(stderr, "[NUMA] Invalid guest local CPU list: %s\n", argv[3]);
+  if (!parse_cpus(argv[2], local)) {
+    fprintf(stderr, "[NUMA] Invalid guest local CPU list: %s\n", argv[2]);
     free(local);
     return 125;
   }
 
   size_t allowed_bytes = 0;
   unsigned long *allowed = get_affinity(&allowed_bytes);
-  int seeded = 0;
+  int cpu_applied = 0;
   if (!allowed) {
     policy_failure("sched_getaffinity");
   } else {
@@ -112,63 +110,41 @@ int main(int argc, char **argv) {
       available |= local[index] != 0;
     }
     if (!available) {
-      fprintf(stderr, "[NUMA] Guest has no allowed CPUs local to node %u; continuing with degraded locality\n", node);
+      fprintf(stderr, "[NUMA] Guest has no allowed CPUs local to node %u\n", node);
     } else if (syscall(SYS_sched_setaffinity, 0, local_bytes, local) == 0) {
-      seeded = 1;
+      cpu_applied = 1;
     } else {
       policy_failure("sched_setaffinity");
     }
+  }
+  free(local);
+  free(allowed);
+  if (!cpu_applied) {
+    fprintf(stderr, "[NUMA] Guest local CPU placement could not be enforced; refusing to execute the command\n");
+    return 125;
   }
 
   const size_t memory_words = node / WORD_BITS + 1;
   unsigned long *memory = calloc(memory_words, sizeof(unsigned long));
   if (!memory) {
     fprintf(stderr, "[NUMA] Cannot allocate guest memory mask: %s\n", strerror(errno));
-    if (!strict && seeded && syscall(SYS_sched_setaffinity, 0, allowed_bytes, allowed) != 0)
-      policy_failure("eligible CPU restore");
-    free(local);
-    free(allowed);
     return 125;
   }
   memory[node / WORD_BITS] |= 1UL << (node % WORD_BITS);
   int memory_applied = 0;
-  if (syscall(SYS_set_mempolicy,
-              (strict ? MPOL_BIND : MPOL_PREFERRED) | MPOL_F_STATIC_NODES,
-              memory,
-              memory_words * WORD_BITS + 1) == 0) {
+  if (syscall(SYS_set_mempolicy, MPOL_PREFERRED | MPOL_F_STATIC_NODES, memory, memory_words * WORD_BITS + 1) == 0) {
     memory_applied = 1;
   } else {
     policy_failure("set_mempolicy");
   }
-
-  if (!strict && seeded && syscall(SYS_sched_setaffinity, 0, allowed_bytes, allowed) != 0) {
-    // Executing while accidentally hard-bound would violate loose mode.
-    fprintf(stderr, "[NUMA] Cannot restore guest eligible CPUs for loose mode: %s\n", strerror(errno));
-    free(memory);
-    free(local);
-    free(allowed);
-    return 125;
-  }
-  if (strict && (!seeded || !memory_applied)) {
-    fprintf(stderr, "[NUMA] Strict guest placement could not be enforced; refusing to execute the command\n");
-    free(memory);
-    free(local);
-    free(allowed);
-    return 125;
-  }
-  fprintf(stderr,
-          "[NUMA] Guest %s mode: node %u, CPU %s, memory %s\n",
-          strict ? "strict" : "loose",
-          node,
-          seeded ? (strict ? "bound locally" : "initial placement seeded locally; original CPUs remain eligible")
-                 : "placement unavailable",
-          memory_applied ? (strict ? "bound locally" : "preferred locally with fallback") : "preference unavailable");
   free(memory);
-  free(local);
-  free(allowed);
+  fprintf(stderr,
+          "[NUMA] Guest node %u: CPUs bound locally, memory %s\n",
+          node,
+          memory_applied ? "preferred locally with fallback" : "preference unavailable");
 
-  execvp(argv[5], &argv[5]);
+  execvp(argv[4], &argv[4]);
   const int failure = errno;
-  fprintf(stderr, "[NUMA] Cannot execute guest command %s: %s\n", argv[5], strerror(failure));
+  fprintf(stderr, "[NUMA] Cannot execute guest command %s: %s\n", argv[4], strerror(failure));
   return failure == ENOENT ? 127 : 126;
 }

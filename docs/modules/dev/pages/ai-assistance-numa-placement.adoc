@@ -6,83 +6,73 @@ AI-Inference-Date: 2026-10-19
 
 == Scope
 
-The maintainer requested GPU-local CPU and RAM placement based on the multi-GPU
-development branch, with selectable loose and strict policies. This change starts
-from `dev-gpu-selection` commit `257ae696a6dd602ef42f3daafe10f3db3c00534d`.
-Existing worktrees and their uncommitted changes remain separate.
+The maintainer requested a separate NUMA-aware branch based on the multi-GPU
+development branch. The implementation starts from `dev-gpu-selection` commit
+`257ae696a6dd602ef42f3daafe10f3db3c00534d`; existing worktrees and their uncommitted
+changes remain separate.
 
-`WOLF_NUMA_MODE=loose` defaults to initial local CPU execution with full permitted
-CPU eligibility restored immediately, plus `MPOL_PREFERRED` for RAM fallback.
-`strict` retains a local CPU mask and binds new RAM allocations to that node.
-`WOLF_NUMA_AWARE=false` disables placement. Neither mode changes GPU admission,
-reserves exclusive CPU cores, or overrides explicit operator resource limits.
+The current configuration uses one setting, `WOLF_NUMA_MODE=auto|on|off`, with
+`auto` as the default. Automatic mode enables placement on physical multi-node
+hosts when compatible GPU locality is available. Active placement keeps CPU
+threads on the GPU-local node for their lifetime and uses `MPOL_PREFERRED` for
+RAM fallback. Off mode retains ordinary scheduling. Unknown topology falls back
+to ordinary scheduling; explicit on mode rejects known resource conflicts.
+No adaptive CPU spillover controller or exclusive resource reservation is added.
 
-DRM/PCI discovery resolves locality at the existing selected render-node boundaries.
-Docker guests receive mode-appropriate resource cpusets. A static, read-only
-launcher applies loose guest policy before executing the original image/app
-command. It preserves Docker's effective entrypoint/command merge and explicit
-capability drops. Host workers use scoped allocation policy and affinity;
-GStreamer task ENTER/LEAVE callbacks cover reusable streaming threads.
+DRM/PCI discovery follows the GPU selected for each app or encoder. Docker
+CPU cpusets enforce locality while retaining permitted remote RAM. A static,
+read-only launcher sets preferred RAM before executing the original image/app
+command. Argument boundaries and explicit operator/security restrictions are
+preserved. Host workers use scoped policy and affinity; GStreamer task
+ENTER/LEAVE callbacks apply placement to reusable threads and restore previous
+settings when they leave a pipeline.
 
 Session/lobby render workers, routed and shared encoders, host-process runners,
-and audio startup receive the policy. Manual split encoders honor
+and audio startup receive placement. Manual split encoders honor
 `WOLF_ENCODER_NODE`. Existing audio pipelines retain startup locality across
 later producer switches. Existing/shared allocations and global driver threads
 are outside the scoped allocation policy.
 
-== Validation
+== Validation and limits
 
-Dependency-free tests cover sparse topology, CPU/memory restrictions, unknown
-nodes, ancestor and single-memory-node fallback, large resource IDs, both modes,
-process inheritance, exact restoration, and construction rollback. Catch2
-regressions cover Docker masks/commands, reusable GStreamer workers, real streaming
-tasks, failure propagation, and manual versus automatic encoder node selection.
-The static guest launcher's Python tests cover policies, CPU eligibility, literal
+Regression coverage includes topology and operator limits, automatic detection,
+configuration parsing, Docker startup arguments, guest process inheritance,
+reusable GStreamer worker placement/restoration, memory preference when syscalls
+are available, and failure propagation. Memory-policy checks explicitly account
+for Docker seccomp restrictions. The static launcher tests also check literal
 arguments, PID, environment, working directory, signals, and exit status.
 
-Disposable tests on the dual-Xeon development host resolved both W6600 GPUs to
-node 0 and both Quadro RTX 4000 GPUs to node 1. Loose scopes kept all 56 CPUs
-eligible and preferred the selected node; strict scopes used its local CPU list.
-Fresh 32 MiB anonymous mappings placed all 8192 pages on the expected node.
-The production static launcher also passed as a non-root guest with `SYS_NICE`.
-Docker's default seccomp denied explicit memory-policy syscalls without that
-capability; diagnostics reported the reduced enforcement instead of claiming
-success. Strict Docker CPU/memory cpusets worked independently.
+The combined Wolf/server, test executable, and static launcher build passed.
+The offline per-case CTest run passed all 75 selected tests; the physical VA
+test and unrelated network icon-API case were excluded. With `SYS_NICE`, the
+NUMA suite passed 142 assertions across 11 cases, and all eight launcher tests
+passed as both root and user 1000. Dependency-free checks passed 85 checks on
+Linux and 17 with a simulated non-Linux platform.
 
-Local evidence is retained in the sibling `wolf-numa-validation` directory.
-CMake/Ninja built `wolf`, `wolftests`, the GPU tests, and the static launcher.
-All 72 nonhardware CTest cases passed in separate processes: 71 with networking
-disabled and the existing icon-download API test with networking enabled. One
-explicit VA hardware test was excluded. The NUMA Catch2 subset separately passed
-125 assertions in eight cases with `SYS_NICE`; the standalone helper passed 76
-Linux checks and 17 simulated non-Linux checks. All seven launcher tests passed
-with `SYS_NICE`, including under a non-root guest user; default seccomp explicitly
-skipped three memory-policy-dependent checks.
+Disposable-container checks covered all four GPUs in auto/on/off. Auto and on
+kept CPU affinity local for each scope, placed each fresh 32 MiB anonymous
+mapping wholly on the GPU-local memory node, kept both memory nodes permitted,
+and restored prior policies exactly. Off left policy unchanged. Evidence is in
+the sibling `wolf-numa-auto-validation` directory. These checks did not modify
+the running game or establish deployment of the revised image.
 
-The initial aggregate Catch2 invocation encountered an API startup/socket race
-between existing detached test servers. Both affected API cases passed in
-isolation, and the complete per-case CTest run avoided the shared-socket race.
-No live service was restarted or deployed during implementation.
+Read-only inspection of a running game found remote CPU execution despite local
+RAM allocation under the earlier policy. The sampled logs and resource counters
+did not establish a stutter cause. Persistent local CPU affinity removes that
+placement mismatch; its effect on frame pacing still requires comparison under
+the same workload. This document does not claim a proven stutter fix or a
+rollout of the revised setting.
 
 == Preserve the deployed reconnect repair
 
-Deployment preflight found that the live `wolf:reconnect-timeout-dev` image
-contained an already tested, uncommitted handshake repair based on `257ae69`.
-Its source changes were copied separately onto the NUMA branch before deployment;
-the original development worktree and its uncommitted edits were preserved.
-
-Unclaimed GPU admissions retain their 30-second monotonic deadline and expire
-back to a retained app assignment. The app's GPU pin survives expiration;
-active encoders and cancelled teardown keep their capacity protection. RTP
+The branch preserves the already deployed handshake repair copied from the
+original development worktree without modifying that worktree. Unclaimed GPU
+admissions keep a 30-second monotonic deadline while retaining the app's GPU pin;
+active encoders and cancelled teardown retain their capacity protection. RTP
 timeouts check current connection credentials under the HTTPS resume transition
-lock, preventing an old waiter from pausing a newer connection or active worker.
-The existing clock-injected admission and stale-handshake session regressions
-were included with the combined source. No admission thresholds or GPU isolation
-rules were relaxed to introduce NUMA placement.
-
-The combined server and test binaries rebuilt successfully. Seven GPU CTests,
-seven shared-video/handshake cases (119 assertions), eight NUMA cases (125
-assertions), and eight isolated API/reconnect cases passed before packaging.
+lock so an old waiter cannot pause a newer connection or active worker. The
+clock-injected admission and stale-handshake regressions remain included.
+GPU admission thresholds and isolation rules are unchanged by NUMA placement.
 
 == Tools
 

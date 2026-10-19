@@ -22,15 +22,14 @@ using namespace wolf::core::gstreamer;
 using namespace wolf::core;
 
 namespace {
-std::optional<wolf::numa::Placement>
-gpu_placement(std::string_view render_node, std::string_view worker, wolf::numa::Mode mode) {
+std::optional<wolf::numa::Placement> gpu_placement(std::string_view render_node, std::string_view worker) {
   if (!wolf::numa::enabled() || render_node.empty())
     return {};
   auto resolved = wolf::numa::resolve(render_node);
-  if (resolved.conflict && mode == wolf::numa::Mode::strict)
+  if (resolved.conflict)
     throw std::runtime_error(fmt::format("[NUMA] {} on {}: {}", worker, render_node, resolved.reason));
   if (!resolved.placement) {
-    logs::log(resolved.conflict ? logs::warning : logs::debug,
+    logs::log(wolf::numa::read_mode() == wolf::numa::Mode::on ? logs::warning : logs::debug,
               "[NUMA] {} on {}: {}",
               worker,
               render_node,
@@ -38,29 +37,17 @@ gpu_placement(std::string_view render_node, std::string_view worker, wolf::numa:
     return {};
   }
   const auto &placement = *resolved.placement;
-  if (mode == wolf::numa::Mode::strict) {
-    logs::log(logs::info,
-              "[NUMA] {} on {} uses strict node {}, CPUs {}, memory nodes {}",
-              worker,
-              render_node,
-              placement.node,
-              wolf::numa::format_list(placement.cpus),
-              wolf::numa::format_list(placement.memory_nodes));
-  } else {
-    logs::log(logs::info,
-              "[NUMA] {} on {} uses loose node {}: initial CPUs {}, original CPUs remain eligible, "
-              "memory preferred locally with fallback",
-              worker,
-              render_node,
-              placement.node,
-              wolf::numa::format_list(placement.cpus));
-  }
+  logs::log(logs::info,
+            "[NUMA] {} on {} uses local node {}, CPUs {}, memory preferred locally with fallback",
+            worker,
+            render_node,
+            placement.node,
+            wolf::numa::format_list(placement.cpus));
   return resolved.placement;
 }
 
 struct TaskPolicy {
   wolf::numa::Placement placement;
-  wolf::numa::Mode mode;
   std::atomic_bool cpu_warning{false};
   std::atomic_bool memory_warning{false};
 };
@@ -95,14 +82,12 @@ void task_stream_status(GstBus *bus, GstMessage *message, gpointer data) noexcep
       return active.policy == policy && active.task == task;
     });
     if (type == GST_STREAM_STATUS_TYPE_ENTER && current == active_task_policies.end()) {
-      auto scope = std::make_unique<wolf::numa::ThreadScope>(policy->placement, policy->mode);
+      auto scope = std::make_unique<wolf::numa::ThreadScope>(policy->placement);
       if (!scope->cpu_applied()) {
         if (!policy->cpu_warning.exchange(true))
           logs::log(logs::error, "[NUMA] GStreamer task CPU affinity failed: {}", scope->cpu_error());
-        if (policy->mode == wolf::numa::Mode::strict) {
-          task_placement_error(bus, message, scope->cpu_error().c_str());
-          return;
-        }
+        task_placement_error(bus, message, scope->cpu_error().c_str());
+        return;
       }
       if (!scope->memory_error().empty() && !policy->memory_warning.exchange(true))
         logs::log(logs::warning,
@@ -124,13 +109,9 @@ void task_stream_status(GstBus *bus, GstMessage *message, gpointer data) noexcep
 } // namespace
 
 GpuLocality::GpuLocality(std::string_view render_node, std::string_view worker)
-    : mode_(wolf::numa::enabled() ? wolf::numa::read_mode() : wolf::numa::Mode::loose),
-      placement_(gpu_placement(render_node, worker, mode_)), thread_(placement_, mode_) {
-  if (placement_ && !thread_.cpu_applied()) {
-    if (mode_ == wolf::numa::Mode::strict)
-      throw std::runtime_error(fmt::format("[NUMA] {} CPU affinity failed: {}", worker, thread_.cpu_error()));
-    logs::log(logs::warning, "[NUMA] {} initial CPU placement failed: {}", worker, thread_.cpu_error());
-  }
+    : placement_(gpu_placement(render_node, worker)), thread_(placement_) {
+  if (placement_ && !thread_.cpu_applied())
+    throw std::runtime_error(fmt::format("[NUMA] {} CPU affinity failed: {}", worker, thread_.cpu_error()));
   if (!thread_.memory_error().empty())
     logs::log(logs::warning,
               "[NUMA] {} memory policy failed: {}; CPU affinity remains available",
@@ -142,10 +123,9 @@ struct PipelineNumaPolicy::State {
   GstBus *bus;
   gulong handler;
 
-  State(GstBus *source, const wolf::numa::Placement &placement, wolf::numa::Mode mode) : bus(source) {
+  State(GstBus *source, const wolf::numa::Placement &placement) : bus(source) {
     auto policy = std::make_shared<TaskPolicy>();
     policy->placement = placement;
-    policy->mode = mode;
     auto data = std::make_unique<std::shared_ptr<TaskPolicy>>(std::move(policy));
     gst_object_ref(bus);
     gst_bus_enable_sync_message_emission(bus);
@@ -164,11 +144,9 @@ struct PipelineNumaPolicy::State {
   }
 };
 
-PipelineNumaPolicy::PipelineNumaPolicy(GstBus *bus,
-                                       const std::optional<wolf::numa::Placement> &placement,
-                                       wolf::numa::Mode mode) {
+PipelineNumaPolicy::PipelineNumaPolicy(GstBus *bus, const std::optional<wolf::numa::Placement> &placement) {
   if (placement)
-    state_ = std::make_unique<State>(bus, *placement, mode);
+    state_ = std::make_unique<State>(bus, *placement);
 }
 PipelineNumaPolicy::~PipelineNumaPolicy() = default;
 
@@ -277,7 +255,7 @@ void start_video_producer(const std::string &session_id,
     bus_data_ptr->wayland_plugin.swap(wayland_plugin_ptr);
 
     auto bus = gst_pipeline_get_bus(GST_PIPELINE(pipeline.get()));
-    task_policy = std::make_unique<PipelineNumaPolicy>(bus, locality.placement(), locality.mode());
+    task_policy = std::make_unique<PipelineNumaPolicy>(bus, locality.placement());
     g_signal_connect(bus, "message::application", G_CALLBACK(application_message_handler), bus_data_ptr.get());
     gst_bus_set_sync_handler(bus, bus_sync_handler, ctx_data_ptr.get(), nullptr);
     gst_object_unref(bus);
@@ -338,7 +316,7 @@ void start_audio_producer(const std::string &session_id,
 
   run_pipeline(pipeline, [=, &locality, &task_policy](auto pipeline) {
     auto bus = gst_pipeline_get_bus(GST_PIPELINE(pipeline.get()));
-    task_policy = std::make_unique<PipelineNumaPolicy>(bus, locality.placement(), locality.mode());
+    task_policy = std::make_unique<PipelineNumaPolicy>(bus, locality.placement());
     gst_object_unref(bus);
     auto stop_handler = event_bus->register_handler<immer::box<events::StopStreamEvent>>(
         [session_id, pipeline](const immer::box<events::StopStreamEvent> &ev) {
@@ -700,7 +678,7 @@ SharedVideoResult prepare_shared_video(const events::VideoSession &settings,
               [&](auto pipeline) {
                 running = pipeline;
                 auto bus = gst_pipeline_get_bus(GST_PIPELINE(pipeline.get()));
-                task_policy = std::make_unique<PipelineNumaPolicy>(bus, locality.placement(), locality.mode());
+                task_policy = std::make_unique<PipelineNumaPolicy>(bus, locality.placement());
                 gst_bus_set_sync_handler(bus, bus_sync_handler, context_data.get(), nullptr);
                 gst_object_unref(bus);
                 // Repeat codec headers at every IDR, including viewers joining an existing encoder.
@@ -895,7 +873,7 @@ static void stream_video_once(immer::box<events::VideoSession> video_session,
         }
 
         auto bus = gst_pipeline_get_bus(GST_PIPELINE(pipeline.get()));
-        task_policy = std::make_unique<PipelineNumaPolicy>(bus, locality.placement(), locality.mode());
+        task_policy = std::make_unique<PipelineNumaPolicy>(bus, locality.placement());
         gst_bus_set_sync_handler(bus, bus_sync_handler, ctx_data_ptr.get(), nullptr);
         gst_object_unref(bus);
 
@@ -1117,7 +1095,7 @@ void start_streaming_audio(immer::box<events::AudioSession> audio_session,
       pipeline,
       [session_id = audio_session->session_id, udp_sink, event_bus, &locality, &task_policy](auto pipeline) {
         auto bus = gst_pipeline_get_bus(GST_PIPELINE(pipeline.get()));
-        task_policy = std::make_unique<PipelineNumaPolicy>(bus, locality.placement(), locality.mode());
+        task_policy = std::make_unique<PipelineNumaPolicy>(bus, locality.placement());
         gst_object_unref(bus);
         if (auto app_sink_el = gst_bin_get_by_name(GST_BIN(pipeline.get()), "wolf_udp_sink")) {
           logs::log(logs::debug, "Setting up wolf_udp_sink");

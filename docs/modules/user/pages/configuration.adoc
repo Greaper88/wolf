@@ -67,13 +67,9 @@ Wolf is configured via a TOML config file and some additional optional ENV varia
 |/dev/dri/renderD128
 |The default render node used for virtual desktops; see: <<_multiple_gpu>>
 
-|WOLF_NUMA_AWARE
-|TRUE
-|Enable GPU-local resource placement when Linux exposes NUMA topology. Applies to automatic and manually selected GPUs; see xref:numa-awareness.adoc[NUMA placement].
-
 |WOLF_NUMA_MODE
-|loose
-|`loose` starts on local CPUs and prefers local RAM while allowing remote resources. `strict` confines CPUs and new RAM to the GPU's node. Explicit resource limits remain authoritative.
+|auto
+|`auto` enables GPU-local CPU affinity and preferred local RAM on compatible multi-node hosts; `on` requests placement explicitly; `off` uses ordinary scheduling. CPU affinity remains local, while RAM can fall back to other permitted nodes. See xref:numa-awareness.adoc[NUMA placement].
 
 |WOLF_GPU_PREFER_RAY_TRACING
 |FALSE

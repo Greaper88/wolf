@@ -23,10 +23,15 @@ using namespace wolf::core;
 
 boost::json::object with_hotplug_capabilities(boost::json::object options);
 
-// Intersect app restrictions with the selected GPU's locality before Docker creates the guest.
-boost::json::object with_numa_placement(boost::json::object options,
-                                        const wolf::numa::Placement &placement,
-                                        wolf::numa::Mode mode = wolf::numa::read_mode());
+// Keep CPUs local while preserving every permitted RAM node for the launcher's preferred-memory fallback.
+boost::json::object with_numa_placement(boost::json::object options, const wolf::numa::Placement &placement);
+struct NumaGuestOptions {
+  boost::json::object options;
+  bool placed;
+};
+// Auto mode can retain ordinary resource bounds when an app excludes the local CPUs.
+NumaGuestOptions
+with_numa_guest_policy(boost::json::object options, const wolf::numa::Placement &placement, wolf::numa::Mode mode);
 boost::json::object with_numa_bootstrap(boost::json::object options,
                                         const boost::json::object &image_config,
                                         const wolf::numa::Placement &placement);

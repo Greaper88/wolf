@@ -163,7 +163,7 @@ inline void validate_gpu_locality(std::string_view render_node) {
   if (!wolf::numa::enabled())
     return;
   const auto locality = wolf::numa::resolve(render_node);
-  if (locality.conflict && wolf::numa::read_mode() == wolf::numa::Mode::strict)
+  if (locality.conflict)
     throw std::runtime_error("NUMA placement for " + std::string(render_node) + ": " + locality.reason);
 }
 

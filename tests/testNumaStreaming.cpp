@@ -4,7 +4,11 @@
 #include <streaming/streaming.hpp>
 
 #ifdef __linux__
+#include <cerrno>
+#include <linux/mempolicy.h>
 #include <sched.h>
+#include <sys/syscall.h>
+#include <unistd.h>
 
 namespace {
 std::vector<unsigned> current_cpus() {
@@ -33,6 +37,26 @@ unsigned allowed_memory_node() {
   throw std::runtime_error("Cannot read test memory node allowance");
 }
 
+struct MemoryPolicy {
+  int mode;
+  std::vector<unsigned long> nodes;
+  bool operator==(const MemoryPolicy &) const = default;
+};
+
+std::optional<MemoryPolicy> current_memory_policy() {
+#if defined(SYS_get_mempolicy)
+  constexpr auto word_bits = sizeof(unsigned long) * 8;
+  for (unsigned bits = 1024; bits <= 1024 * 1024; bits *= 2) {
+    MemoryPolicy policy{.mode = 0, .nodes = std::vector<unsigned long>((bits + word_bits - 1) / word_bits)};
+    if (syscall(SYS_get_mempolicy, &policy.mode, policy.nodes.data(), bits + 1UL, nullptr, 0UL) == 0)
+      return policy;
+    if (errno != EINVAL)
+      break;
+  }
+#endif
+  return {};
+}
+
 void task_status(GstBus *bus, GstElement *owner, GstTask *task, GstStreamStatusType type) {
   auto message = gst_message_new_stream_status(GST_OBJECT(owner), type, owner);
   GValue object = G_VALUE_INIT;
@@ -56,8 +80,8 @@ TEST_CASE("GStreamer task placement follows each pipeline and restores reusable 
   const auto node = allowed_memory_node();
   const wolf::numa::Placement first{.node = static_cast<int>(node), .cpus = {original.front()}, .memory_nodes = {node}};
   const wolf::numa::Placement second{.node = static_cast<int>(node), .cpus = {original.back()}, .memory_nodes = {node}};
-  streaming::PipelineNumaPolicy first_policy(first_bus.get(), first, wolf::numa::Mode::strict);
-  streaming::PipelineNumaPolicy second_policy(second_bus.get(), second, wolf::numa::Mode::strict);
+  streaming::PipelineNumaPolicy first_policy(first_bus.get(), first);
+  streaming::PipelineNumaPolicy second_policy(second_bus.get(), second);
 
   // Drive the real synchronous bus callback on one persistent worker. A task pool
   // can hand that worker to pipelines for different GPUs in exactly this sequence.
@@ -67,7 +91,7 @@ TEST_CASE("GStreamer task placement follows each pipeline and restores reusable 
     try {
       // Pool workers can inherit the previous pipeline creator's narrow mask.
       // The next pipeline must be able to expand it within the authorized CPUs.
-      wolf::numa::ThreadScope inherited(first, wolf::numa::Mode::strict);
+      wolf::numa::ThreadScope inherited(first);
       std::vector<std::vector<unsigned>> masks{current_cpus()};
       task_status(first_bus.get(), owner.get(), task.get(), GST_STREAM_STATUS_TYPE_ENTER);
       masks.push_back(current_cpus());
@@ -98,13 +122,6 @@ TEST_CASE("GStreamer streaming threads use the pipeline NUMA policy", "[NUMA][GS
   const wolf::numa::Placement placement{.node = static_cast<int>(node),
                                         .cpus = {original.front()},
                                         .memory_nodes = {node}};
-  auto mode = wolf::numa::Mode::loose;
-  auto expected = original;
-  SECTION("Strict mode binds streaming threads to local CPUs") {
-    mode = wolf::numa::Mode::strict;
-    expected = placement.cpus;
-  }
-  SECTION("Loose mode keeps other CPUs eligible") {}
   GError *error = nullptr;
   auto pipeline = streaming::gstreamer::gst_element_ptr(
       gst_parse_launch("fakesrc num-buffers=4 ! fakesink name=observe signal-handoffs=true", &error),
@@ -116,7 +133,7 @@ TEST_CASE("GStreamer streaming threads use the pipeline NUMA policy", "[NUMA][GS
   }
   REQUIRE(pipeline);
   auto bus = std::shared_ptr<GstBus>(gst_element_get_bus(pipeline.get()), gst_object_unref);
-  streaming::PipelineNumaPolicy policy(bus.get(), placement, mode);
+  streaming::PipelineNumaPolicy policy(bus.get(), placement);
   auto sink =
       streaming::gstreamer::gst_element_ptr(gst_bin_get_by_name(GST_BIN(pipeline.get()), "observe"), gst_object_unref);
   std::vector<std::vector<unsigned>> observed;
@@ -142,8 +159,44 @@ TEST_CASE("GStreamer streaming threads use the pipeline NUMA policy", "[NUMA][GS
   REQUIRE(type == GST_MESSAGE_EOS);
   REQUIRE(observed.size() == 4);
   for (const auto &mask : observed)
-    REQUIRE(mask == expected);
+    REQUIRE(mask == placement.cpus);
   REQUIRE(current_cpus() == original);
+}
+
+TEST_CASE("GStreamer task RAM preference and CPU affinity restore on leave", "[NUMA][GStreamer]") {
+  const auto original_cpus = current_cpus();
+  REQUIRE_FALSE(original_cpus.empty());
+  const auto node = allowed_memory_node();
+  const wolf::numa::Placement placement{.node = static_cast<int>(node),
+                                        .cpus = {original_cpus.front()},
+                                        .memory_nodes = {node}};
+  bool memory_supported;
+  {
+    wolf::numa::ThreadScope probe(placement);
+    REQUIRE(probe.cpu_applied());
+    memory_supported = probe.memory_applied();
+  }
+  const auto original_memory = current_memory_policy();
+  auto bus = std::shared_ptr<GstBus>(gst_bus_new(), gst_object_unref);
+  auto owner = streaming::gstreamer::gst_element_ptr(gst_pipeline_new("numa-memory-owner"), gst_object_unref);
+  std::shared_ptr<GstTask> task(gst_task_new([](gpointer) {}, nullptr, nullptr), gst_object_unref);
+  streaming::PipelineNumaPolicy policy(bus.get(), placement);
+  task_status(bus.get(), owner.get(), task.get(), GST_STREAM_STATUS_TYPE_ENTER);
+  const auto active_cpus = current_cpus();
+  const auto active_memory = current_memory_policy();
+  task_status(bus.get(), owner.get(), task.get(), GST_STREAM_STATUS_TYPE_LEAVE);
+  REQUIRE(active_cpus == placement.cpus);
+  REQUIRE(current_cpus() == original_cpus);
+  REQUIRE(current_memory_policy() == original_memory);
+  if (memory_supported) {
+    REQUIRE(original_memory.has_value());
+    REQUIRE(active_memory.has_value());
+    REQUIRE((active_memory->mode & ~MPOL_MODE_FLAGS) == MPOL_PREFERRED);
+    constexpr auto word_bits = sizeof(unsigned long) * 8;
+    REQUIRE(active_memory->nodes.at(node / word_bits) & (1UL << (node % word_bits)));
+  } else {
+    INFO("Memory policy syscalls unavailable; CPU placement and restoration still verified");
+  }
 }
 
 TEST_CASE("Failed GStreamer task CPU placement reports a pipeline error", "[NUMA][GStreamer]") {
@@ -153,7 +206,7 @@ TEST_CASE("Failed GStreamer task CPU placement reports a pipeline error", "[NUMA
   auto bus = std::shared_ptr<GstBus>(gst_bus_new(), gst_object_unref);
   auto owner = streaming::gstreamer::gst_element_ptr(gst_pipeline_new("numa-failure-owner"), gst_object_unref);
   std::shared_ptr<GstTask> task(gst_task_new([](gpointer) {}, nullptr, nullptr), gst_object_unref);
-  streaming::PipelineNumaPolicy policy(bus.get(), unavailable, wolf::numa::Mode::strict);
+  streaming::PipelineNumaPolicy policy(bus.get(), unavailable);
   task_status(bus.get(), owner.get(), task.get(), GST_STREAM_STATUS_TYPE_ENTER);
   auto message = gst_bus_timed_pop_filtered(bus.get(), GST_SECOND, GST_MESSAGE_ERROR);
   REQUIRE(message);

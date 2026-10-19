@@ -195,51 +195,62 @@ std::vector<unsigned> intersect_lists(const std::vector<unsigned> &left, const s
 }
 
 bool enabled() {
-  auto value = std::getenv("WOLF_NUMA_AWARE");
-  if (!value)
-    return true;
-  std::string flag(trim(value));
-  std::transform(flag.begin(), flag.end(), flag.begin(), [](unsigned char c) {
-    return c >= 'a' && c <= 'z' ? static_cast<char>(c - 'a' + 'A') : static_cast<char>(c);
-  });
-  if (flag == "FALSE" || flag == "0" || flag == "OFF" || flag == "NO")
-    return false;
-  if (flag == "TRUE" || flag == "1" || flag == "ON" || flag == "YES")
-    return true;
-  throw std::invalid_argument("WOLF_NUMA_AWARE must be a boolean");
+  return read_mode() != Mode::off;
 }
 
 Mode read_mode() {
   auto value = std::getenv("WOLF_NUMA_MODE");
   if (!value)
-    return Mode::loose;
+    return Mode::automatic;
   std::string flag(trim(value));
   std::transform(flag.begin(), flag.end(), flag.begin(), [](unsigned char c) {
     return c >= 'A' && c <= 'Z' ? static_cast<char>(c - 'A' + 'a') : static_cast<char>(c);
   });
-  if (flag == "loose")
-    return Mode::loose;
-  if (flag == "strict")
-    return Mode::strict;
-  throw std::invalid_argument("WOLF_NUMA_MODE must be loose or strict");
+  if (flag == "auto")
+    return Mode::automatic;
+  if (flag == "on")
+    return Mode::on;
+  if (flag == "off")
+    return Mode::off;
+  throw std::invalid_argument("WOLF_NUMA_MODE must be auto, on, or off");
 }
 
 const char *mode_name(Mode mode) {
-  return mode == Mode::strict ? "strict" : "loose";
+  switch (mode) {
+  case Mode::automatic:
+    return "auto";
+  case Mode::on:
+    return "on";
+  case Mode::off:
+    return "off";
+  }
+  return "unknown";
 }
 
-Resolution resolve(std::string_view render_node, const Paths &paths) {
+Resolution resolve(std::string_view render_node, const Paths &paths, Mode mode) {
+  if (mode == Mode::off)
+    return {{}, "NUMA placement is disabled", false};
 #ifdef __linux__
+  auto unavailable = [mode](std::string reason, bool conflict = false) -> Resolution {
+    if (mode == Mode::automatic && conflict)
+      return {{}, "Automatic NUMA placement skipped: " + reason, false};
+    return {{}, std::move(reason), conflict};
+  };
   try {
+    auto memory = memory_nodes(paths);
+    if (mode == Mode::automatic && memory.size() < 2)
+      return unavailable(memory.size() == 1
+                             ? "Automatic NUMA placement skipped: host has one memory node"
+                             : "Automatic NUMA placement skipped: multi-node memory topology is unavailable");
     std::error_code error;
     auto render = std::filesystem::canonical(std::filesystem::path(render_node), error);
     auto name = (error ? std::filesystem::path(render_node) : render).filename().string();
     if (!name.starts_with("renderD") || name.size() == 7 ||
         name.find_first_not_of("0123456789", 7) != std::string::npos)
-      return {{}, "Selected GPU has no canonical DRM render node", false};
+      return unavailable("Selected GPU has no canonical DRM render node");
     auto device = std::filesystem::canonical(paths.drm_class / name / "device", error);
     if (error)
-      return {{}, "Selected GPU PCI topology is unavailable", false};
+      return unavailable("Selected GPU PCI topology is unavailable");
     std::optional<int> node;
     for (auto current = device; !current.empty(); current = current.parent_path()) {
       if ((node = node_at(current)))
@@ -247,29 +258,28 @@ Resolution resolve(std::string_view render_node, const Paths &paths) {
       if (current == current.parent_path())
         break;
     }
-    auto memory = memory_nodes(paths);
     if (!node && memory.size() == 1 && memory.front() <= static_cast<unsigned>(std::numeric_limits<int>::max()))
       node = static_cast<int>(memory.front());
     if (!node)
-      return {{}, "Selected GPU NUMA node is unknown on this topology", false};
+      return unavailable("Selected GPU NUMA node is unknown on this topology");
     auto text = read_text(paths.status);
     if (!text)
-      return {{}, "Process CPU and memory allowances are unavailable", true};
+      return unavailable("Process CPU and memory allowances are unavailable", true);
     auto allowed_cpus = status_field(*text, "Cpus_allowed_list");
     auto allowed_memory = status_field(*text, "Mems_allowed_list");
     if (!allowed_cpus || !allowed_memory)
-      return {{}, "Process CPU and memory allowances are incomplete", true};
+      return unavailable("Process CPU and memory allowances are incomplete", true);
     auto local_text = read_text(paths.nodes / ("node" + std::to_string(*node)) / "cpulist");
     if (!local_text)
-      return {{}, "Selected GPU NUMA node has no CPU topology", true};
+      return unavailable("Selected GPU NUMA node has no CPU topology", true);
     auto eligible_cpus = parse_list(*allowed_cpus);
     auto eligible_memory = parse_list(*allowed_memory);
     auto cpus = intersect_lists(parse_list(*local_text), eligible_cpus);
     auto local_memory = intersect_lists({static_cast<unsigned>(*node)}, eligible_memory);
     if (cpus.empty())
-      return {{}, "Selected GPU NUMA node has no allowed local CPUs", true};
+      return unavailable("Selected GPU NUMA node has no allowed local CPUs", true);
     if (local_memory.empty() || (!memory.empty() && !std::binary_search(memory.begin(), memory.end(), *node)))
-      return {{}, "Selected GPU NUMA node has no allowed local RAM", true};
+      return unavailable("Selected GPU NUMA node has no allowed local RAM", true);
     return {Placement{*node,
                       std::move(cpus),
                       std::move(local_memory),
@@ -278,7 +288,7 @@ Resolution resolve(std::string_view render_node, const Paths &paths) {
             {},
             false};
   } catch (const std::invalid_argument &error) {
-    return {{}, std::string("Invalid NUMA topology or process allowance: ") + error.what(), true};
+    return unavailable(std::string("Invalid NUMA topology or process allowance: ") + error.what(), true);
   }
 #else
   (void)render_node;
@@ -294,7 +304,6 @@ struct ThreadScope::State {
   std::vector<unsigned long> original_cpu, original_memory;
   int original_mode = MPOL_DEFAULT;
   unsigned memory_bits = 0;
-  bool restore_cpu = false;
 #endif
   ~State() noexcept {
 #ifdef __linux__
@@ -304,16 +313,16 @@ struct ThreadScope::State {
       syscall(SYS_set_mempolicy, original_mode, mask, mask ? memory_bits : 0UL);
     }
 #endif
-    if (restore_cpu)
+    if (cpu_applied)
       syscall(SYS_sched_setaffinity, 0, original_cpu.size() * sizeof(unsigned long), original_cpu.data());
 #endif
   }
 };
 
-ThreadScope::ThreadScope(const Placement &placement, Mode mode, bool respect_current_affinity)
-    : ThreadScope(std::optional(placement), mode, respect_current_affinity) {}
+ThreadScope::ThreadScope(const Placement &placement, bool respect_current_affinity)
+    : ThreadScope(std::optional(placement), respect_current_affinity) {}
 
-ThreadScope::ThreadScope(const std::optional<Placement> &placement, Mode mode, bool respect_current_affinity)
+ThreadScope::ThreadScope(const std::optional<Placement> &placement, bool respect_current_affinity)
     : state_(std::make_unique<State>()) {
   if (!placement)
     return;
@@ -328,22 +337,7 @@ ThreadScope::ThreadScope(const std::optional<Placement> &placement, Mode mode, b
     } else {
       auto mask = make_mask(cpus, state_->original_cpu.size());
       if (syscall(SYS_sched_setaffinity, 0, mask.size() * sizeof(unsigned long), mask.data()) == 0) {
-        state_->restore_cpu = true;
-        if (mode == Mode::strict) {
-          state_->cpu_applied = true;
-        } else if (syscall(SYS_sched_setaffinity,
-                           0,
-                           state_->original_cpu.size() * sizeof(unsigned long),
-                           state_->original_cpu.data()) == 0) {
-          state_->cpu_applied = true;
-          state_->restore_cpu = false;
-        } else {
-          state_->cpu_error = system_error("Restore CPU eligibility after local placement", errno);
-          // Returning would leave a loose worker temporarily hard-bound for its
-          // lifetime. Abort construction; State retries the original mask while
-          // unwinding instead of allowing the caller to continue in that state.
-          throw std::runtime_error(state_->cpu_error);
-        }
+        state_->cpu_applied = true;
       } else {
         state_->cpu_error = system_error("sched_setaffinity", errno);
       }
@@ -378,8 +372,7 @@ ThreadScope::ThreadScope(const std::optional<Placement> &placement, Mode mode, b
   }
   auto mask = make_mask(placement->memory_nodes, state_->original_memory.size());
   auto bits = mask.size() * word_bits + 1;
-  auto policy = mode == Mode::strict ? MPOL_BIND : MPOL_PREFERRED;
-  if (syscall(SYS_set_mempolicy, policy | MPOL_F_STATIC_NODES, mask.data(), bits) == 0)
+  if (syscall(SYS_set_mempolicy, MPOL_PREFERRED | MPOL_F_STATIC_NODES, mask.data(), bits) == 0)
     state_->memory_applied = true;
   else
     state_->memory_error = system_error("set_mempolicy", errno);
@@ -387,7 +380,6 @@ ThreadScope::ThreadScope(const std::optional<Placement> &placement, Mode mode, b
   state_->memory_error = "Memory policy syscalls are unavailable on this platform";
 #endif
 #else
-  (void)mode;
   (void)respect_current_affinity;
   state_->cpu_error = "CPU placement is unavailable on this platform";
   state_->memory_error = "Memory placement is unavailable on this platform";

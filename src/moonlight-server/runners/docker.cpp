@@ -18,14 +18,14 @@ wolf::numa::Placement permitted_guest_resources() {
       placement.allowed_memory_nodes = wolf::numa::parse_list(std::string_view(line).substr(18));
   }
   if (placement.allowed_cpus.empty() || placement.allowed_memory_nodes.empty())
-    throw std::runtime_error("Cannot determine the resources permitted to Wolf for a loose NUMA guest");
+    throw std::runtime_error("Cannot determine the resources permitted to Wolf for an app container");
+  placement.cpus = placement.allowed_cpus;
   return placement;
 }
 } // namespace
 #endif
 
-boost::json::object
-with_numa_placement(boost::json::object options, const wolf::numa::Placement &placement, wolf::numa::Mode mode) {
+boost::json::object with_numa_placement(boost::json::object options, const wolf::numa::Placement &placement) {
   auto &host_value = options["HostConfig"];
   if (host_value.is_null())
     host_value = boost::json::object{};
@@ -42,14 +42,29 @@ with_numa_placement(boost::json::object options, const wolf::numa::Placement &pl
     return wolf::numa::format_list(selected);
   };
   // Validate both before changing either. Empty explicit Docker masks mean unrestricted.
-  const auto cpus =
-      intersect_local("CpusetCpus", mode == wolf::numa::Mode::strict ? placement.cpus : placement.allowed_cpus);
-  const auto mems = intersect_local(
-      "CpusetMems",
-      mode == wolf::numa::Mode::strict ? placement.memory_nodes : placement.allowed_memory_nodes);
+  const auto cpus = intersect_local("CpusetCpus", placement.cpus);
+  // Keep all permitted RAM nodes available: the exec launcher prefers local RAM with fallback.
+  const auto mems = intersect_local("CpusetMems", placement.allowed_memory_nodes);
   host["CpusetCpus"] = cpus;
   host["CpusetMems"] = mems;
   return options;
+}
+
+NumaGuestOptions
+with_numa_guest_policy(boost::json::object options, const wolf::numa::Placement &placement, wolf::numa::Mode mode) {
+  if (mode != wolf::numa::Mode::off) {
+    try {
+      return {with_numa_placement(options, placement), true};
+    } catch (const std::exception &) {
+      if (mode != wolf::numa::Mode::automatic)
+        throw;
+    }
+  }
+  // Docker creates a sibling cgroup: fallback must still intersect the app's
+  // restrictions with Wolf's full captured allowance, never the daemon's limits.
+  auto permitted = placement;
+  permitted.cpus = permitted.allowed_cpus;
+  return {with_numa_placement(std::move(options), permitted), false};
 }
 
 boost::json::object with_numa_bootstrap(boost::json::object options,
@@ -80,7 +95,6 @@ boost::json::object with_numa_bootstrap(boost::json::object options,
   if (entry.empty() && command.empty())
     throw std::runtime_error("NUMA launcher requires an image or app command");
   boost::json::array launcher{"/run/wolf-numa-run",
-                              "loose",
                               std::to_string(placement.node),
                               wolf::numa::format_list(placement.cpus),
                               "--"};
@@ -96,7 +110,7 @@ boost::json::object with_numa_bootstrap(boost::json::object options,
   };
   const auto *dropped = host.if_contains("CapDrop");
   if (dropped && std::any_of(dropped->as_array().begin(), dropped->as_array().end(), matches)) {
-    logs::log(logs::warning, "[NUMA] App drops SYS_NICE: the loose launcher may be unable to prefer local RAM");
+    logs::log(logs::warning, "[NUMA] App drops SYS_NICE: the launcher may be unable to prefer local RAM");
   } else {
     auto &caps = host["CapAdd"];
     if (caps.is_null())
@@ -207,13 +221,13 @@ void RunDocker::run(std::string_view session_id,
                     const immer::map<std::string, std::string> &env_variables,
                     std::string_view render_node) {
 
-  const auto locality = wolf::numa::enabled() ? wolf::numa::resolve(render_node) : wolf::numa::Resolution{};
-  const auto numa_mode = wolf::numa::enabled() ? wolf::numa::read_mode() : wolf::numa::Mode::loose;
-  if (locality.conflict && numa_mode == wolf::numa::Mode::strict) {
+  const auto numa_mode = wolf::numa::read_mode();
+  const auto locality = wolf::numa::resolve(render_node, {}, numa_mode);
+  if (locality.conflict) {
     logs::log(logs::error, "[NUMA] Refusing app {} on {}: {}", session_id, render_node, locality.reason);
     return;
   }
-  if (wolf::numa::enabled() && !locality.placement)
+  if (numa_mode != wolf::numa::Mode::off && !locality.placement)
     logs::log(logs::warning, "[NUMA] App {} on {}: {}", session_id, render_node, locality.reason);
 
   const bool isolate_mesa = env_variables.find("DRI_PRIME") != nullptr;
@@ -431,13 +445,12 @@ void RunDocker::run(std::string_view session_id,
     final_json_opts = boost::json::serialize(with_hotplug_capabilities(utils::parse_json(final_json_opts).as_object()));
 
 #ifdef __linux__
-  if (wolf::numa::enabled() && !locality.placement) {
+  if (!locality.placement) {
     // The daemon launches siblings, so they do not inherit Wolf's cpuset. Even
     // when local placement is unavailable, preserve its operator resource limits.
     try {
-      final_json_opts = boost::json::serialize(with_numa_placement(utils::parse_json(final_json_opts).as_object(),
-                                                                   permitted_guest_resources(),
-                                                                   wolf::numa::Mode::loose));
+      final_json_opts = boost::json::serialize(
+          with_numa_placement(utils::parse_json(final_json_opts).as_object(), permitted_guest_resources()));
     } catch (const std::exception &error) {
       logs::log(logs::error, "[NUMA] Refusing app {}: {}", session_id, error.what());
       return;
@@ -447,9 +460,10 @@ void RunDocker::run(std::string_view session_id,
 
   if (locality.placement) {
     try {
-      auto options =
-          with_numa_placement(utils::parse_json(final_json_opts).as_object(), *locality.placement, numa_mode);
-      if (numa_mode == wolf::numa::Mode::loose) {
+      auto policy =
+          with_numa_guest_policy(utils::parse_json(final_json_opts).as_object(), *locality.placement, numa_mode);
+      auto options = std::move(policy.options);
+      if (policy.placed) {
         const auto helper = std::find_if(mounts.begin(), mounts.end(), [](const auto &mount) {
           return mount.destination == "/run/wolf-numa-run";
         });
@@ -466,14 +480,24 @@ void RunDocker::run(std::string_view session_id,
       }
       final_json_opts = boost::json::serialize(options);
       const auto &host = options.at("HostConfig").as_object();
-      logs::log(logs::info,
-                "[NUMA] App {} GPU {}: mode {}, local node {}, eligible CPUs {}, eligible memory nodes {}",
-                session_id,
-                render_node,
-                wolf::numa::mode_name(numa_mode),
-                locality.placement->node,
-                std::string_view(host.at("CpusetCpus").as_string()),
-                std::string_view(host.at("CpusetMems").as_string()));
+      if (policy.placed) {
+        logs::log(logs::info,
+                  "[NUMA] App {} GPU {}: mode {}, local node {}, local CPUs {}, permitted memory nodes {}",
+                  session_id,
+                  render_node,
+                  wolf::numa::mode_name(numa_mode),
+                  locality.placement->node,
+                  std::string_view(host.at("CpusetCpus").as_string()),
+                  std::string_view(host.at("CpusetMems").as_string()));
+      } else {
+        logs::log(logs::warning,
+                  "[NUMA] App {} GPU {}: auto fallback because app resource limits exclude local placement; "
+                  "permitted CPUs {}, permitted memory nodes {}",
+                  session_id,
+                  render_node,
+                  std::string_view(host.at("CpusetCpus").as_string()),
+                  std::string_view(host.at("CpusetMems").as_string()));
+      }
     } catch (const std::exception &error) {
       logs::log(logs::error, "[NUMA] Refusing app {}: {}", session_id, error.what());
       return;
