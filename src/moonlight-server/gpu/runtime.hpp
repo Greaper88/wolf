@@ -12,7 +12,15 @@ public:
   using Generation = std::function<std::string()>;
   using Probe = std::function<EncoderProbeResult(const Device &, Codec, std::stop_token)>;
   using RayProbe = std::function<RayTracingResult(const Device &, std::stop_token)>;
-  Runtime(Options options, Inventory inventory, Generation generation, Probe probe, RayProbe ray_probe = {});
+  // Optional telemetry module; absent on hosts without useful NUMA topology.
+  // Invoked on the existing refresh worker and fresh, unpinned admissions only.
+  using Ranking = std::function<void(std::vector<Device> &)>;
+  Runtime(Options options,
+          Inventory inventory,
+          Generation generation,
+          Probe probe,
+          RayProbe ray_probe = {},
+          Ranking ranking = {});
   ~Runtime();
   Runtime(const Runtime &) = delete;
   Runtime &operator=(const Runtime &) = delete;
@@ -41,11 +49,13 @@ public:
 
 private:
   void verify(std::stop_token stop);
+  void rank(std::vector<Device> &devices);
   Options options_;
   Inventory inventory_;
   Generation generation_;
   Probe probe_;
   RayProbe ray_probe_;
+  Ranking ranking_;
   CapabilityCache cache_;
   Admission admission_;
   std::mutex mutex_;

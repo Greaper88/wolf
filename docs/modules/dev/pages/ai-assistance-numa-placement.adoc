@@ -33,6 +33,17 @@ and audio startup receive placement. Manual split encoders honor
 later producer switches. Existing/shared allocations and global driver threads
 are outside the scoped allocation policy.
 
+Fresh automatic GPU assignments also have an optional GPU-local CPU-load band.
+It activates only with NUMA enabled and usable multi-node GPU topology, on either
+single- or multi-socket hosts. Uniform-memory hosts do not sample CPU counters
+for it. The metric uses the selected GPU node's CPUs intersected with Wolf's
+allowed CPU mask, rather than a global CPU-load estimate. Existing eligibility,
+pool, session-count, encoder-load, and GPU-load decisions precede this band;
+VRAM ranking follows it. Unknown, invalid, or stale CPU telemetry skips the
+optional comparison without disqualifying a device. There is no added setting,
+CPU spillover controller, or migration of existing, retained, manual, or pinned
+assignments.
+
 == Validation and limits
 
 Regression coverage includes topology and operator limits, automatic detection,
@@ -43,11 +54,21 @@ for Docker seccomp restrictions. The static launcher tests also check literal
 arguments, PID, environment, working directory, signals, and exit status.
 
 The combined Wolf/server, test executable, and static launcher build passed.
-The offline per-case CTest run passed all 75 selected tests; the physical VA
+The offline per-case CTest run passed all 76 selected tests; the physical VA
 test and unrelated network icon-API case were excluded. With `SYS_NICE`, the
-NUMA suite passed 142 assertions across 11 cases, and all eight launcher tests
-passed as both root and user 1000. Dependency-free checks passed 85 checks on
-Linux and 17 with a simulated non-Linux platform.
+NUMA suite passed 142 assertions across 11 cases. The CPU-load extension passed
+165 selector/NVML checks, 114 runtime/process checks, and 48 sampler checks on
+Linux plus six sampler checks with a simulated non-Linux platform.
+
+A read-only probe on the actual four-GPU host measured each GPU against its
+correct permitted NUMA CPU set. GPUs sharing a node received identical load
+values; the first sample stayed unknown, off mode performed zero counter reads,
+and the probe left CPU affinity unchanged. The current build and CPU-load
+evidence are in the sibling `wolf-numa-load-validation` directory.
+
+Additional placement-baseline checks passed all eight launcher tests as both
+root and user 1000, plus 85 dependency-free Linux checks and 17 with a simulated
+non-Linux platform.
 
 Disposable-container checks covered all four GPUs in auto/on/off. Auto and on
 kept CPU affinity local for each scope, placed each fresh 32 MiB anonymous
@@ -60,8 +81,7 @@ Read-only inspection of a running game found remote CPU execution despite local
 RAM allocation under the earlier policy. The sampled logs and resource counters
 did not establish a stutter cause. Persistent local CPU affinity removes that
 placement mismatch; its effect on frame pacing still requires comparison under
-the same workload. This document does not claim a proven stutter fix or a
-rollout of the revised setting.
+the same workload. This document does not claim a proven stutter fix.
 
 == Preserve the deployed reconnect repair
 

@@ -44,6 +44,28 @@ Merge these settings into the saved Compose service, then recreate Wolf through
 Compose. Values are case insensitive; other values are configuration errors.
 Existing apps must be stopped and relaunched to receive changed placement.
 
+== NUMA load and automatic GPU selection
+
+For fresh automatic GPU assignments, Wolf can prefer a GPU whose local CPUs are
+less busy. This applies to usable multi-node GPU topology on hosts with one or
+several CPU sockets. The load estimate covers only CPUs local to that GPU and
+permitted by Wolf's operator CPU limits; it is not the host-wide CPU average.
+
+This comparison is active only when `WOLF_NUMA_MODE` is `auto` or `on` and usable
+multi-node GPU locality is detected. Uniform-memory hosts do not sample CPU
+counters for this ranking, and `off` disables it. No additional setting is needed.
+
+CPU load breaks otherwise comparable choices after the existing device
+eligibility checks, preferred/fallback pools, session counts, encoder-load band,
+and GPU-load band, and before VRAM usage. It cannot promote an ineligible GPU or
+bypass those earlier preferences. Unknown, invalid, or stale CPU samples do not
+exclude a GPU; Wolf skips this optional comparison when usable samples are
+incomplete and continues with the existing ranking.
+
+Running apps, retained apps, reconnects, and manually selected or pinned GPUs
+keep their existing assignment. This ranking neither migrates apps nor moves
+threads or memory between nodes after launch.
+
 == App containers and workers
 
 Docker guests receive GPU-local `HostConfig.CpusetCpus`, intersected with

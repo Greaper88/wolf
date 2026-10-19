@@ -11,6 +11,7 @@
 #include <filesystem>
 #include <gpu/discovery.hpp>
 #include <gpu/numa.hpp>
+#include <gpu/numa_load.hpp>
 #include <gpu/probe_process.hpp>
 #include <immer/array_transient.hpp>
 #include <immer/map_transient.hpp>
@@ -111,13 +112,23 @@ auto initialize(std::string_view config_file, std::string_view pkey_filename, st
   auto running_sessions = std::make_shared<immer::atom<immer::vector<events::StreamSession>>>();
   auto gpu_options = wolf::gpu::read_options();
   // Validate configuration before any detached session workers can read it.
-  logs::log(logs::info, "[NUMA] Placement mode: {}", wolf::numa::mode_name(wolf::numa::read_mode()));
+  const auto numa_mode = wolf::numa::read_mode();
+  logs::log(logs::info, "[NUMA] Placement mode: {}", wolf::numa::mode_name(numa_mode));
   std::shared_ptr<wolf::gpu::Runtime> gpu_runtime;
   if (gpu_options.enabled()) {
     logs::log(logs::info,
               "[GPU] Selection policy: prefer ray tracing={}, allow last resort={}",
               gpu_options.prefer_ray_tracing,
               gpu_options.allow_last_resort);
+    wolf::gpu::LoadRanking cpu_ranking;
+    if (numa_mode != wolf::numa::Mode::off) {
+      try {
+        cpu_ranking = wolf::gpu::make_numa_load_ranking(wolf::gpu::discover(), numa_mode);
+      } catch (const std::exception &error) {
+        logs::log(logs::warning, "[NUMA] CPU-load ranking unavailable: {}", error.what());
+      }
+    }
+    logs::log(logs::info, "[NUMA] GPU-local CPU-load ranking: {}", cpu_ranking ? "enabled" : "inactive");
     gpu_runtime = std::make_shared<wolf::gpu::Runtime>(
         gpu_options,
         [] { return wolf::gpu::discover(); },
@@ -151,7 +162,8 @@ auto initialize(std::string_view config_file, std::string_view pkey_filename, st
                                                      : "unverified; last resort",
                     result.reason);
           return result;
-        });
+        },
+        std::move(cpu_ranking));
   }
   auto config = load_config(config_file, event_bus, running_sessions);
 

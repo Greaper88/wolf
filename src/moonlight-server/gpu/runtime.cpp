@@ -1,11 +1,23 @@
 #include "runtime.hpp"
 
 namespace wolf::gpu {
-Runtime::Runtime(Options options, Inventory inventory, Generation generation, Probe probe, RayProbe ray_probe)
+Runtime::Runtime(
+    Options options, Inventory inventory, Generation generation, Probe probe, RayProbe ray_probe, Ranking ranking)
     : options_(std::move(options)), inventory_(std::move(inventory)), generation_(std::move(generation)),
-      probe_(std::move(probe)), ray_probe_(std::move(ray_probe)) {
+      probe_(std::move(probe)), ray_probe_(std::move(ray_probe)), ranking_(std::move(ranking)) {
   if (options_.enabled())
     worker_ = std::jthread([this](std::stop_token stop) { verify(stop); });
+}
+void Runtime::rank(std::vector<Device> &devices) {
+  if (!ranking_)
+    return;
+  try {
+    ranking_(devices);
+  } catch (...) {
+    // Optional CPU telemetry must never prevent an otherwise valid GPU launch.
+    for (auto &device : devices)
+      device.local_cpu_percent.reset();
+  }
 }
 Runtime::~Runtime() {
   worker_.request_stop();
@@ -43,6 +55,8 @@ Runtime::LaunchResult Runtime::prepare(const std::string &session_id, const std:
         auto devices = inventory_();
         if (!device_id.empty())
           std::erase_if(devices, [&](const auto &device) { return device.id != device_id; });
+        else
+          rank(devices);
         auto generation = generation_();
         sampled_generation = generation;
         for (auto &device : devices) {
@@ -147,6 +161,7 @@ void Runtime::verify(std::stop_token stop) {
       auto devices = inventory_();
       auto generation = generation_();
       std::vector<std::string> present;
+      rank(devices);
       for (const auto &device : devices)
         if (device.accessible && !blacklisted(device, options_))
           present.push_back(device.id);
