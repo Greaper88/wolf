@@ -1,0 +1,102 @@
+= AI assistance disclosure: ray-tracing preference and last-resort policy
+
+AI-Agent: ChatGPT Codex
+
+AI-Model-Version: GPT-6.1 Sol Extra High (client-displayed model label supplied by maintainer)
+
+AI-Inference-Date: 2026-10-11 00:33:38 UTC
+
+The serving variant is not independently exposed to the agent. The label follows
+the maintainer's earlier client screenshot. This timestamp records preparation
+of the disclosure; implementation and validation span this session.
+
+== Requested behavior
+
+Implemented on `dev-gpu-selection`:
+
+* `WOLF_GPU_PREFER_RAY_TRACING=FALSE`: opt-in preference for verified RT hardware
+  with usable Vulkan RT features. Non-RT/unverified devices become fallback.
+* `WOLF_GPU_ALLOW_LAST_RESORT=TRUE`: fallback is available by default. Turning it
+  off excludes existing integrated/shared-memory/admin-designated fallback GPUs
+  and, when RT preference is on, non-RT/unverified cards from new assignments.
+* Existing fallback classifications retain lower priority within each RT group.
+  Verified RT fallback hardware precedes non-RT hardware when fallback is allowed.
+* Pinned reconnects retain their GPU without reapplying this placement restriction;
+  memory/encoder/device gates and the explicit blacklist still apply.
+* Codec advertisement respects excluded fallback devices, and the existing manual
+  render/encoder override and automatic-selection-off paths are unchanged.
+
+Individual-card exclusions continue to use `WOLF_GPU_BLACKLIST` in Compose. No
+card-specific PCI/model blacklist was added. The existing virtual-driver policy
+was not changed. Tests exclude the RX 7600 through the environment variable.
+
+== Detection and cache
+
+The optional Python standard-library probe uses native public APIs through ctypes.
+AMD graphics IP (GFX10.3/11/12) supplies evidence of dedicated ray accelerators;
+NVIDIA uses the exact PCI-bound CUDA device and OptiX's RT-core version property.
+Pre-Turing NVIDIA compute capability establishes absence of RT cores; later compute
+capability alone never certifies support. OptiX API table layouts are public ABI
+facts for supported SDK versions; no SDK headers/implementation are redistributed.
+Intel ANV's exposed hardware RT feature path is recognized; other unverified
+hardware/query paths remain unknown rather than certified.
+
+Vulkan devices match the requested render major/minor and/or PCI identity, with
+conflicting identities rejected. CPU/software devices cannot qualify. The probe
+requires acceleration structures/buffer addresses and ray-query or RT-pipeline
+feature bits, then creates/destroys a headless logical device with those features.
+Known Mesa emulation overrides are not certified. Failures, missing libraries,
+unsupported ABI queries, crashes and timeouts remain unverified fallback results.
+
+The server's isolated child replaces itself with Python, retaining the existing
+bounded deadline/result-pipe handling. Driver calls are outside the live process.
+RT results share the encoder cache's device/generation revision and invalidation.
+The RT probe is skipped with the default preference off; app admission and codec
+advertisement only read cached results. CMake installs the helper beside the
+manual/diagnostic binaries; the image Dockerfile includes it beside Wolf.
+
+This verifies dedicated hardware evidence and driver feature enablement. It does
+not dispatch a ray-traced scene, measure RT throughput, or guarantee every game,
+Proton version or guest app image works. Positive RT-core detection on a real
+RTX card awaits hardware; its property/ABI/cleanup path is covered by mocks.
+
+== Validation
+
+* The server and Catch2 binary built successfully in the isolated cached builder.
+* Of 54 selected CTest cases, 53 passed and one opt-in VA hardware sharing case
+  skipped. Four unbuilt third-party Simple-Web-Server tests were excluded.
+* Six GPU suites cover defaults, invalid settings, strict/fallback ordering,
+  explicit blacklist precedence, pinned reconnects, cached probe reuse/refresh,
+  codec advertisement and malformed/deadline-limited child responses.
+* Thirteen Python cases cover physical identity conflicts, software/emulated
+  rejection, unknown hardware, actual RT feature bits, query-only/pipeline-only
+  devices, device-creation failures and NVIDIA RT-core property/cleanup behavior.
+* Headless host queries found RX 7600 hardware/Vulkan RT support and no dedicated
+  RT cores on either GTX 1080. Host Intel identity was unverified; the isolated
+  container identified the HD 630 but found no Vulkan RT feature support.
+* A separate local image `wolf:rt-selection-dev` combined the built server/helper
+  with the unchanged tested runtime. Isolated socket-API sessions selected the
+  RX 7600 in strict RT mode and a GTX 1080 when the RX 7600 was blacklisted and
+  fallback was enabled. Existing iGPU fallback priority was preserved.
+* With the RX 7600 blacklisted and fallback disabled, an actual session request
+  returned HTTP 503 with an explicit hardware-RT policy rejection. Temporary test
+  servers/sessions were removed and the cached builder was stopped afterwards.
+
+The existing live Wolf service, user profiles and Compose file were not changed.
+The primary branch, Wolf-UI and GOW sources were not modified.
+
+== Tools and primary references
+
+Codex command/execution/polling and patch tools, UTC clock and web search/open;
+Bash, Python 3 standard library/ctypes/unittest/urllib/tarfile/zipfile; Git and
+ripgrep; Docker Engine, native CDI, inspect/logs/exec/copy and BuildKit; CMake,
+Ninja, CTest, Catch2, ccache and checksum-verified clang-format 18.1.8. No delegated
+agents were used. No host driver, kernel mode, live service or client setting was
+changed for these tests.
+
+* https://docs.vulkan.org/guide/latest/extensions/ray_tracing.html
+* https://github.com/KhronosGroup/Vulkan-Headers/blob/main/include/vulkan/vulkan_core.h
+* https://docs.mesa3d.org/envvars.html
+* https://docs.mesa3d.org/drivers/radv.html
+* https://github.com/NVIDIA/optix-dev
+* https://raytracing-docs.nvidia.com/optix8/api/group__optix__types.html

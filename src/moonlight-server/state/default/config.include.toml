@@ -440,7 +440,7 @@ video/x-h265, profile=main, stream-format=byte-stream\
 plugin_name = "nvcodec"
 check_elements = ["nvh264enc", "cudaconvertscale", "cudaupload"]
 encoder_pipeline = """
-nvh264enc preset=low-latency-hq zerolatency=true gop-size=0 rc-mode=cbr-ld-hq bitrate={bitrate} vbv-buffer-size={vbv_buffer_size} aud=false !
+nvh264enc preset=p1 tune=ultra-low-latency zerolatency=true gop-size=-1 rc-mode=cbr bitrate={bitrate} vbv-buffer-size={vbv_buffer_size} aud=false !
 h264parse !
 video/x-h264, profile=main, stream-format=byte-stream\
 """

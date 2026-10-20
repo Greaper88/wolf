@@ -1,0 +1,113 @@
+= NVIDIA development: automatic app driver-volume provisioning
+
+AI-Agent: ChatGPT Codex
+
+AI-Model-Version: GPT-6.1 Sol Extra High (client-displayed model label supplied by maintainer)
+
+AI-Inference-Date: 2026-10-09 07:18:56 UTC
+
+== Findings
+
+The maintainer reported that Plasma applications, especially Firefox, could not
+launch and Steam stopped before presenting its UI. DBus services were responding.
+The native CDI specification omitted 32-bit NVIDIA libraries even though matching
+host packages were installed. Steam's 32-bit client consequently tried Mesa's
+Nouveau path and stalled during GLX initialization.
+
+With Plasma's actual unmasked-proc settings, an isolated container reproduced
+Bubblewrap's `Can't mount proc on /proc` failure. Removing only the CDI-created
+`/proc/driver/nvidia/params` bind inside that disposable container changed the
+sandbox test from failure to success while its assigned GPU remained usable.
+The first reproduction used Docker's default proc masks and still failed after
+that bind was removed; matching the real app's settings isolated the CDI cause.
+No host proc mount, AppArmor policy or kernel setting was changed.
+
+== Implementation
+
+Wolf startup now calls a Python standard-library helper before starting the server.
+Without a loaded NVIDIA module it makes no Docker or NVIDIA provisioning calls.
+`auto` mode builds a version-matched driver-only image and volume on first use;
+`volume`, `toolkit` and `manual` provide explicit alternatives.
+
+The packaged Dockerfile is adapted from GOW's driver-image recipe and downloads
+the installer matching the loaded kernel module. It explicitly excludes kernel
+module installation. A manifest records the driver version, file SHA-256 hashes
+and symlink targets; startup checks 64-bit/32-bit required libraries, GBM and the
+manifest. A new generation is populated and independently checked before its
+name is exported to the Wolf process. Old volumes are not overwritten or deleted;
+only a failed, unpublished candidate may be removed.
+
+App driver mounts are read-only. Existing NVIDIA GPU UUID/device isolation and
+CUDA/NVENC selection stay in effect, while volume-backed apps avoid CDI's proc
+bind mount. Wolf itself still uses its existing CDI library/device injection.
+This does not yet implement a universal Compose setup without server-side NVIDIA
+device provisioning. Automatic packaging currently targets Linux x86_64/Docker.
+
+The temporary GOW GBM path changes were reverted in the isolated
+`gow-nvidia-gbm-dev` worktree, and `gow/plasma:nvidia-gbm-dev` was removed.
+Greaper's Plasma app reference was restored to the original `gow/plasma:local`.
+The original GOW checkout stayed unchanged. Protected before/after profile and
+app-restart backups remain in the Wolf state volume.
+
+== Validation and rollout
+
+* Fourteen focused policy/manifest tests passed: non-NVIDIA skip, toolkit opt-out,
+  offline cache reuse, new driver generations, damaged/missing/wrong-architecture
+  files, altered links, failed candidate cleanup and explicit-volume preservation.
+* Wolf built successfully; clang-format 18.1.8 was applied, the focused GPU
+  isolation suite passed, and the changed source passed `git diff --check`.
+* Driver package `580.178.04` was downloaded from NVIDIA and built through the
+  Docker Engine API. Both the package and populated volume passed validation.
+* An isolated Wolf server reused the volume automatically. A separate original
+  Plasma image reported NVIDIA EGL/OpenGL compositing and Xwayland OpenGL 4.6.
+  Only the assigned GPU1 UUID was visible; its driver mount was read-only.
+* Bubblewrap and the Firefox Flatpak sandbox passed. Firefox, Konsole and Kate
+  opened in the disposable desktop. The shared Flatpak installation was mounted
+  read-only; user Firefox data was not used for that test.
+* Steam's actual i386 and x86_64 `check-gl` diagnostics exited successfully and
+  loaded NVIDIA GLX from `lib32` and `lib`, respectively.
+* The test desktop produced 118 HEVC frame indices; FFprobe decoded 117 frames.
+  The decoded image visibly showed Firefox in Plasma. The stream used CUDA
+  producer buffers and the selected GPU's NVENC encoder.
+* A complete verified-cache startup check took approximately 3.57 seconds with
+  no download/build. The disposable server, sessions and app containers were
+  stopped and removed; the named driver volume was retained.
+
+Automatic approval review initially rejected stopping both live apps because
+the earlier authorization covered only Plasma. The maintainer then explicitly
+approved stopping Plasma and Steam and restarting Wolf. Their existing state
+folders and profiles were backed up/retained, Wolf alone was recreated, and both
+apps were relaunched. WolfDen and unrelated host containers remained running.
+
+The live Plasma again reported NVIDIA hardware compositing, and its Firefox
+Flatpak sandbox passed. Steam started its UI/webhelper processes and reported the
+GTX 1080 with NVIDIA proprietary driver 580.178.04. Both real app containers saw
+only GPU0's UUID; H.264/HEVC CUDA zero-copy startup checks passed on both cards.
+The temporary relaunch session was removed. No games or further sharing tests
+were run during this change. No Git or GHCR push was performed.
+
+Current local image: `wolf:nvidia-gpu-selection-dev`
+
+Image ID: `sha256:5a3c4b248faa25df15f6d9e10c5dd6bddc4f53fc1eb5ea83e86e953153e77111`
+
+Managed volume: `wolf-nvidia-driver-580.178.04-b02af0459444`
+
+Previous image retained as `wolf:nvidia-toolkit-before-volume-20261009`.
+
+== Tools and primary references
+
+Codex exec, command, patch, image-view, UTC clock and asynchronous user-input tools;
+Bash, Python 3/standard library, unittest, Git, ripgrep and clang-format; Docker
+Engine REST API, BuildKit, native CDI, logs/inspect/exec/copy and Compose; NVIDIA's
+driver-only installer and nvidia-smi; journal/audit and proc/mount inspection;
+KWin DBus through qdbus-qt6, glxinfo, Bubblewrap, Flatpak and Steam runtime graphics
+diagnostics; GStreamer/RTSP/RTP capture, FFmpeg and FFprobe. No delegated agents
+were used. The host driver and kernel modules were not replaced.
+
+Primary materials consulted: the local GOW driver Dockerfile and startup scripts,
+the installed `nvidia-ctk cdi generate` help/specification, NVIDIA Container Toolkit
+source and specialized Docker documentation, and the upstream Wolf quickstart:
+
+* https://github.com/NVIDIA/nvidia-container-toolkit/blob/v1.20.1/pkg/nvcdi/driver-nvml.go
+* https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/docker-specialized.html
+* https://games-on-whales.github.io/wolf/stable/user/quickstart.html

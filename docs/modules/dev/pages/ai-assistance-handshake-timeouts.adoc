@@ -1,0 +1,114 @@
+= Bound unfinished GPU admissions and protect newer reconnects
+
+AI-Agent: ChatGPT Codex
+
+AI-Model-Version: GPT-6 family; exact serving version and reasoning setting unavailable
+
+AI-Inference-Date: 2026-10-17 12:34:30 UTC
+
+== Problem
+
+HTTPS launch/resume reserves encoder demand before RTSP negotiation starts.
+A client that abandons its connection before ANNOUNCE never creates the RTP
+waiter, so the existing RTP timeout cannot release that pending admission.
+Three interrupted launchers can leave three idle GPUs marked as starting
+indefinitely. Repeated resume calls reused that admission without clearing it.
+
+== Change
+
+Unclaimed encoder admissions now have a 30-second monotonic deadline.
+The next admission/encoder-start operation expires overdue handshakes back to
+retained state. The app and its GPU assignment remain intact. Repeated calls
+within an admitted handshake do not extend its original deadline. A late
+encoder start must pass admission again. Actual encoder startup and running
+encoders are exempt; cancelled teardown holds its capacity until its owners
+exit. Same-reservation handoffs also have a bounded unclaimed interval.
+
+The existing RTP video timeout now checks the current connection credentials
+under the same transition lock used by HTTPS resume. An old waiter cannot
+pause a newer connection reusing that client ID, and a duplicate waiter cannot
+pause a stream whose video worker is already running. Credentials are never
+included in the diagnostic message.
+
+== Historical diagnosis and limits
+
+Saved logs separately showed repeated RTSP ambiguous legacy-session failures
+for clients sharing an address after successful GPU admission. The timeout
+prevents abandoned handshakes from indefinitely blocking later GPU admission;
+it does not provide the missing client identity or resolve that RTSP ambiguity.
+No utilization thresholds, codec checks, GPU isolation or app pinning rules
+were relaxed. Historical UI crashes following server shutdown do not establish
+a GPU driver fault. The reboot also restored an older Wolf container after a
+Docker duplicate-name registration conflict; that is a separate deployment
+issue, not a selector-policy change.
+
+== Validation
+
+A clock-injected CPU regression covers three abandoned reconnects, recovery
+at the deadline, retries that cannot extend it, preserved pins, late starts,
+new admissions protected from old deadlines, actual encoder startup/running
+streams, and cancelled teardown capacity. Independent session tests cover
+stale/current RTP identities, live workers and removed/reused session IDs.
+The full Wolf server and test executable builds passed. All five standalone
+GPU suites passed, including 123 pipeline/lifecycle checks. The shared-video
+suite passed 119 assertions in seven test cases with hardware-only checks
+excluded; the API suite passed 118 assertions in nine test cases. These tests
+used private runtime directories and no live Docker or GPU workloads. Existing
+compiler deprecation warnings were unrelated to this change. Formatting and
+Git whitespace checks passed.
+
+The already-running-worker timeout check covers an established worker; a
+same-generation duplicate waiter racing a simultaneous worker start remains
+an existing boundary case outside the admission-lease repair.
+
+The maintainer also requested that live updates always use saved Compose YAML.
+That workflow is recorded in AGENTS.md. The saved deployment already selected
+the newer image, while Docker restored a conflicting older container record;
+YAML persistence and container-registration recovery are separate concerns.
+A reviewable image-only Compose override is prepared locally. No live server
+was restarted or reconfigured, and no source or registry push was performed.
+Final candidate metadata is recorded in wolf-reconnect-timeout-validation.
+
+== Tools
+
+Codex execution, patching, clock and collaboration tools; parallel code review,
+regression implementation and read-only historical-log analysis; Git, Bash,
+ripgrep, Python 3, Docker, journalctl, CMake, Ninja, the C++ toolchain, Catch2 and
+clang-format 18. Tests use synthetic identities and mocked devices. Private
+connection keys, profile PINs and complete configuration bodies were not
+published. No external messaging or online research was used.
+
+== Approved local rollout
+
+The maintainer explicitly approved applying the tested image and cleaning the
+duplicate Wolf records. Applied at 2026-10-17T12:57:10.825271+00:00 through the saved
+`/root/wolf/docker-compose.yml` and `docker-compose.override.yml`, both selecting
+`wolf:reconnect-timeout-dev` with `pull_policy: never`. The running image is
+`sha256:8d71643b549b9b65287cc3863539c9b497acd5681107d924b4d926fc70e252cc`; the live executable hash matches
+the tested build. The earlier statements about leaving the live stack unchanged
+describe validation before this authorization.
+
+Both Compose files and all four old Wolf/Wolf-Den container record directories
+were privately backed up and their copied files verified. Compose stopped and
+removed the two registered old services. The two unregistered, stopped records
+were archived outside Docker's container-discovery directory. No image layers,
+snapshotter databases or unrelated container records were altered. Compose then
+recreated Wolf and Wolf-Den. Exactly one persistent record per service remains.
+The Docker daemon was not restarted, and unrelated containers retained their
+container IDs, startup times and restart counts. App/profile bind-mounted files
+were preserved.
+
+Post-rollout checks passed: the base and merged saved Compose configurations
+match the running image; Wolf and Wolf-Den are running without restarts; the
+control API, Moonlight serverinfo and Wolf-Den web page respond successfully.
+All four GPUs are accessible with ready cached H.264/HEVC capabilities. Both
+AMD cards and NVIDIA verified zero-copy; Intel remains a CPU-buffer fallback.
+The existing verified NVIDIA driver volume was reused. AV1 remains unavailable
+on this hardware. No GPU utilization thresholds were relaxed.
+
+The image's bundled disclosure captures pre-rollout validation; this section
+records the later approved deployment. At the end of that October 17 rollout,
+all changes were still local and unpushed.
+Additional rollout tools were private Python backup/verification scripts and
+a read-only parallel cleanup review. Service changes used the saved Compose
+configuration throughout.

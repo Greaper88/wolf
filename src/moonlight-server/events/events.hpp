@@ -26,6 +26,11 @@
 #include <state/serialised_config.hpp>
 #include <string_view>
 
+namespace streaming {
+class SharedVideoEncoder;
+class SharedVideoEncoders;
+} // namespace streaming
+
 namespace wolf::core::events {
 
 struct PairSignal {
@@ -112,6 +117,23 @@ struct GpuStreamTarget {
   std::array<std::string, 3> pipelines;
   std::string producer;
   std::string producer_caps;
+  std::shared_ptr<streaming::SharedVideoEncoders> shared_encoders;
+  std::shared_ptr<streaming::SharedVideoEncoder> shared_encoder;
+};
+struct VideoSession;
+// Read-only worker telemetry, independent of automatic GPU admission and routing.
+struct StreamVideoStatus {
+  std::string codec;
+  long bitrate_kbps;
+  int width;
+  int height;
+  int fps;
+  std::string render_node;
+  std::optional<std::string> gpu_id;
+};
+struct StreamMonitoring {
+  std::atomic<std::shared_ptr<const StreamVideoStatus>> video;
+  std::atomic<std::shared_ptr<const std::string>> profile_id;
 };
 struct GpuStreamRoute {
   std::shared_ptr<const GpuStreamTarget> home;
@@ -119,6 +141,8 @@ struct GpuStreamRoute {
   std::shared_ptr<wolf::gpu::Runtime> runtime;
   std::atomic<int> codec{0};
   std::atomic<bool> streaming{false};
+  std::atomic<std::shared_ptr<const std::string>> profile_id;
+  std::atomic<std::shared_ptr<const VideoSession>> negotiated_video;
 };
 struct Lobby {
   const std::string id;
@@ -238,6 +262,9 @@ struct DockerContainerCreated {
   std::string container_id;
   std::string hostname;
   std::string session_id;
+  std::string name;
+  std::string image;
+  std::string render_node;
 };
 
 struct DockerContainerStopped {
@@ -271,6 +298,8 @@ struct GpuEncoderFailed {
 };
 
 struct VideoSession {
+  rfl::Skip<std::shared_ptr<StreamMonitoring>> monitoring;
+  rfl::Skip<std::string> monitoring_codec;
   rfl::Skip<std::shared_ptr<GpuStreamRoute>> gpu_route;
   rfl::Skip<std::shared_ptr<const wolf::gpu::Runtime::Launch>> gpu_launch;
   rfl::Skip<std::shared_ptr<immer::atom<gst_video_context::gst_context_ptr>>> video_context;
@@ -451,6 +480,10 @@ struct StreamSession {
   std::shared_ptr<App> app;
   std::string app_local_state_folder;
   std::string app_host_state_folder;
+
+  // Connection state is shared by protocol copies, including legacy/manual GPU sessions.
+  std::shared_ptr<std::atomic<bool>> connected = std::make_shared<std::atomic<bool>>(false);
+  std::shared_ptr<StreamMonitoring> monitoring = std::make_shared<StreamMonitoring>();
 
   // Populated by launch admission; absent for legacy/manual sessions.
   std::shared_ptr<GpuStreamRoute> gpu_route;

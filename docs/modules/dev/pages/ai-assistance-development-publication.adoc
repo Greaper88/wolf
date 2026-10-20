@@ -1,0 +1,76 @@
+= Development image publication: 2026-10-20
+
+AI-Agent: ChatGPT Codex
+
+AI-Model-Version: GPT-6 family; exact serving version and reasoning setting unavailable
+
+AI-Inference-Date: 2026-10-20
+
+== Scope
+
+The maintainer requested publication of the two development branches and images.
+Promotion to the primary branch and `latest` channel is a separate later action.
+
+* `dev-gpu-selection` publishes `ghcr.io/greaper88/wolf:gpu-selection-dev`.
+* `dev-NUMA-aware` publishes `ghcr.io/greaper88/wolf:numa-aware-dev`.
+* Each publication also retains an immutable `sha-<full source revision>` tag.
+* The companion UI remains `ghcr.io/greaper88/wolf-ui:gpu-selection-dev`.
+
+This publication does not change the running deployment or its saved Compose
+configuration. It does not promote either branch or update `latest`.
+
+== Changes
+
+Commit the previously tested and deployed 30-second admission lease and stale
+RTP waiter repairs in the ordinary GPU-selection branch. The NUMA branch already
+includes the same fixes. The handshake disclosure records their prior validation
+and local rollout; this publication does not claim to repair every reconnect or
+client latency issue.
+
+Add a distinct NUMA development image channel while retaining per-channel build
+caches and full-source-revision image labels. Include `tools/numa-run.c` in the
+NUMA Docker context so clean source builds can compile the guest launcher.
+Document the NUMA image, default `WOLF_NUMA_MODE=auto`, local CPU affinity,
+preferred RAM with fallback, and permission requirements in the branch README.
+Run the CPU-load sampler regression alongside the existing NUMA and launcher
+checks in Linux CI.
+
+Both Dockerfiles pin the tested Ubuntu GStreamer base by immutable digest.
+The mutable upstream `1.26.7` tag had changed to a different distribution, so a
+hosted build could not run the repository's APT installation steps. A filesystem
+export verified Ubuntu 25.04, APT and the existing package-source configuration
+in the pinned base; the configured official package endpoints were reachable.
+
+The hosted matrix built successfully on both architectures, then exposed a
+shared runner dependency gap: `h264parse` was absent in two shared-video tests.
+Install `gstreamer1.0-plugins-bad` alongside the existing base and ugly plug-ins
+so those existing tests can construct their pipelines. This changes the CI
+environment rather than streaming code.
+
+== Validation and limits
+
+The ordinary branch repair was previously built and deployed locally. All five
+standalone GPU suites passed, including 123 lifecycle checks; the shared-video
+suite passed 119 assertions in seven cases, and the API suite passed 118
+assertions in nine cases. Hardware-only tests were excluded from that run.
+
+The NUMA source matches the successful saved build manifest: 76 selected offline
+tests passed, with 142 NUMA assertions across 11 cases under SYS_NICE. Separate
+four-GPU checks verified CPU locality, preferred local allocations, permitted RAM
+fallback, policy restoration and disabled sampling in off mode. Runtime use on a
+dual-socket host with two W6600s and two Quadro RTX 4000s exercised simultaneous
+clients, reconnects and routed sessions. These observations do not constitute a
+controlled frame-pacing or NUMA-on/off benchmark. Sparse AMD VA surface errors
+remain a separate observed issue with no established NUMA cause.
+
+An actual BuildKit context export verifies that the NUMA launcher source is
+included and unrelated tools, tests, documentation and Git data stay excluded.
+Publication receipts and registry verification are kept separately from source
+validation; source tests alone do not establish that an image was published.
+
+== Tools
+
+Codex execution, patching and parallel review; Git and GitHub CLI; Docker and
+BuildKit; Python, SHA-256 checks, CMake, Ninja, GCC, Catch2 and CTest. Private
+configuration, credentials and connection identities are excluded from this
+disclosure and the published build context.

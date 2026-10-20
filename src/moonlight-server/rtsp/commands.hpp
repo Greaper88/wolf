@@ -223,6 +223,10 @@ announce(const RTSP_PACKET &req, const events::StreamSession &session) {
 
   // Video session
   events::VideoSession video = {
+      .monitoring = session.monitoring,
+      .monitoring_codec = std::string(video_format_av1    ? "AV1"
+                                      : video_format_hevc ? "HEVC"
+                                                          : "H.264"),
       .gpu_route = session.gpu_route,
       .gpu_launch = session.gpu_launch,
       .video_context = session.video_context,
@@ -249,6 +253,11 @@ announce(const RTSP_PACKET &req, const events::StreamSession &session) {
       .client_ip = session.ip,
       .rtp_secret_payload = session.rtp_secret_payload,
   };
+  if (session.gpu_route) {
+    auto settings = video;
+    settings.gpu_route = nullptr; // The route owns this snapshot; avoid a reference cycle.
+    session.gpu_route->negotiated_video.store(std::make_shared<const events::VideoSession>(settings));
+  }
   session.event_bus->fire_event(immer::box<events::VideoSession>(video));
 
   // Audio session

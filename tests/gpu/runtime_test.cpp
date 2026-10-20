@@ -23,6 +23,15 @@ template <typename F> void eventually(F condition) {
   }
 }
 int main(int argc, char **argv) {
+  if (argc > 1 && std::string(argv[1]) == "--wolf-ray-tracing-probe") {
+    if (std::string(argv[3]) == "hang")
+      for (;;)
+        pause();
+    std::string reply = std::string(argv[3]) == "bad"       ? "WOLF_RT_V1 5 invalid\n"
+                        : std::string(argv[3]) == "unknown" ? "WOLF_RT_V1 -1 driver-query-failed\n"
+                                                            : "WOLF_RT_V1 1 hardware-and-vulkan-device-verified\n";
+    return write(3, reply.data(), reply.size()) == static_cast<ssize_t>(reply.size()) ? 0 : 2;
+  }
   if (argc > 1 && std::string(argv[1]) == "--wolf-gpu-probe") {
     if (std::string(argv[3]) == "hang" || (argc == 7 && std::string(argv[3]) == "dma-hang")) {
       for (;;)
@@ -203,6 +212,62 @@ int main(int argc, char **argv) {
     });
     check(runtime.prepare("invalidated").launch != nullptr, "reverified device can be reserved after rollback");
   }
+  // A new client can resume a retained app from a launcher on another GPU.
+  // Rendering load belongs to the existing app; memory and encoder gates remain.
+  {
+    auto other = d;
+    other.id = "0000:09:00.0";
+    other.render_node = "/dev/dri/renderD130";
+    other.driver = "nvidia";
+    std::atomic<double> core = 0, memory = 10, encoder = 0;
+    Runtime runtime(
+        Options{},
+        [&] {
+          auto app_gpu = d;
+          app_gpu.gpu_percent = core;
+          app_gpu.vram_percent = memory;
+          app_gpu.encoder_percent = encoder;
+          return std::vector{app_gpu, other};
+        },
+        [] { return "cross-device"; },
+        [](const Device &device, Codec codec, std::stop_token) {
+          return EncoderProbeResult{EncoderBinding{"vah264enc", "va", codec, device.render_node, std::nullopt}, {}};
+        });
+    eventually([&] {
+      auto c = runtime.capabilities(other);
+      return c && c->status == CapabilityCache::Status::ready;
+    });
+    auto original = runtime.prepare("original-client", d.id);
+    check(original.launch != nullptr, "original client reserves the app GPU");
+    auto app = runtime.retain("persistent-cross-device-app", *original.launch);
+    check(app.launch != nullptr, "app keeps its GPU reservation");
+    original.launch.reset();
+    auto launcher = runtime.prepare("new-client", other.id);
+    check(launcher.launch != nullptr, "new client launcher can use another GPU");
+    core = 99;
+    auto fresh = runtime.prepare("fresh-viewer", d.id);
+    check(!fresh.launch && fresh.error.find("GPU core saturated") != std::string::npos,
+          "new rendering workload remains rejected on a saturated GPU");
+    auto viewer = runtime.retain("resuming-viewer", *app.launch);
+    check(viewer.launch != nullptr, "viewer retains the app's exact GPU and capabilities");
+    check(runtime.resume(*viewer.launch, launcher.launch.get()).empty(),
+          "cross-GPU reconnect admits an encoder despite existing rendering saturation");
+    check(viewer.launch->device.id == d.id, "reconnect remains pinned to the existing app GPU");
+    viewer.launch.reset();
+    memory = 90;
+    auto low_memory = runtime.retain("resuming-viewer", *app.launch);
+    check(low_memory.launch &&
+              runtime.resume(*low_memory.launch, launcher.launch.get()).find("VRAM saturated") != std::string::npos,
+          "cross-GPU reconnect still rejects saturated VRAM");
+    low_memory.launch.reset();
+    memory = 10;
+    encoder = 99;
+    auto busy_encoder = runtime.retain("resuming-viewer", *app.launch);
+    check(
+        busy_encoder.launch &&
+            runtime.resume(*busy_encoder.launch, launcher.launch.get()).find("encoder hard limit") != std::string::npos,
+        "cross-GPU reconnect still rejects an exhausted encoder");
+  }
   // Optional zero-copy policy must affect admission and advertised codecs, not only pipeline construction.
   for (const auto [required, enabled] : {std::pair{false, true}, {true, true}, {false, false}}) {
     Options options;
@@ -236,6 +301,88 @@ int main(int argc, char **argv) {
       check(!fallback.launch->zero_copy, "fallback uses CPU buffers on its pinned GPU");
     check(runtime.supports(Codec::av1) == !required, "strict policy never advertises unverified zero-copy codec");
   }
+  for (bool zero_copy : {false, true}) {
+    auto nvidia = d;
+    nvidia.driver = "nvidia";
+    Runtime runtime(
+        Options{},
+        [&] { return std::vector{nvidia}; },
+        [] { return "nv1"; },
+        [&](const Device &device, Codec codec, std::stop_token) {
+          if (codec == Codec::av1)
+            return EncoderProbeResult{};
+          EncoderBinding binding{codec == Codec::h264 ? "nvh264enc" : "nvh265enc",
+                                 "nvcodec",
+                                 codec,
+                                 device.render_node,
+                                 0};
+          if (zero_copy)
+            binding.zero_copy_postproc = "cudaconvertscale";
+          return EncoderProbeResult{binding, {}};
+        });
+    eventually([&] {
+      auto c = runtime.capabilities(nvidia);
+      return c && c->status == CapabilityCache::Status::ready;
+    });
+    check(runtime.supports(Codec::h264) && runtime.supports(Codec::hevc),
+          "Moonlight advertises verified NVIDIA codecs in zero-copy and fallback modes");
+    check(!runtime.supports(Codec::av1), "NVIDIA hardware without AV1 never advertises it");
+  }
+  for (bool prefer : {false, true}) {
+    Options policy;
+    policy.prefer_ray_tracing = prefer;
+    policy.allow_last_resort = false;
+    std::atomic<unsigned> ray_queries = 0;
+    std::atomic<bool> supported = true;
+    Runtime runtime(
+        policy,
+        [&] { return std::vector{d}; },
+        [] { return "rt-generation"; },
+        [](const Device &device, Codec codec, std::stop_token) {
+          return EncoderProbeResult{EncoderBinding{"vah264enc", "va", codec, device.render_node, std::nullopt}, {}};
+        },
+        [&](const Device &, std::stop_token) {
+          ++ray_queries;
+          return RayTracingResult{supported.load(), "mock-hardware-query"};
+        });
+    eventually([&] {
+      auto c = runtime.capabilities(d);
+      return c && c->status == CapabilityCache::Status::ready;
+    });
+    check(ray_queries == (prefer ? 1 : 0), "RT probe is opt-in and runs once per cached device");
+    for (int i = 0; i < 10; ++i) {
+      auto launch = runtime.prepare("ray-session-" + std::to_string(i));
+      check(launch.launch && runtime.supports(Codec::hevc),
+            "cached RT support authorizes selection and codec advertisement");
+    }
+    check(ray_queries == (prefer ? 1 : 0), "launches and advertisement do not query RT drivers");
+    auto revision = runtime.capabilities(d)->revision;
+    supported = false;
+    runtime.invalidate(d.id);
+    eventually([&] {
+      auto c = runtime.capabilities(d);
+      return c && c->status == CapabilityCache::Status::ready && c->revision != revision;
+    });
+    check(ray_queries == (prefer ? 2 : 0), "invalidation refreshes RT capability together with encoder results");
+    check((runtime.prepare("after-refresh").launch != nullptr) == !prefer,
+          "disabled fallback excludes failed RT cards only when preference is enabled");
+    check(runtime.supports(Codec::hevc) == !prefer, "strict codec advertisement excludes fallback GPUs");
+  }
+  auto ray = isolated_ray_tracing_probe("/proc/self/exe", d);
+  check(ray.supported == true, "isolated RT reply is accepted");
+  auto ray_device = d;
+  ray_device.id = "unknown";
+  check(!isolated_ray_tracing_probe("/proc/self/exe", ray_device).supported.has_value(), "probe failure stays unknown");
+  ray_device.id = "bad";
+  check(!isolated_ray_tracing_probe("/proc/self/exe", ray_device).supported.has_value(),
+        "malformed RT response is rejected");
+  ray_device.id = "hang";
+  auto started = std::chrono::steady_clock::now();
+  check(!isolated_ray_tracing_probe("/proc/self/exe", ray_device, {}, std::chrono::milliseconds(40))
+             .supported.has_value(),
+        "hung RT child times out");
+  check(std::chrono::steady_clock::now() - started < std::chrono::seconds(1),
+        "RT deadline bounds launch-independent driver work");
   auto encoded = isolated_probe("/proc/self/exe", d, Codec::h264);
   check(encoded.encoder && encoded.encoder->render_node == d.render_node,
         "isolated process returns device-bound result");

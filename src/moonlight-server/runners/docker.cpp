@@ -1,7 +1,70 @@
+#include <cctype>
 #include <gpu/app_isolation.hpp>
 #include <runners/docker.hpp>
 
 namespace wolf::core::docker {
+
+boost::json::object with_hotplug_capabilities(boost::json::object options) {
+  auto &host = options["HostConfig"];
+  if (host.is_null())
+    host = boost::json::object{};
+  auto &caps = host.as_object()["CapAdd"];
+  if (caps.is_null())
+    caps = boost::json::array{};
+
+  // Custom app templates can omit the permissions in Wolf's default templates.
+  // fake-udev needs NET_ADMIN to multicast udev events; device nodes need MKNOD.
+  for (const auto *required : {"NET_ADMIN", "MKNOD"}) {
+    auto matches = [required](const auto &cap) {
+      auto name = std::string(cap.as_string());
+      std::transform(name.begin(), name.end(), name.begin(), [](unsigned char c) { return std::toupper(c); });
+      return name == "ALL" || name == "CAP_ALL" || name == required || name == std::string("CAP_") + required;
+    };
+    if (std::any_of(caps.as_array().begin(), caps.as_array().end(), matches))
+      continue;
+    // Preserve explicit restrictions instead of silently overriding a hardened app.
+    if (auto dropped = host.as_object().if_contains("CapDrop");
+        dropped && dropped->is_array() &&
+        std::any_of(dropped->as_array().begin(), dropped->as_array().end(), matches)) {
+      logs::log(logs::warning, "[DOCKER] Controller hotplug requires {}, but the app explicitly drops it", required);
+      continue;
+    }
+    caps.as_array().push_back(required);
+  }
+  return options;
+}
+
+std::vector<std::string>
+hotplug_command(const std::map<std::string, std::string> &udev_event, const std::string &encoded_event, bool remove) {
+  auto node = udev_event.find("DEVNAME");
+  if (node == udev_event.end())
+    return {"fake-udev", "-m", encoded_event};
+
+  if (remove) {
+    // Cleanup must still run when notification fails, without hiding that failure.
+    return {"/bin/bash",
+            "-c",
+            "status=0; fake-udev -m \"$2\" || status=$?; rm -f -- \"$1\" || exit $?; exit \"$status\"",
+            "wolf-unplug",
+            node->second,
+            encoded_event};
+  }
+
+  // A previous failed unplug may have left this node behind. Reuse a matching
+  // character device, replace stale nodes, and always send the new add event.
+  // Pass values as arguments so paths and event contents are never shell code.
+  return {"/bin/bash",
+          "-c",
+          "mkdir -p -- \"$(dirname -- \"$1\")\" && { "
+          "if [ ! -c \"$1\" ] || [ \"$(stat -c '%t:%T' -- \"$1\")\" != \"$(printf '%x:%x' \"$2\" \"$3\")\" ]; then "
+          "rm -f -- \"$1\" && mknod -- \"$1\" c \"$2\" \"$3\" || exit $?; fi; "
+          "chmod 777 -- \"$1\" && fake-udev -m \"$4\"; }",
+          "wolf-plug",
+          node->second,
+          udev_event.at("MAJOR"),
+          udev_event.at("MINOR"),
+          encoded_event};
+}
 
 void create_udev_hw_files(std::filesystem::path base_hw_db_path,
                           std::vector<std::pair<std::string, std::vector<std::string>>> udev_hw_db_entries) {
@@ -42,10 +105,14 @@ void RunDocker::run(std::string_view session_id,
                     std::string_view render_node) {
 
   const bool isolate_mesa = env_variables.find("DRI_PRIME") != nullptr;
+  const auto nvidia_uuid = env_variables.find("WOLF_NVIDIA_GPU_UUID");
+  const bool isolate_nvidia = nvidia_uuid != nullptr;
   std::vector<std::string> full_env;
   full_env.insert(full_env.end(), this->container.env.begin(), this->container.env.end());
-  if (isolate_mesa)
-    std::erase_if(full_env, wolf::gpu::mesa_selection_env);
+  if (isolate_mesa || isolate_nvidia)
+    std::erase_if(full_env, [](const auto &entry) {
+      return wolf::gpu::mesa_selection_env(entry) || wolf::gpu::nvidia_selection_env(entry);
+    });
   for (const auto &env_var : env_variables) {
     full_env.push_back(fmt::format("{}={}", env_var.first, env_var.second));
   }
@@ -61,7 +128,10 @@ void RunDocker::run(std::string_view session_id,
   std::vector<MountPoint> mounts;
   mounts.insert(mounts.end(), this->container.mounts.begin(), this->container.mounts.end());
   for (const auto &path : paths) {
-    mounts.insert(mounts.end(), MountPoint{.source = path.first, .destination = path.second, .mode = "rw"});
+    mounts.insert(mounts.end(),
+                  MountPoint{.source = path.first,
+                             .destination = path.second,
+                             .mode = path.second == "/usr/nvidia" ? "ro" : "rw"});
   }
 
   // Fake udev
@@ -87,49 +157,36 @@ void RunDocker::run(std::string_view session_id,
               fake_udev_cli_path);
   }
 
-  // Add equivalent of --gpu=all if on NVIDIA without the custom driver volume
   auto final_json_opts = this->base_create_json;
-  if (get_vendor(render_node) == NVIDIA && !utils::get_env("NVIDIA_DRIVER_VOLUME_NAME")) {
-    logs::log(logs::info, "NVIDIA_DRIVER_VOLUME_NAME not set, assuming nvidia driver toolkit is installed..");
-    {
-      auto parsed_json = utils::parse_json(final_json_opts).as_object();
-      auto default_gpu_config = boost::json::array{                    // [
-                                                   boost::json::object{// {
-                                                                       {"DeviceIDs", {"all"}},
-                                                                       {"Capabilities", boost::json::array{{"gpu"}}}}};
-      if (auto host_config_ptr = parsed_json.if_contains("HostConfig")) {
-        auto host_config = host_config_ptr->as_object();
-        if (host_config.find("DeviceRequests") == host_config.end()) {
-          host_config["DeviceRequests"] = default_gpu_config;
-          host_config["Runtime"] = "nvidia";
-          parsed_json["HostConfig"] = host_config;
-          final_json_opts = boost::json::serialize(parsed_json);
-        } else {
-          logs::log(logs::debug, "DeviceRequests manually set in base_create_json, skipping..");
-        }
-      } else {
-        logs::log(logs::warning, "HostConfig not found in base_create_json.");
-        parsed_json["HostConfig"] = boost::json::object{{"DeviceRequests", default_gpu_config}, {"Runtime", "nvidia"}};
-        final_json_opts = boost::json::serialize(parsed_json);
-      }
+  if (isolate_nvidia) {
+    if (!nvidia_uuid->starts_with("GPU-") || nvidia_uuid->size() != 40 ||
+        nvidia_uuid->substr(4).find_first_not_of("0123456789abcdefABCDEF-") != std::string::npos)
+      throw std::runtime_error("Invalid NVIDIA GPU UUID");
+    auto options = utils::parse_json(final_json_opts).as_object();
+    if (!options.if_contains("HostConfig"))
+      options["HostConfig"] = json::object{};
+    auto &host = options["HostConfig"].as_object();
+    auto volume = utils::get_env("NVIDIA_DRIVER_VOLUME_NAME");
+    if (!volume || !*volume) {
+      host["DeviceRequests"] =
+          json::array{json::object{{"Driver", "cdi"}, {"DeviceIDs", json::array{"nvidia.com/gpu=" + *nvidia_uuid}}}};
+      logs::log(logs::info, "[GPU] App {} requests only CDI GPU {}", session_id, *nvidia_uuid);
+    } else {
+      host.erase("DeviceRequests");
     }
-
-    // Setup -e NVIDIA_VISIBLE_DEVICES=all  -e NVIDIA_DRIVER_CAPABILITIES=all if not present
-    {
-      auto nvd_env = std::find_if(full_env.begin(), full_env.end(), [](const std::string &env) {
-        return env.find("NVIDIA_VISIBLE_DEVICES") != std::string::npos;
-      });
-      if (nvd_env == full_env.end()) {
-        full_env.push_back("NVIDIA_VISIBLE_DEVICES=all");
+    host["Runtime"] = "runc";
+    if (auto env = options.if_contains("Env")) {
+      json::array filtered;
+      for (const auto &entry : env->as_array()) {
+        auto value = std::string_view(entry.as_string());
+        if (!wolf::gpu::nvidia_selection_env(value) && !wolf::gpu::mesa_selection_env(value))
+          filtered.push_back(entry);
       }
-
-      auto nvd_caps_env = std::find_if(full_env.begin(), full_env.end(), [](const std::string &env) {
-        return env.find("NVIDIA_DRIVER_CAPABILITIES") != std::string::npos;
-      });
-      if (nvd_caps_env == full_env.end()) {
-        full_env.push_back("NVIDIA_DRIVER_CAPABILITIES=all");
-      }
+      options["Env"] = std::move(filtered);
     }
+    // Native CDI supplies libraries and visibility; suppress legacy runtime injection.
+    full_env.push_back("NVIDIA_VISIBLE_DEVICES=void");
+    final_json_opts = json::serialize(options);
   }
 
   { // Setup Wolf socket path (if the runner needs it, and it hasn't been overridden via ENV)
@@ -162,10 +219,12 @@ void RunDocker::run(std::string_view session_id,
       auto parsed_json = utils::parse_json(final_json_opts).as_object();
       if (auto host_config_ptr = parsed_json.if_contains("HostConfig")) {
         auto host_config = host_config_ptr->as_object();
-        host_config["DeviceCgroupRules"] = json::array{
-            fmt::format("c {}:* rwm", *hidraw_major),
-            fmt::format("c {}:* rwm", *input_major),
-        };
+        auto &rules = host_config["DeviceCgroupRules"];
+        if (rules.is_null())
+          rules = json::array{};
+        for (const auto &rule : {fmt::format("c {}:* rwm", *hidraw_major), fmt::format("c {}:* rwm", *input_major)})
+          if (std::find(rules.as_array().begin(), rules.as_array().end(), json::value(rule)) == rules.as_array().end())
+            rules.as_array().push_back(json::value(rule));
         parsed_json["HostConfig"] = host_config;
       } else {
         parsed_json["HostConfig"] = json::object{
@@ -182,7 +241,7 @@ void RunDocker::run(std::string_view session_id,
     }
   }
 
-  if (isolate_mesa) {
+  if (isolate_mesa || isolate_nvidia) {
     try {
       // Device nodes are the enforcement boundary; Mesa settings keep normal apps'
       // enumeration aligned. Do not silently accept overrides that expose other GPUs.
@@ -201,9 +260,14 @@ void RunDocker::run(std::string_view session_id,
           const auto &host = config->as_object();
           if (auto privileged = host.if_contains("Privileged"); privileged && privileged->as_bool())
             return "privileged mode exposes all GPUs";
-          for (const auto *key : {"DeviceRequests", "VolumesFrom"})
+          for (const auto *key : {"VolumesFrom"})
             if (auto value = host.if_contains(key); value && !value->as_array().empty())
               return std::string(key) + " can bypass per-app GPU device selection";
+          if (auto requests = host.if_contains("DeviceRequests"); requests && !requests->as_array().empty()) {
+            if (!isolate_nvidia || requests->as_array().size() != 1 || requests->as_array()[0].at("Driver") != "cdi" ||
+                requests->as_array()[0].at("DeviceIDs") != json::array{"nvidia.com/gpu=" + *nvidia_uuid})
+              return "GPU request does not match the assigned NVIDIA UUID";
+          }
           if (auto extra = host.if_contains("Devices"))
             for (const auto &entry : extra->as_array()) {
               const auto &device = entry.as_object();
@@ -250,6 +314,9 @@ void RunDocker::run(std::string_view session_id,
     }
   }
 
+  if (use_fake_udev)
+    final_json_opts = boost::json::serialize(with_hotplug_capabilities(utils::parse_json(final_json_opts).as_object()));
+
   logs::log(logs::debug, "[DOCKER] Container options: {}", final_json_opts);
 
   Container new_container = {.id = "",
@@ -269,12 +336,15 @@ void RunDocker::run(std::string_view session_id,
     logs::log(logs::debug, "[DOCKER] Starting container: {}", *docker_container);
 
     std::string inspected_hostname;
-    if (auto inspected = docker_api.get_by_id(container_id)) {
+    if (auto inspected = docker_api.get_by_id(container_id); inspected && inspected->status == RUNNING) {
       inspected_hostname = inspected->hostname;
       this->ev_bus->fire_event(immer::box<events::DockerContainerCreated>{events::DockerContainerCreated{
           .container_id = container_id,
           .hostname = inspected->hostname,
           .session_id = std::string(session_id),
+          .name = new_container.name,
+          .image = new_container.image,
+          .render_node = std::string(render_node),
       }});
     } else {
       logs::log(logs::warning, "[DOCKER] Unable to inspect container {} for hostname", container_id);
@@ -309,14 +379,9 @@ void RunDocker::run(std::string_view session_id,
             for (auto udev_ev : ev->udev_events) {
               udev_ev["ACTION"] = "remove";
               std::string udev_msg = base64_encode(map_to_string(udev_ev));
-              std::string cmd;
-              if (udev_ev.count("DEVNAME") == 0) {
-                cmd = fmt::format("fake-udev -m {}", udev_msg);
-              } else {
-                cmd = fmt::format("fake-udev -m {} && rm {}", udev_msg, udev_ev["DEVNAME"]);
-              }
-              logs::log(logs::debug, "[DOCKER] Executing command: {}", cmd);
-              docker_api.exec(container_id, {"/bin/bash", "-c", cmd}, "root");
+              auto cmd = hotplug_command(udev_ev, udev_msg, true);
+              logs::log(logs::debug, "[DOCKER] Executing command: {}", utils::join(cmd, " "));
+              docker_api.exec(container_id, std::vector<std::string_view>(cmd.begin(), cmd.end()), "root");
             }
           }
         });
@@ -331,20 +396,10 @@ void RunDocker::run(std::string_view session_id,
           }
 
           for (auto udev_ev : device_ev->get().udev_events) {
-            std::string cmd;
             std::string udev_msg = base64_encode(map_to_string(udev_ev));
-            if (udev_ev.count("DEVNAME") == 0) {
-              cmd = fmt::format("fake-udev -m {}", udev_msg);
-            } else {
-              cmd = fmt::format("mkdir -p /dev/input && mknod {} c {} {} && chmod 777 {} && fake-udev -m {}",
-                                udev_ev["DEVNAME"],
-                                udev_ev["MAJOR"],
-                                udev_ev["MINOR"],
-                                udev_ev["DEVNAME"],
-                                udev_msg);
-            }
-            logs::log(logs::debug, "[DOCKER] Executing command: {}", cmd);
-            docker_api.exec(container_id, {"/bin/bash", "-c", cmd}, "root");
+            auto cmd = hotplug_command(udev_ev, udev_msg, false);
+            logs::log(logs::debug, "[DOCKER] Executing command: {}", utils::join(cmd, " "));
+            docker_api.exec(container_id, std::vector<std::string_view>(cmd.begin(), cmd.end()), "root");
           }
         }
       }

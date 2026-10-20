@@ -1,5 +1,6 @@
 add_library(wolf_runner)
 add_library(wolf::runner ALIAS wolf_runner)
+configure_file(gpu/ray-tracing-probe.py ${CMAKE_CURRENT_BINARY_DIR}/ray-tracing-probe.py COPYONLY)
 
 find_package(PkgConfig)
 

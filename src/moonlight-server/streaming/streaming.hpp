@@ -12,6 +12,7 @@
 #include <immer/box.hpp>
 #include <memory>
 #include <moonlight/fec.hpp>
+#include <streaming/shared_video.hpp>
 
 namespace streaming {
 
@@ -29,6 +30,28 @@ struct WaylandDisplayReady {
    */
   gstreamer::gst_element_ptr wayland_plugin;
 };
+
+// Matching is conservative: compare the complete encoding chain and negotiated video settings.
+// Client packetization/FEC and endpoints are deliberately outside the shared portion.
+std::string format_video_pipeline(immer::box<events::VideoSession> video,
+                                  const std::string &client_ip,
+                                  unsigned short client_port,
+                                  const std::string &producer);
+struct SharedVideoDescription {
+  std::string key;
+  std::string encoder;
+  std::string viewer;
+};
+std::optional<SharedVideoDescription> shared_video_description(const events::VideoSession &video,
+                                                               const std::string &producer);
+struct SharedVideoResult {
+  std::shared_ptr<SharedVideoEncoder> encoder;
+  std::string error;
+};
+SharedVideoResult prepare_shared_video(const events::VideoSession &settings,
+                                       const events::GpuStreamTarget &lobby,
+                                       const events::GpuStreamTarget &current,
+                                       const std::shared_ptr<wolf::gpu::Runtime> &runtime);
 
 void start_video_producer(const std::string &session_id,
                           const std::string &buffer_format,
@@ -65,7 +88,8 @@ static bool run_pipeline(
         &on_pipeline_ready,
     bool strict = false,
     const std::function<void(gstreamer::gst_element_ptr)> &on_stopped = {},
-    const std::function<bool()> &interrupted = {}) {
+    const std::function<bool()> &interrupted = {},
+    const std::function<void()> &on_started = {}) {
   GError *error = nullptr;
   gstreamer::gst_element_ptr pipeline(gst_parse_launch(pipeline_desc.c_str(), &error), [](const auto &pipeline) {
     logs::log(logs::trace, "~pipeline");
@@ -136,6 +160,8 @@ static bool run_pipeline(
     cleanup();
     return false;
   }
+  if (on_started)
+    on_started();
   GST_DEBUG_BIN_TO_DOT_FILE_WITH_TS(reinterpret_cast<GstBin *>(pipeline.get()),
                                     GST_DEBUG_GRAPH_SHOW_ALL,
                                     "pipeline-start");

@@ -3,6 +3,7 @@
 #include <charconv>
 #include <fstream>
 #include <map>
+#include <mutex>
 #include <regex>
 #include <set>
 #ifdef __linux__
@@ -101,6 +102,34 @@ std::string resolved_path(const std::filesystem::path &path) {
   auto resolved = std::filesystem::canonical(path, ec);
   return ec ? "" : resolved.string();
 }
+#ifdef __linux__
+struct NvmlRuntime {
+  std::mutex mutex;
+  void *library = nullptr;
+  int (*shutdown)() = nullptr;
+  bool initialized = false;
+
+  bool initialize() {
+    if (!library)
+      library = dlopen("libnvidia-ml.so.1", RTLD_NOW | RTLD_LOCAL);
+    if (!library)
+      return false;
+    auto init = reinterpret_cast<int (*)()>(dlsym(library, "nvmlInit_v2"));
+    shutdown = reinterpret_cast<int (*)()>(dlsym(library, "nvmlShutdown"));
+    if (!init || !shutdown)
+      return false;
+    if (!initialized)
+      initialized = init() == 0;
+    return initialized;
+  }
+  ~NvmlRuntime() {
+    if (initialized)
+      shutdown();
+    if (library)
+      dlclose(library);
+  }
+};
+#endif
 } // namespace
 
 void sample_nvidia(Device &d) {
@@ -112,6 +141,7 @@ void sample_nvidia(Device &d) {
   d.gpu_percent.reset();
   d.vram_percent.reset();
   d.vram_bytes.reset();
+  d.nvidia_uuid.reset();
   // Stable public NVML ABI. Runtime loading keeps NVIDIA headers and libraries optional on AMD/Intel hosts.
   struct Memory {
     unsigned long long total, free, used;
@@ -121,30 +151,25 @@ void sample_nvidia(Device &d) {
   };
   struct NvmlDevice;
   using Handle = NvmlDevice *;
-  void *library = dlopen("libnvidia-ml.so.1", RTLD_NOW | RTLD_LOCAL);
-  if (!library)
+  // Some driver versions leak an eventfd on each NVML init/shutdown/reload cycle.
+  // Keep one process-lifetime library session; samples still query fresh telemetry.
+  static NvmlRuntime runtime;
+  std::scoped_lock lock(runtime.mutex);
+  if (!runtime.initialize())
     return;
-  struct Library {
-    void *value;
-    ~Library() {
-      dlclose(value);
-    }
-  } owner{library};
-  auto init = reinterpret_cast<int (*)()>(dlsym(library, "nvmlInit_v2"));
-  auto shutdown = reinterpret_cast<int (*)()>(dlsym(library, "nvmlShutdown"));
+  auto library = runtime.library;
   auto get_handle =
       reinterpret_cast<int (*)(const char *, Handle *)>(dlsym(library, "nvmlDeviceGetHandleByPciBusId_v2"));
-  if (!init || !shutdown || !get_handle || init() != 0)
+  if (!get_handle)
     return;
-  struct Shutdown {
-    int (*fn)();
-    ~Shutdown() {
-      fn();
-    }
-  } initialized{shutdown};
   Handle handle{};
   if (get_handle(d.id.c_str(), &handle) != 0)
     return;
+  if (auto uuid = reinterpret_cast<int (*)(Handle, char *, unsigned int)>(dlsym(library, "nvmlDeviceGetUUID"))) {
+    char buffer[96]{};
+    if (uuid(handle, buffer, sizeof(buffer)) == 0)
+      d.nvidia_uuid = buffer;
+  }
   if (auto name = reinterpret_cast<int (*)(Handle, char *, unsigned int)>(dlsym(library, "nvmlDeviceGetName"))) {
     char buffer[128]{};
     if (name(handle, buffer, sizeof(buffer)) == 0)
@@ -210,7 +235,7 @@ std::vector<Device> discover(const DiscoveryPaths &paths, const CapabilityProbe 
                    ? names.lookup(*vendor_id, *device_id, hex_number(read_text(sys_device / "revision")))
                    : "GPU";
     }
-    struct stat info{};
+    struct stat info {};
     if (stat(d.render_node.c_str(), &info) == 0 && S_ISCHR(info.st_mode)) {
       int fd = open(d.render_node.c_str(), O_RDWR | O_CLOEXEC);
       d.accessible = fd >= 0;

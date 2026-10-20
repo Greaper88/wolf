@@ -464,6 +464,7 @@ void resume(const std::shared_ptr<typename SimpleWeb::Server<SimpleWeb::HTTPS>::
             const state::PairedClient &current_client,
             const immer::box<state::AppState> &state) {
   log_req<SimpleWeb::HTTPS>(request);
+  std::lock_guard transition(*state->gpu_transitions);
 
   auto client_ip = get_client_ip<SimpleWeb::HTTPS>(request);
   auto old_session = state::get_session_by_client(state->running_sessions->load(), current_client);
@@ -471,6 +472,11 @@ void resume(const std::shared_ptr<typename SimpleWeb::Server<SimpleWeb::HTTPS>::
     if (old_session->gpu_launch) {
       auto error = state->gpu_runtime->resume(*old_session->gpu_launch);
       if (!error.empty()) {
+        logs::log(logs::warning,
+                  "[GPU] Resume rejected for session {} on {}: {}",
+                  old_session->session_id,
+                  old_session->gpu_launch->device.render_node,
+                  error);
         XML xml;
         xml.put("root.<xmlattr>.status_code", 503);
         xml.put("root.<xmlattr>.status_message", error);

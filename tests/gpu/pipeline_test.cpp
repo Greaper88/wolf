@@ -67,6 +67,35 @@ int main() {
   binding = {"nvh264enc", "nvcodec", Codec::h264, "/dev/dri/renderD129", 7};
   rejects([&] { bind_pipeline(binding, templates, "source", "sink"); }, "unintegrated CUDA context is rejected");
 
+  EncoderBinding nvidia{"nvh264device1enc", "nvcodec", Codec::h264, "/dev/dri/renderD130", 1};
+  std::vector<PipelineTemplate> nv_templates{{"nvcodec", "nvh264enc bitrate={bitrate} ! h264parse"}};
+  auto nv_cpu = bind_pipeline(nvidia, nv_templates, "source", "sink");
+  check(nv_cpu.find("nvh264device1enc bitrate={bitrate}") != std::string::npos &&
+            nv_cpu.find("cudaupload cuda-device-id=1") != std::string::npos &&
+            nv_cpu.find("cudaconvertscale cuda-device-id=1") != std::string::npos,
+        "NVIDIA fallback upload, conversion and encoder all bind to the verified device");
+  check(nv_cpu.find("interlace-mode=progressive") != std::string::npos,
+        "NVIDIA conversion fixes progressive output even when the producer omits interlace metadata");
+  rejects([&] { bind_pipeline(nvidia, nv_templates, "source", "sink", true); },
+          "NVIDIA zero-copy cannot be enabled without compositor verification");
+  nvidia.zero_copy_postproc = "cudaconvertscale";
+  auto nv_zero_copy = bind_pipeline(nvidia, nv_templates, "source", "sink", true);
+  check(nv_zero_copy.find("cudaupload") == std::string::npos &&
+            nv_zero_copy.find("cudaconvertscale cuda-device-id=1") != std::string::npos &&
+            nv_zero_copy.find("video/x-raw(memory:CUDAMemory)") != std::string::npos,
+        "verified NVIDIA zero-copy keeps CUDA memory and avoids CPU uploads");
+  check(nv_zero_copy.find("interlace-mode=progressive") != std::string::npos,
+        "zero-copy CUDA conversion also fixes the virtual display's interlace mode");
+  nvidia.factory = "nvh264enc";
+  rejects([&] { bind_pipeline(nvidia, nv_templates, "source", "sink"); },
+          "GPU zero's encoder cannot authorize a GPU one session");
+  nvidia.factory = "nvautogpuh264enc";
+  rejects([&] { bind_pipeline(nvidia, nv_templates, "source", "sink"); },
+          "GStreamer automatic GPU selection cannot override Wolf's assignment");
+  nvidia.factory = "nvh264device1enc";
+  nvidia.cuda_device.reset();
+  rejects([&] { bind_pipeline(nvidia, nv_templates, "source", "sink"); }, "missing CUDA identity fails closed");
+
   Admission admission;
   Device device;
   device.id = "pci-one";
@@ -174,5 +203,95 @@ int main() {
   b.join();
   check(errors[0].empty() != errors[1].empty(), "simultaneous resumes atomically reserve one pending encoder");
   check(admission.count(device.id) == 2, "competing resumes retain both app assignments");
+
+  {
+    auto now = Admission::Clock::time_point{};
+    Admission leases([&] { return now; });
+    std::vector<Device> devices;
+    std::vector<std::shared_ptr<Admission::Reservation>> launchers;
+    for (int i = 0; i != 3; ++i) {
+      auto gpu = device;
+      gpu.id = "lease-gpu-" + std::to_string(i);
+      gpu.render_node = "/dev/dri/renderD" + std::to_string(128 + i);
+      devices.push_back(gpu);
+    }
+    auto inventory = [&] { return devices; };
+    for (int i = 0; i != 3; ++i) {
+      auto launcher = leases.acquire("launcher-" + std::to_string(i), {}, inventory, [] {}).reservation;
+      check(launcher != nullptr, "create three persistent launchers");
+      launcher->pause();
+      launchers.push_back(launcher);
+    }
+    // HTTPS admits the reconnect, but an interrupted client never reaches RTSP ANNOUNCE.
+    for (const auto &launcher : launchers)
+      check(launcher->resume({}, inventory).empty(), "admit an abandoned launcher reconnect");
+    check(!leases.acquire("fourth-launcher", {}, inventory, [] {}).reservation,
+          "pending handshakes protect all three GPUs before their deadlines");
+    now += std::chrono::seconds(29);
+    for (int retry = 0; retry != 10; ++retry)
+      for (const auto &launcher : launchers)
+        check(launcher->resume({}, inventory).empty(), "repeated handshake retries reuse admission");
+    check(!leases.acquire("still-pending", {}, inventory, [] {}).reservation,
+          "retries do not release a live handshake lease early");
+    now += std::chrono::seconds(1);
+    auto recovered = leases.acquire("recovered-launcher", {}, inventory, [] {});
+    check(recovered.reservation != nullptr, "abandoned handshakes stop blocking GPUs at the original deadline");
+    for (int i = 0; i != 3; ++i)
+      check(launchers[i]->valid() && launchers[i]->gpu().id == devices[i].id && leases.count(devices[i].id) >= 1,
+            "lease expiration preserves each launcher's original GPU assignment");
+    check(!launchers[1]->begin_encoder(), "a late encoder must be readmitted after handshake expiration");
+    check(launchers[1]->resume({}, inventory).empty(), "expired launcher can acquire a fresh handshake lease");
+    // Passing the original deadline again must not expire the replacement lease.
+    now += std::chrono::seconds(1);
+    auto epoch = launchers[1]->begin_encoder();
+    check(epoch != 0, "an old handshake deadline cannot expire the newer valid admission");
+    launchers[1]->end_encoder(epoch);
+  }
+  {
+    auto now = Admission::Clock::time_point{};
+    Admission leases([&] { return now; });
+    auto encoding = leases.acquire("encoding", {}, sample, [] {}).reservation;
+    auto epoch = encoding->begin_encoder();
+    check(epoch != 0, "claim handshake before constructing a real encoder");
+    now += std::chrono::hours(1);
+    check(!leases.acquire("premature-replacement", {}, sample, [] {}).reservation && encoding->encoding(),
+          "a real encoder starting without output does not lose capacity to handshake expiration");
+    encoding->encoder_active(epoch);
+    auto second = leases.acquire("second-encoder", {}, sample, [] {});
+    check(second.reservation != nullptr, "settled real encoder still allows safe additional admission");
+    second.reservation.reset();
+    now += std::chrono::hours(1);
+    check(encoding->encoding() && !encoding->begin_encoder() && !encoding->resume({}, sample).empty(),
+          "an active encoder remains owned after the handshake deadline passes");
+    encoding->cancel();
+    encoding->end_encoder(epoch);
+    now += std::chrono::hours(1);
+    check(!leases.acquire("during-teardown", {}, sample, [] {}).reservation && leases.count(device.id) == 1,
+          "cancelled teardown keeps capacity until its final owner exits");
+    encoding.reset();
+    check(leases.acquire("after-teardown", {}, sample, [] {}).reservation != nullptr,
+          "the GPU is reusable after cancelled teardown finishes");
+  }
+  {
+    auto now = Admission::Clock::time_point{};
+    Admission leases([&] { return now; });
+    auto closing = leases.acquire("cancelled-handshake", {}, sample, [] {}).reservation;
+    closing->cancel();
+    now += std::chrono::hours(1);
+    check(!leases.acquire("before-cancelled-owner-exits", {}, sample, [] {}).reservation,
+          "cancelling an unclaimed handshake preserves teardown capacity beyond its old deadline");
+    closing.reset();
+    check(leases.acquire("after-cancelled-owner-exits", {}, sample, [] {}).reservation != nullptr,
+          "cancelled handshake teardown frees capacity when its final owner exits");
+  }
+  {
+    auto now = Admission::Clock::time_point{};
+    Admission leases([&] { return now; });
+    auto late = leases.acquire("late-start", {}, sample, [] {}).reservation;
+    now += std::chrono::seconds(30);
+    check(!late->begin_encoder(), "begin_encoder itself expires an overdue unclaimed handshake");
+    check(late->resume({}, sample).empty() && late->begin_encoder(),
+          "resume readmits the same pinned app after an expired initial launch");
+  }
   std::cout << checks << " pipeline/lifecycle checks passed\n";
 }

@@ -1,18 +1,27 @@
 """Hardware integration test for a disposable Wolf server ONLY.
 
-Run inside a network-isolated Wolf container with two verified VA GPUs, three
+Run inside a network-isolated Wolf container with two verified GPUs, two
 throwaway paired clients and a first app running an animated Wayland client.
 The server must expose its default internal ports and Unix socket. The test
-creates/stops sessions and a sub-app, and exercises real HEVC RTP output.
+creates/stops sessions and a sub-app, and exercises real RTP output (HEVC by
+default; set WOLF_GPU_TEST_CODEC=H264 for H.264).
 For the strict zero-copy fixture, set WOLF_GPU_TEST_REQUIRE_ZERO_COPY=1 and
 WOLF_GPU_EXPECT_ZERO_COPY_NODE to the sole verified zero-copy GPU's render node.
 That mode verifies streaming on it and rejection while its first encoder is pending.
+For a busy-app reconnect check, set WOLF_GPU_TEST_BUSY_FILE to a writable fixture
+file bind-mounted over the app GPU's core-load reading only in this container.
 Never run against user sessions. Set WOLF_GPU_DISPOSABLE_TEST=1 explicitly.
 """
 import os
 if os.environ.get("WOLF_GPU_DISPOSABLE_TEST") != "1":
     raise SystemExit("Use only a disposable server; set WOLF_GPU_DISPOSABLE_TEST=1")
 import http.client, socket, json, time, struct, select
+from pathlib import Path
+busy_file = Path(os.environ['WOLF_GPU_TEST_BUSY_FILE']) if os.environ.get('WOLF_GPU_TEST_BUSY_FILE') else None
+original_busy = busy_file.read_text() if busy_file else None
+codec = os.environ.get('WOLF_GPU_TEST_CODEC', 'HEVC')
+assert codec in ('HEVC', 'H264'), codec
+codec_id, codec_name = (1, 'HEVC') if codec == 'HEVC' else (0, 'H.264')
 class UnixHTTP(http.client.HTTPConnection):
     def connect(self):
         self.sock=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM); self.sock.settimeout(25)
@@ -55,7 +64,7 @@ sockets=[]
 def stream(i):
     response=rtsp(i,'SETUP');secret=next(line.split(b':',1)[1].strip() for line in response.split(b'\r\n') if line.lower().startswith(b'x-ss-ping-payload:'))
     body=('v=0\r\na=x-nv-video[0].clientViewportWd:640\r\na=x-nv-video[0].clientViewportHt:360\r\n'
-          'a=x-nv-video[0].maxFPS:30\r\na=x-nv-vqos[0].bitStreamFormat:1\r\na=x-nv-general.featureFlags:0\r\n').encode()
+          f'a=x-nv-video[0].maxFPS:30\r\na=x-nv-vqos[0].bitStreamFormat:{codec_id}\r\na=x-nv-general.featureFlags:0\r\n').encode()
     rtsp(i,'ANNOUNCE','streamid=control/13/0',body)
     udp=socket.socket(socket.AF_INET,socket.SOCK_DGRAM);udp.bind(('127.0.0.1',0));udp.settimeout(8)
     udp.sendto(secret+struct.pack('<I',1),('127.0.0.1',48100));sockets.append(udp)
@@ -87,7 +96,7 @@ try:
     add(0);add(1);g0,g1=gpu(0),gpu(1);assert g0!=g1,(g0,g1)
     u0=stream(0);u1=stream(1);frames(u0);frames(u1)
     for current in sessions():
-        assert current['gpu']['codec']=='HEVC',current['gpu']
+        assert current['gpu']['codec']==codec_name,current['gpu']
         assert current['gpu']['name'] and '0x' not in current['gpu']['name'],current['gpu']
         usage=current['gpu'].get('gpu_percent')
         assert usage is None or 0 <= float(usage) <= 100,current['gpu']
@@ -113,13 +122,18 @@ try:
     payload['source_session_id']=sid[1]
     assert ok('lobbies/create',payload)['lobby_id']==lobby,'reconnect must reuse persistent app'
     before=frames(u1)[-1]
+    if busy_file:
+        busy_file.write_text('99\n')
     status,body=join(1);assert status==200,(status,body)
     time.sleep(1);after=frames(u1)
     assert max(after)>before,(before,after[-10:])
     assert gpu(1)==g0,'viewer encoder must follow app GPU'
     current=next(s for s in sessions() if s['client_id']==sid[1])
-    assert current['gpu']['codec']=='HEVC',current['gpu']
+    assert current['gpu']['codec']==codec_name,current['gpu']
     print('PASS: cross-device join reuses app and moves encoder to its GPU with continuing frames',flush=True)
+    if busy_file:
+        assert current['gpu']['gpu_percent']==99,current['gpu']
+        print('PASS: cross-device resume ignores existing app core saturation',flush=True)
     ok('lobbies/leave',dict(lobby_id=lobby,moonlight_session_id=sid[1]));time.sleep(1)
     frames(u1);assert gpu(1)==g1,'return must restore launcher GPU'
     print('PASS: return to launcher restores original GPU',flush=True)
@@ -127,6 +141,7 @@ try:
     assert any(l['id']==lobby and l['gpu']['id']==g0 for l in ok('lobbies')['lobbies'])
     print('PASS: persistent app survives original launcher shutdown',flush=True)
 finally:
+    if busy_file:busy_file.write_text(original_busy)
     for i in range(2):stop(i)
     if lobby:request('lobbies/stop',dict(lobby_id=lobby))
     for udp in sockets:udp.close()

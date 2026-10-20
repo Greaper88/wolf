@@ -218,12 +218,111 @@ EncoderProbeResult probe_encoder(const Device &device, Codec codec, std::chrono:
   return result;
 }
 
+namespace {
+std::optional<std::string>
+probe_cuda_zero_copy(const Device &device, const EncoderBinding &binding, std::chrono::milliseconds timeout) {
+#ifdef __linux__
+  if (!binding.cuda_device || cuda_device_for_pci(device.id) != binding.cuda_device)
+    return std::nullopt;
+  auto library = dlopen("libgstcuda-1.0.so.0", RTLD_NOW | RTLD_LOCAL);
+  if (!library)
+    return std::nullopt;
+  auto new_cuda = reinterpret_cast<GstObject *(*)(guint)>(dlsym(library, "gst_cuda_context_new"));
+  auto new_context = reinterpret_cast<GstContext *(*)(void *)>(dlsym(library, "gst_context_new_cuda_context"));
+  auto cuda = new_cuda ? new_cuda(*binding.cuda_device) : nullptr;
+  auto context = cuda && new_context ? new_context(cuda) : nullptr;
+  if (!context) {
+    if (cuda)
+      gst_object_unref(cuda);
+    dlclose(library);
+    return std::nullopt;
+  }
+  auto pipeline = gst_pipeline_new(nullptr);
+  auto source = gst_element_factory_make("waylanddisplaysrc", nullptr);
+  auto input = gst_element_factory_make("capsfilter", nullptr);
+  auto converter = gst_element_factory_make("cudaconvertscale", nullptr);
+  auto output = gst_element_factory_make("capsfilter", nullptr);
+  auto encoder = gst_element_factory_make(binding.factory.c_str(), nullptr);
+  auto sink = gst_element_factory_make("fakesink", nullptr);
+  bool success = false;
+  if (pipeline && source && input && converter && output && encoder && sink &&
+      encoder_binding(encoder, device, binding.codec)) {
+    g_object_set(source, "render-node", device.render_node.c_str(), "num-buffers", 8, nullptr);
+    g_object_set(converter, "cuda-device-id", *binding.cuda_device, nullptr);
+    auto in_caps = gst_caps_from_string("video/x-raw(memory:CUDAMemory),width=320,height=240,framerate=30/1");
+    auto out_caps = gst_caps_from_string("video/x-raw(memory:CUDAMemory),format=NV12");
+    g_object_set(input, "caps", in_caps, nullptr);
+    g_object_set(output, "caps", out_caps, nullptr);
+    gst_caps_unref(in_caps);
+    gst_caps_unref(out_caps);
+    std::atomic<unsigned int> encoded{0};
+    g_object_set(sink, "sync", FALSE, "signal-handoffs", TRUE, nullptr);
+    g_signal_connect(sink, "handoff", G_CALLBACK(count_buffer), &encoded);
+    struct MemoryCheck {
+      unsigned frames = 0;
+      bool valid = true;
+    } memory;
+    auto inspect = [](GstPad *, GstPadProbeInfo *info, gpointer data) -> GstPadProbeReturn {
+      auto &check = *static_cast<MemoryCheck *>(data);
+      auto buffer = GST_PAD_PROBE_INFO_BUFFER(info);
+      ++check.frames;
+      check.valid = check.valid && gst_buffer_n_memory(buffer) > 0;
+      for (guint i = 0; i < gst_buffer_n_memory(buffer); ++i) {
+        auto mem = gst_buffer_peek_memory(buffer, i);
+        check.valid = check.valid && gst_memory_is_type(mem, "gst.cuda.memory") &&
+                      !GST_MEMORY_FLAG_IS_SET(mem, GST_MEMORY_FLAG_LAST << 1); // no pending CPU upload
+      }
+      return GST_PAD_PROBE_OK;
+    };
+    auto source_pad = gst_element_get_static_pad(source, "src");
+    auto encoder_pad = gst_element_get_static_pad(encoder, "sink");
+    auto source_probe = gst_pad_add_probe(source_pad, GST_PAD_PROBE_TYPE_BUFFER, inspect, &memory, nullptr);
+    auto encoder_probe = gst_pad_add_probe(encoder_pad, GST_PAD_PROBE_TYPE_BUFFER, inspect, &memory, nullptr);
+    gst_bin_add_many(GST_BIN(pipeline), source, input, converter, output, encoder, sink, nullptr);
+    gst_element_set_context(pipeline, context);
+    if (gst_element_link_many(source, input, converter, output, encoder, sink, nullptr) &&
+        gst_element_set_state(pipeline, GST_STATE_PLAYING) != GST_STATE_CHANGE_FAILURE) {
+      auto bus = gst_element_get_bus(pipeline);
+      auto message = gst_bus_timed_pop_filtered(bus,
+                                                timeout.count() * GST_MSECOND,
+                                                static_cast<GstMessageType>(GST_MESSAGE_EOS | GST_MESSAGE_ERROR));
+      success = message && GST_MESSAGE_TYPE(message) == GST_MESSAGE_EOS && encoded.load() == 8;
+      if (message)
+        gst_message_unref(message);
+      gst_object_unref(bus);
+    }
+    gst_element_set_state(pipeline, GST_STATE_NULL);
+    gst_pad_remove_probe(source_pad, source_probe);
+    gst_pad_remove_probe(encoder_pad, encoder_probe);
+    gst_object_unref(source_pad);
+    gst_object_unref(encoder_pad);
+    success = success && memory.valid && memory.frames == 16;
+    gst_object_unref(pipeline);
+  } else {
+    for (auto element : {pipeline, source, input, converter, output, encoder, sink})
+      if (element)
+        gst_object_unref(element);
+  }
+  gst_context_unref(context);
+  gst_object_unref(cuda);
+  dlclose(library);
+  return success ? std::make_optional(std::string("cudaconvertscale")) : std::nullopt;
+#else
+  return std::nullopt;
+#endif
+}
+} // namespace
+
 std::optional<std::string>
 probe_zero_copy(const Device &device, const EncoderBinding &binding, std::chrono::milliseconds timeout) {
 #ifndef __linux__
   return std::nullopt;
 #else
-  if (binding.plugin != "va" || timeout.count() <= 0 || timeout > std::chrono::seconds(30))
+  if (timeout.count() <= 0 || timeout > std::chrono::seconds(30))
+    return std::nullopt;
+  if (binding.plugin == "nvcodec")
+    return probe_cuda_zero_copy(device, binding, timeout);
+  if (binding.plugin != "va")
     return std::nullopt;
   auto close_library = [](void *handle) { dlclose(handle); };
   std::unique_ptr<void, decltype(close_library)> library(dlopen("libgstva-1.0.so.0", RTLD_NOW | RTLD_LOCAL),

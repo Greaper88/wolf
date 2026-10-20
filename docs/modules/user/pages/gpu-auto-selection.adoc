@@ -1,11 +1,17 @@
-= Per-session GPU selection (VA integration)
+= Per-session GPU selection
 
-IMPORTANT: Automatic session routing currently supports verified VA hardware encoders.
-NVENC automatic contexts, custom video overrides and multi-user lobby sharing are not
-supported in this version. Unsupported launches/transitions fail explicitly.
-Automatic sessions prefer a verified zero-copy VA pipeline. GPUs without that path retain CPU-buffer
-conversion with hardware encoding unless `WOLF_GPU_REQUIRE_ZERO_COPY=true` excludes them.
-Broader performance and compatibility validation remain.
+Automatic session routing supports startup-verified VA-API hardware encoding on AMD/Intel
+and device-bound CUDA/NVENC encoding on NVIDIA. Automatic sessions prefer a verified zero-copy
+pipeline. GPUs without that path retain CPU-buffer conversion with hardware encoding unless
+`WOLF_GPU_REQUIRE_ZERO_COPY=true` excludes them. Custom video overrides require an explicit
+app render-node pin because automatic selection cannot safely retarget them.
+
+IMPORTANT: NVIDIA support remains experimental. Wolf's own container needs compatible NVIDIA
+libraries and devices, and the host needs DRM modesetting. App containers use version-matched
+driver volumes or native CDI; see xref:configuration.adoc[configuration]. Startup verification
+does not guarantee that every later CUDA context allocation will succeed. A failed producer
+may require closing and relaunching the app; reconnecting alone does not recreate it. Save work
+before closing an app. Virtual GPU slicing and management are not implemented.
 
 The automatic-selection Compose environment contains only:
 
@@ -26,10 +32,12 @@ Remove both node variables entirely to enable selection; an empty value is still
 |Variable |Default |Meaning
 |WOLF_GPU_AUTO_SELECT |true |Enable launch-time selection for supported automatic pipelines.
 |WOLF_GPU_AUTO_BLACKLIST |true |Exclude virtio_gpu, qxl, bochs-drm, vmwgfx, simpledrm, hyperv_drm, ast and mgag200.
-|WOLF_USE_ZERO_COPY |true |Use the startup-verified DMA-BUF/VA path when available. `false` uses CPU-buffer conversion with hardware encoding.
+|WOLF_USE_ZERO_COPY |true |Use the startup-verified DMA-BUF/VA or CUDA path when available. `false` uses CPU-buffer conversion with hardware encoding.
 |WOLF_GPU_REQUIRE_ZERO_COPY |false |Exclude GPUs without verified H.264 zero-copy support and exclude codecs without a verified zero-copy path. Requires `WOLF_USE_ZERO_COPY=true`.
 |WOLF_GPU_BLACKLIST |empty |Never select these GPU identities.
 |WOLF_GPU_LAST_RESORT |empty |Use these GPUs only when no preferred candidate passes capacity checks.
+|WOLF_GPU_PREFER_RAY_TRACING |false |Prefer GPUs with verified dedicated RT hardware and usable Vulkan RT features. Other or unverified GPUs enter the last-resort pool.
+|WOLF_GPU_ALLOW_LAST_RESORT |true |Allow new assignments to last-resort GPUs when no preferred candidate remains. `false` excludes that pool from new assignments.
 |WOLF_GPU_PERCENT_THRESHOLD |90 |Reject measured GPU core usage at or above this percentage.
 |WOLF_GPU_PERCENT_RETRY_THRESHOLD |87 |Core gate on the single fresh retry.
 |WOLF_GPU_PERCENT_VARIANCE |5 |Core loads within this many points of the minimum tie.
@@ -51,8 +59,8 @@ Booleans accept true/false (case insensitive) and 1/0. Invalid selector settings
 manual overrides and auto-selection=false bypass unrelated selector parsing.
 
 Selection uses fresh measurements at admission. Both rendering and encoding use the selected node.
-Survivors rank by preferred pool, active plus pending plus disconnected app count, projected encoder usage, core load,
-VRAM load and stable device identity. No llvmpipe or software encoder fallback is authorized.
+Survivors rank by preferred pool, active plus pending plus retained app count, projected encoder usage,
+core load, VRAM load and stable device identity. No llvmpipe or software encoder fallback is authorized.
 
 For measured encoder usage E and n active Wolf encoder sessions, another session projects E + E/n.
 Pending starts add further E/n estimates without increasing n. Thus 51% with one user rejects a second;
@@ -65,19 +73,28 @@ unknown encoder telemetry using session counts; choose `reject` to require a mea
 A device must still have a verified hardware encoder. Discovery's capability callback defaults to false.
 
 Zero-copy verification runs in separate bounded subprocesses at startup/background refresh, never at
-app launch or reconnect. It tests the actual compositor exporting linear 8-bit XR24 DMA buffers,
-the selected GPU's VA postprocessor producing NV12 VA surfaces, and that GPU's encoder producing
-frames. Converter and encoder identities are checked against their read-only device paths.
-The check also verifies that VA attached a surface to the original DMA memory, rejecting a hidden
-CPU-copy import fallback. Missing VA inspection support is treated as unverified zero-copy.
-This verifies the implemented path, not every format/modifier a GPU might theoretically support.
-It does not establish maximum resolution, frame rate, HDR support or concurrent encoder capacity.
+app launch or reconnect. The VA path tests the actual compositor exporting linear 8-bit XR24 DMA
+buffers, the selected GPU's VA postprocessor producing NV12 VA surfaces, and that GPU's encoder
+producing frames. Converter and encoder identities are checked against their device paths. VA
+surface inspection rejects a hidden CPU-copy import fallback; missing inspection support leaves
+zero-copy unverified. The NVIDIA path checks the CUDA device against the GPU's PCI identity and
+tests compositor CUDA memory through CUDA conversion and NVENC, inspecting the source and encoder
+buffers for CUDA memory without a pending CPU upload.
+
+These checks verify the implemented paths, not every format/modifier a GPU might theoretically support.
+They do not establish maximum resolution, frame rate, HDR support or concurrent encoder capacity.
 Here zero-copy means avoiding a CPU readback/upload of raw video frames; GPU color conversion still occurs.
 
 The H.264 result fixes the producer's buffer mode for its lifetime. A zero-copy producer only offers
 codecs that also passed zero-copy verification. The mode and GPU remain pinned across disconnects,
 profile app resumes, device changes and returns to the launcher. Startup and producer logs identify
 zero-copy, CPU-buffer fallback, or exclusion explicitly. Restart Wolf to apply these environment changes.
+
+A retained lobby also keeps the virtual display's original resolution and refresh rate. Changing a
+Moonlight stream from 30 to 60 FPS and reconnecting can change the encoder's output rate without
+changing the app's display to 60 Hz. Rate conversion repeats or drops frames; it does not make the
+app render additional frames. Close and relaunch the app with the desired settings to create a new
+display mode; closing it can lose unsaved work.
 
 To allow only verified zero-copy GPUs in the automatic pool:
 
@@ -94,6 +111,13 @@ verified hardware encoder: it remains available when the requirement is off.
 
 Automatic pool classification currently treats NVIDIA and devices reporting more than 1 GiB dedicated
 VRAM as preferred. Unclassified/shared-memory devices are last resort. This is a conservative heuristic.
+
+With `WOLF_GPU_PREFER_RAY_TRACING=true`, verified RT devices precede non-RT or unverified devices.
+Within each RT group, ordinary discrete GPUs still precede existing fallback classifications.
+The cached check verifies dedicated RT hardware and usable Vulkan RT features; it is not a game
+benchmark. `WOLF_GPU_ALLOW_LAST_RESORT=false` excludes fallback devices for new assignments, including
+non-RT/unverified devices when RT preference is enabled. Existing apps remain pinned and their
+reconnects do not reapply that new-assignment restriction. Blacklist, codec and capacity checks remain.
 
 The optional session `gpu` field includes identity, name, render/encoder node, VRAM bytes, encoder usage,
 projected admission usage, device-wide `gpu_percent`, negotiated stream `codec` and session count.
@@ -116,16 +140,19 @@ in `gpu.stream_error`, and Wolf UI displays it in the GPU status. Moonlight resu
 status message; an already-running stream can only receive a termination code, so the client may show
 a generic disconnect instead of the full explanation. End-to-end client validation remains outstanding.
 
-Single-user Wolf UI sub-apps own a separate, persistent GPU assignment. Leaving or pausing the app,
+Wolf UI sub-apps own a separate, persistent GPU assignment. Leaving or pausing the app,
 disconnecting Moonlight, and closing its original Wolf UI launcher do not move the running app.
 The assignment lasts until the sub-app exits or is explicitly stopped. A paused app does not reserve
 an encoder stream and does not make that GPU exclusive to the app.
 
 An updated Wolf UI supplies its source session and selected profile when creating or joining apps.
 The server identifies a persistent instance by profile and app state folder. Reopening it from another
-device reuses that instance, checks capacity on its original GPU, and places the viewer's encoder there.
-A busy GPU causes a rejection; Wolf does not migrate or restart the app. Only one viewer can join an
-automatically routed sub-app in this version. Joining also requires a codec supported by the app GPU.
+device reuses that instance and places the viewer's encoder on its original GPU. Multiple viewers
+can join a shared lobby. Compatible stream settings reuse one encoder; different codecs, resolution,
+frame rate, bitrate or other encoder settings require a separate encoder and fresh admission on the
+app GPU. Each viewer retains its own network stream and input connection. Joining requires a codec
+supported by the app GPU. Insufficient capacity causes a rejection; Wolf does not migrate or restart
+the app.
 
 Returning to Wolf UI restores the launcher's own GPU and checks its capacity. Disconnecting leaves the
 sub-app running and returns the launcher route to Wolf UI; select the same profile and app to rejoin.
@@ -139,8 +166,8 @@ placement still applies the graphics-core threshold. Same-GPU producer switches 
 existing viewer's encoder admission while replacing its pipeline.
 
 A new sub-app currently inherits the launcher GPU directly; automatic fallback to another device
-before creating the app is not implemented yet. A different device joining an existing sub-app
-uses fresh targeted admission on the app GPU, including its graphics-load gate.
+before creating the app is not implemented yet. Joining an existing sub-app stays on that app's GPU;
+new encoder groups receive targeted admission without the new-app graphics-core gate.
 
 The primary `auto-gpu-selection` branch publishes `ghcr.io/greaper88/wolf:latest` and
 `ghcr.io/greaper88/wolf-ui:latest`. Fresh configurations generated by the primary server
@@ -149,8 +176,9 @@ update that entry as well as the server's Compose image when changing channels, 
 Wolf UI is a child container, so Compose does not pull it with the server.
 
 The `dev-gpu-selection` branch and paired `gpu-selection-dev` image tags remain available
-for future NVIDIA and vGPU development. Publish the matching companion image before
-distributing a server image. Wolf's `stable` branch remains reserved for upstream updates.
+for development and testing. NVIDIA support described here is also included in the primary image,
+with the experimental limitations above. Use a compatible Wolf UI image; the published primary and
+development UI images support these GPU APIs. Wolf's `stable` branch remains reserved for upstream updates.
 
 
 Mesa application GPU isolation is applied separately to Wolf UI and each sub-app, using that
@@ -161,13 +189,15 @@ replaced; these settings are not applied globally to the Wolf server.
 
 Docker apps receive only the selected GPU's primary/render nodes. App runner overrides that expose
 extra GPU nodes, GPU device mounts (including `/dev`), privileged mode, device requests or inherited
-volumes are rejected with a `[GPU] Refusing app` log message. This applies to Mesa apps in this branch,
-including explicitly pinned apps. Keep the server's access to all eligible GPUs; these restrictions
-belong to its child app containers. Custom images must respect Mesa selection and must not reset these
-variables in their entrypoint. The process runner receives the selection variables but does not provide
-Docker device isolation. Older Vulkan applications without PCI-property support may not honor a
-PCI selector when multiple devices are exposed; use Docker runners for device isolation. This is
-hardware selection isolation, not a sandbox against hostile apps.
+volumes are rejected with a `[GPU] Refusing app` log message. NVIDIA apps additionally receive only
+their assigned GPU's NVIDIA nodes and UUID, through the validated driver-volume setup or a matching
+native CDI request. Wolf replaces conflicting GPU selection variables. These restrictions apply to
+Mesa and NVIDIA apps, including explicitly pinned apps. Keep the server's access to all eligible GPUs;
+the restrictions belong to its child app containers. Custom images must preserve the selected driver
+and GPU environment. The process runner receives selection variables but does not provide Docker
+device isolation. Older Vulkan applications without PCI-property support may not honor a PCI selector
+when multiple devices are exposed; use Docker runners for device isolation. This is hardware selection
+isolation, not a sandbox against hostile apps.
 
 Existing running apps retain their original container settings. Stop and relaunch them after adopting
 this image to apply isolation; reconnecting alone does not recreate their containers.

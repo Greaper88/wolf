@@ -11,6 +11,9 @@
 #include <map>
 #include <stdexcept>
 #include <thread>
+#ifdef __linux__
+#include <dlfcn.h>
+#endif
 
 using namespace wolf::gpu;
 unsigned checks = 0;
@@ -42,6 +45,22 @@ void config_tests() {
   auto o = options();
   check(o.enabled() && o.auto_blacklist, "default-on flags");
   check(o.use_zero_copy && !o.require_zero_copy, "zero-copy preferred with fallback by default");
+  check(!o.prefer_ray_tracing && o.allow_last_resort, "RT preference is opt-in and last resort is allowed by default");
+  check(
+      options({{"WOLF_GPU_PREFER_RAY_TRACING", "TRUE"}, {"WOLF_GPU_ALLOW_LAST_RESORT", "FALSE"}}).prefer_ray_tracing &&
+          !options({{"WOLF_GPU_ALLOW_LAST_RESORT", "0"}}).allow_last_resort,
+      "RT and last-resort flags are configurable");
+  for (const auto *key : {"WOLF_GPU_PREFER_RAY_TRACING", "WOLF_GPU_ALLOW_LAST_RESORT"}) {
+    bool invalid = false;
+    try {
+      options({{key, "maybe"}});
+    } catch (const std::invalid_argument &) {
+      invalid = true;
+    }
+    check(invalid, "invalid policy booleans rejected");
+    check(!options({{"WOLF_RENDER_NODE", ""}, {key, "maybe"}}).enabled(),
+          "manual override ignores automatic policy flags");
+  }
   check(options({{"WOLF_GPU_REQUIRE_ZERO_COPY", "true"}}).require_zero_copy, "strict zero-copy policy is configurable");
   check(!options({{"WOLF_USE_ZERO_COPY", "FALSE"}}).use_zero_copy, "explicit zero-copy disable");
   bool conflict = false;
@@ -205,6 +224,53 @@ void policy_tests() {
   check(status.render_node == status.encoder_node && status.session_count_on_gpu == 3, "zero-copy metadata and count");
   check(select({}, o).error().find("/dev/dri") != std::string::npos, "actionable empty discovery failure");
 }
+void ray_policy_tests() {
+  auto normal = device("normal"), rt = device("rt"), integrated = device("integrated");
+  rt.render_node = "/dev/dri/renderD129";
+  integrated.render_node = "/dev/dri/renderD130";
+  integrated.last_resort = true;
+  rt.hardware_ray_tracing = true;
+  rt.retained_sessions = 2;
+  auto o = options();
+  check(select({normal, rt}, o).device->id == normal.id, "default policy ignores RT preference");
+  o.prefer_ray_tracing = true;
+  check(select({normal, rt}, o).device->id == rt.id, "verified RT pool precedes session counts");
+  rt.gpu_percent = 95;
+  check(select({normal, rt}, o).device->id == normal.id, "saturated RT card permits fallback");
+  normal.retained_sessions = 3;
+  check(select({normal, integrated}, o).device->id == normal.id,
+        "non-RT discrete fallback retains priority over an iGPU with fewer reservations");
+  integrated.hardware_ray_tracing = true;
+  check(select({normal, integrated}, o).device->id == integrated.id,
+        "verified RT capability is preferred even on an otherwise last-resort device");
+  integrated.hardware_ray_tracing.reset();
+  normal.retained_sessions = 0;
+  o.allow_last_resort = false;
+  auto rejected = select({normal, rt}, o);
+  check(!rejected.device && rejected.error().find("ray tracing") != std::string::npos,
+        "strict RT preference fails clearly without fallback");
+  check(select({normal}, o, false, true).device.has_value(), "pinned app may resume on its original non-RT GPU");
+  normal.vram_percent = 99;
+  check(!select({normal}, o, false, true).device, "pinned resume still respects memory admission");
+  normal = device("normal");
+  rt.gpu_percent = 0;
+  rt.hardware_ray_tracing.reset();
+  check(!select({normal, rt}, o).device, "unknown RT result never enters strict pool");
+  o.prefer_ray_tracing = false;
+  check(select({normal, integrated}, o).device->id == normal.id,
+        "fallback switch does not exclude ordinary discrete GPUs");
+  check(!select({integrated}, o).device, "automatic last-resort cards can be disabled independently");
+  o.last_resort = {normal.id};
+  check(!select({normal}, o).device, "admin-designated last-resort cards also obey the switch");
+  o.allow_last_resort = true;
+  check(select({normal}, o).device.has_value(), "fallback can be explicitly reenabled");
+  o.prefer_ray_tracing = true;
+  rt.hardware_ray_tracing = true;
+  o.blacklist = {rt.id};
+  check(select({normal, rt}, o).device->id == normal.id, "Compose blacklist overrides a verified RT card");
+  o.allow_last_resort = false;
+  check(!select({normal, rt}, o).device, "blacklist and disabled fallback cannot be bypassed");
+}
 void admission_tests() {
   Admission admission;
   auto o = options();
@@ -271,16 +337,41 @@ void admission_tests() {
 void nvml_tests() {
   if (!std::getenv("WOLF_GPU_TEST_NVML"))
     return;
+#ifdef __linux__
+  auto fixture = dlopen("libnvidia-ml.so.1", RTLD_NOW | RTLD_LOCAL);
+  check(fixture != nullptr, "NVML fixture is available");
+  auto init_count = reinterpret_cast<unsigned int (*)()>(dlsym(fixture, "wolf_test_nvml_init_count"));
+  auto set_gpu = reinterpret_cast<void (*)(unsigned int)>(dlsym(fixture, "wolf_test_nvml_set_gpu_percent"));
+  check(init_count && set_gpu, "NVML lifecycle and telemetry controls are available");
   auto d = device("0000:02:00.0");
   d.driver = "nvidia";
   sample_nvidia(d);
   check(d.name == "Mock GPU" && d.vram_percent == 25 && d.vram_bytes == (8ULL << 30),
         "NVML PCI-bound identity and VRAM");
   check(d.gpu_percent == 31 && d.encoder_percent == 59, "NVML encoder independent from GPU core");
+  std::vector<std::future<void>> polls;
+  for (int thread = 0; thread < 4; ++thread)
+    polls.push_back(std::async(std::launch::async, [&] {
+      for (int i = 0; i < 50; ++i) {
+        auto sampled = d;
+        sample_nvidia(sampled);
+        if (sampled.gpu_percent != 31 || sampled.encoder_percent != 59)
+          throw std::runtime_error("concurrent NVML telemetry read failed");
+      }
+    }));
+  for (auto &poll : polls)
+    poll.get();
+  check(init_count() == 1, "repeated concurrent GPU telemetry polls do not reinitialize the driver");
+  set_gpu(44);
+  sample_nvidia(d);
+  check(d.gpu_percent == 44, "persistent NVML session still reads fresh GPU usage");
+  set_gpu(31);
   d.id = "0000:99:00.0";
   d.encoder_percent.reset();
   sample_nvidia(d);
   check(!d.encoder_percent && !d.gpu_percent && !d.vram_bytes, "missing NVML PCI handle clears stale telemetry");
+  dlclose(fixture);
+#endif
 }
 void discovery_tests() {
   auto dir = std::filesystem::temp_directory_path() /
@@ -333,6 +424,7 @@ int main() {
   try {
     config_tests();
     policy_tests();
+    ray_policy_tests();
     admission_tests();
     discovery_tests();
     nvml_tests();

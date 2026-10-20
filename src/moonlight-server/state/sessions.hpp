@@ -130,7 +130,10 @@ gpu_target(const AppState &state,
   auto target = std::make_shared<events::GpuStreamTarget>();
   target->launch = std::move(launch);
   target->producer = producer;
-  target->producer_caps = target->launch->zero_copy ? wolf::gpu::zero_copy_caps : "video/x-raw";
+  target->producer_caps =
+      target->launch->zero_copy
+          ? (target->launch->device.driver == "nvidia" ? "video/x-raw(memory:CUDAMemory)" : wolf::gpu::zero_copy_caps)
+          : "video/x-raw";
   target->context = context ? context : std::make_shared<immer::atom<gst_video_context::gst_context_ptr>>();
   const auto &cfg = state.config->gpu_video;
   auto bind = [&](std::size_t index, const std::vector<wolf::config::GstEncoder> &encoders) {

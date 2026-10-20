@@ -1,5 +1,6 @@
 #include "gst-video-context.hpp"
 #include <algorithm>
+#include <dlfcn.h>
 #include <filesystem>
 #include <fstream>
 #include <gst/cuda/gstcudacontext.h>
@@ -66,64 +67,17 @@ bool isNvidiaGpu(const std::string &pciBusId) {
 }
 
 std::optional<int> getCudaDeviceIndexFromPciBusId(const std::string &pciBusId) {
-  fs::path gpusDir = "/proc/driver/nvidia/gpus";
-
-  std::error_code ec;
-  if (!fs::exists(gpusDir, ec) || !fs::is_directory(gpusDir, ec)) {
+  using Init = int (*)(unsigned int);
+  using Get = int (*)(int *, const char *);
+  auto library = dlopen("libcuda.so.1", RTLD_NOW | RTLD_LOCAL);
+  if (!library)
     return std::nullopt;
-  }
-
-  auto normalize = [](std::string value) {
-    std::transform(value.begin(), value.end(), value.begin(), ::tolower);
-    return value;
-  };
-
-  std::vector<std::pair<std::string, std::string>> gpuBusIds;
-  for (const auto &entry : fs::directory_iterator(gpusDir, ec)) {
-    if (!entry.is_directory()) {
-      continue;
-    }
-
-    std::string busId = entry.path().filename().string();
-    logs::log(logs::debug, "Found Nvidia GPU: {}", busId);
-
-    gpuBusIds.emplace_back(busId, normalize(busId));
-  }
-
-  if (gpuBusIds.empty()) {
-    logs::log(logs::warning, "No NVIDIA GPUs found in {}", gpusDir.string());
-    return std::nullopt;
-  }
-
-  std::sort(gpuBusIds.begin(), gpuBusIds.end(), [](const auto &lhs, const auto &rhs) {
-    return lhs.second < rhs.second;
-  });
-
-  std::string target = normalize(pciBusId);
-  for (size_t index = 0; index < gpuBusIds.size(); ++index) {
-    if (gpuBusIds[index].second == target) {
-      logs::log(logs::debug,
-                "PCI bus ID {} mapped to CUDA device index {} (sorted order)",
-                gpuBusIds[index].first,
-                index);
-      return static_cast<int>(index);
-    }
-  }
-
-  std::string availableIds;
-  for (const auto &entry : gpuBusIds) {
-    if (!availableIds.empty()) {
-      availableIds.append(", ");
-    }
-    availableIds.append(entry.first);
-  }
-
-  logs::log(logs::warning,
-            "PCI bus ID {} not found when mapping to CUDA device index. Available GPUs: {}",
-            pciBusId,
-            availableIds);
-
-  return std::nullopt;
+  auto init = reinterpret_cast<Init>(dlsym(library, "cuInit"));
+  auto get = reinterpret_cast<Get>(dlsym(library, "cuDeviceGetByPCIBusId"));
+  int device = -1;
+  const bool success = init && get && init(0) == 0 && get(&device, pciBusId.c_str()) == 0 && device >= 0;
+  dlclose(library);
+  return success ? std::make_optional(device) : std::nullopt;
 }
 
 std::optional<int> getCudaDeviceFromDri(const fs::path &driPath) {
@@ -176,7 +130,12 @@ bool set_context(gst_context_ptr context, GstMessage *msg) {
 }
 
 cuda_context_ptr create_cuda_context(const std::string &device_path) {
-  auto device_id = getCudaDeviceFromDri(device_path).value_or(0);
+  auto selected = getCudaDeviceFromDri(device_path);
+  if (!selected) {
+    logs::log(logs::error, "Cannot resolve CUDA identity for {}", device_path);
+    return nullptr;
+  }
+  auto device_id = *selected;
   logs::log(logs::info, "Creating CUDA context for device {} (detected CUDA device ID: {})", device_path, device_id);
   auto cuda_ctx = gst_cuda_context_new(device_id);
   if (cuda_ctx) {

@@ -1,0 +1,118 @@
+= API connection-close fix
+
+AI-Agent: ChatGPT Codex +
+AI-Model-Version: GPT-6.1 Sol Extra High (client-displayed label supplied by the maintainer) +
+AI-Inference-Date: 2026-10-11 03:01:36 UTC
+
+The serving model variant cannot be independently verified from this workspace.
+
+== Problem and evidence
+
+Wolf-UI intermittently failed its five-second `/api/v1/sessions` request. Its
+footer disappeared on the failure and returned on a successful poll. Direct
+requests from both UI containers succeeded, and the socket inode matched the
+server. The endpoint remained valid in the modified stack.
+
+A short EventPipe trace from the running UI captured `SocketException (32):
+Broken pipe`, wrapped by `IOException` and `HttpRequestException`. A second trace
+showed the same HTTP connection ID used for a completed lobby request and then
+reused for a session request before the client noticed that Wolf had closed it.
+Decompiling the running UI assembly confirmed that its client matched the source.
+
+Ordinary Wolf API sockets process one request. Their responses supplied a content
+length but no explicit `Connection: close`. That allowed the UI's HTTP connection
+pool to race the server's socket closure. Standalone and headless Godot probes
+without the full live UI request pattern did not reproduce the failure; those
+successful probes alone were not treated as proof that the live issue was fixed.
+
+== Changes
+
+Wolf now adds `Connection: close` unless the response already specifies a
+connection header. This covers JSON, icons and errors, while retaining the
+explicit `Connection: keep-alive` on SSE event subscriptions. Socket write
+ordering and download streaming are unchanged.
+
+The companion UI preserves the last GPU footer readings on failed polls, as
+requested by the maintainer, and logs the underlying exception type and message
+alongside the outer request error. This does not add blanket retries, including
+to requests that could create or stop an app.
+
+== Validation and deployment scope
+
+* The new socket integration check failed against the old isolated image because
+  the ordinary session reply lacked a connection header.
+* The same check passed against the corrected isolated image, including repeated
+  session requests, explicit SSE keep-alive, ordered image-download progress,
+  a disconnected download client, subsequent downloads and a 404 response.
+* All nine API-related CTest cases passed against the rebuilt server.
+* The UI .NET build, Godot import and clean Linux release export passed. Temporary
+  diagnostic scripts were removed before the release build.
+* Formatting and `git diff --check` passed.
+
+Local candidates are `wolf:api-connection-fix-dev` and
+`wolf-ui:api-connection-fix-dev`. The server candidate also includes the already
+validated ray-tracing policy change, whose defaults preserve existing placement
+behavior. No live stack restart or image replacement was performed. A live
+before/after check still requires applying the candidate images.
+
+== Tools and references
+
+Codex execution, patch and UTC clock tools; Git and ripgrep; Docker inspect,
+logs, copy, start, exec, run, build and cleanup; Python 3; .NET SDK 8.0.425 and
+runtime 8.0.31; Godot 4.4.1 Mono; ILSpy command-line 9.1.0.7988;
+Microsoft.Diagnostics.NETCore.Client 0.2.750501 and TraceEvent 3.2.8;
+CMake, Ninja, Catch2 and clang-format 18.1.8. The diagnostic tracing recorded
+HTTP connection events and exception messages, without a process memory dump or
+logging session keys, profile PINs or API response bodies. No subagents were used.
+
+Primary references consulted using the web tool:
+
+* https://learn.microsoft.com/en-us/dotnet/core/diagnostics/diagnostics-client-library[Microsoft diagnostics client documentation]
+* https://github.com/dotnet/runtime/blob/v8.0.0/src/libraries/System.Net.Http/src/System/Net/Http/HttpTelemetry.cs[.NET HTTP failure telemetry]
+* https://github.com/dotnet/runtime/blob/v8.0.0/src/libraries/System.Net.Http/src/System/Net/Http/SocketsHttpHandler/HttpConnection.cs[.NET HTTP connection handling]
+
+== Authorized local rollout
+
+Applied at 2026-10-11 04:10:18 UTC following the maintainer's explicit restart
+authorization. The prior statements about leaving the live stack unchanged
+describe the validation phase before this rollout.
+
+The two background apps and their launchers were closed gracefully. Private
+configuration, Compose files and session/profile metadata were backed up under
+`/mnt/raid/wolf/backups/api-connection-fix-20261011-040850`, with access restricted
+to the owner. No private snapshot contents were published or committed.
+
+The tested server is running as `wolf:nvidia-gpu-selection-dev`, image
+`sha256:71cecc51d1d3ca08c919adc8a047a6b2528e8c6c84556fff60b303e72b4a338b`.
+The companion is available as `wolf-ui:gpu-selection-dev`, image
+`sha256:9d2ca74ffc51ce877fe1adc158337e2687b19144ef130a22f2518368bbedb539`.
+Existing Compose and app image references therefore did not need edits. Previous
+images are retained with `before-api-connection-fix-20261010-230850` tags.
+
+Twenty live session requests returned successful responses with
+`Connection: close`. A headless companion ran several polling cycles without
+transport failures. The maintainer's next real UI connection used the new image
+and also showed no request failures in the checked window. The headless probe
+reported Godot resource-cleanup warnings on exit; it created no streaming session.
+
+Both GTX 1080s verified H.264/HEVC CUDA-to-NVENC zero-copy; the RX 7600 verified
+H.264/HEVC/AV1 VA zero-copy; Intel HD 630 verified H.264/HEVC hardware encoding
+with CPU-buffer fallback. Ray-tracing preference remains disabled and last-resort
+devices remain enabled. The existing verified NVIDIA driver volume was reused.
+Wolf-Den's image was unchanged. This was a local rollout, not a GHCR publication
+or source push. Additional rollout tools were private Python API/backup scripts,
+Docker image tagging and Compose recreation through the host Docker CLI.
+
+== Development-image publication preparation
+
+The previously validated server changes and socket regression are being
+committed separately before the cross-device GPU reconnect fix. The running
+image already contains both changes; recording this prerequisite keeps the
+published development image consistent with the branch source. This commit
+does not modify the companion Wolf-UI repository or its published image.
+
+Current release preparation is by ChatGPT Codex, GPT-6 family; the exact serving
+version and reasoning setting are unavailable. Its inference date and tools are
+recorded in the commit trailers and the cross-device resume disclosure. The
+original model attribution and investigation date above describe the earlier
+API debugging work.

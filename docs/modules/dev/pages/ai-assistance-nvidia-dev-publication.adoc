@@ -1,0 +1,125 @@
+= AI assistance disclosure: NVIDIA development branch publication
+
+AI-Agent: ChatGPT Codex
+
+AI-Model-Version: GPT-6.1 Sol Extra High (client-displayed model label supplied by maintainer)
+
+AI-Inference-Date: 2026-10-09 10:19:31 UTC
+
+The model label comes from the maintainer's client screenshot; the serving model
+variant is not independently exposed to the agent. This entry records release
+preparation; the linked disclosures retain their original dates and findings.
+
+== Published behavior
+
+The maintainer requested removing the local NVIDIA-only test restriction and
+pushing the usable implementation to `dev-gpu-selection`. This development
+channel combines the existing automatic VA-API selection with experimental
+device-bound CUDA/NVENC selection, UUID-isolated NVIDIA app containers, verified
+CUDA zero-copy, and automatically checked version-matched app driver volumes.
+The upstream CUDA validity/lifetime changes were previously merged as `e196356`.
+The existing co-op implementation copied from the primary worktree is included:
+compatible viewers share a lobby-owned encoder; different settings reserve
+another encoder on the app's pinned GPU. Private ownership is preserved.
+
+The README now describes these development capabilities and their limits.
+The primary `auto-gpu-selection` branch and its `latest` image are unchanged.
+The existing publish workflow maps this branch to `gpu-selection-dev` and reads
+AI trailers into image labels. The companion Wolf-UI reference is unchanged.
+
+Release preparation found that the local image's CUDA 12.4 runtime compiler was
+absent from the normal image Dockerfile. The publish Dockerfile now downloads
+NVIDIA's exact NVRTC 12.4.127 redistribution with its published SHA-256 checksum,
+ships only the shared libraries and license, and refreshes the loader cache.
+The new driver manager and packaging Dockerfile are explicitly included in the
+Docker build context. Driver-volume policy tests are registered with CTest when
+Python is available; Python bytecode directories are ignored by Git.
+
+== Local GPU restrictions and selection policy
+
+Only the temporary Compose blacklist for PCI `0000:00:02.0` and `0000:03:00.0`
+was removed from the live stack's saved override and the local prepared overrides.
+No whitelist was configured. Compose validation passed; the running server keeps
+its previous environment until it is recreated. The automatic checks still reject
+unusable devices and keep integrated GPUs as last-resort candidates.
+
+Paused/running apps remain pinned without granting exclusive GPU ownership.
+The current selector first favors fewer active/pending/retained reservations,
+then uses encoder/core/VRAM telemetry among tied candidates. Telemetry thresholds
+remain admission gates. This publication does not change that ranking policy or
+the same-IP routing fixes. The maintainer reported intermittent picture flicker
+on one earlier connection that cleared after reconnecting; its cause remains
+unproven and is not claimed fixed here.
+
+== Validation
+
+The server and Catch2 binary rebuilt in the isolated cached builder. Of 53
+selected CTest cases, 52 passed and one opt-in VA hardware sharing case skipped.
+This includes six GPU suites, session/API/shared-video and same-IP routing cases,
+and all 14 Python driver-volume policy/integrity tests. Four unbuilt third-party
+Simple-Web-Server test executables were excluded. Shell syntax and Git whitespace
+checks passed; changed C++ files were formatted with clang-format 18.1.8.
+
+A disposable server using the tested runtime and newly built server binary had
+all four physical GPUs exposed and no blacklist or user sessions. Both GTX 1080s
+passed H.264/HEVC CUDA zero-copy checks; the RX 7600 passed H.264/HEVC/AV1 VA
+zero-copy checks. Intel HD 630 passed H.264/HEVC hardware encoding with CPU-buffer
+fallback and no AV1. Its socket API returned HTTP 200 with zero sessions/lobbies.
+The isolated network disabled mDNS and no host app-state bind was configured;
+those expected diagnostics do not affect this startup capability check. The
+temporary server and its anonymous volume were removed afterwards.
+
+The complete publish Dockerfile then built successfully from the source tree.
+An image check caught Docker expanding wildcard-copied NVRTC links into ordinary
+files, which omitted the generic compiler name from the loader cache. The final
+Dockerfile copies only the two versioned shared libraries, explicitly recreates
+their SONAME/development links, and checks the required compiler APIs at build
+time. A standalone image check loaded NVRTC 12.4 and compiled a Pascal CUDA kernel
+into a 2,152-byte CUBIN without a GPU. The recipe, manager and compiler license
+were present. The corrected full image repeated the same successful four-GPU
+startup results and returned HTTP 200 with no sessions/lobbies. Its test app-state
+bind was separate from user profiles, and its server was removed after validation.
+
+Earlier actual-device and app validation is detailed in:
+
+* xref:ai-assistance-nvidia-local-dev.adoc[NVIDIA discovery, encoding and zero-copy]
+* xref:ai-assistance-nvidia-telemetry-lifecycle.adoc[NVML telemetry lifetime]
+* xref:ai-assistance-nvidia-driver-volumes.adoc[Driver volumes, Plasma and Steam]
+* xref:ai-assistance-nvidia-plasma-gbm.adoc[Retired temporary Plasma workaround]
+
+NVIDIA validation is limited to the installed GTX 1080 pair and driver 580.178.04.
+Wolf's server container still needs NVIDIA library/device provisioning, such as
+native CDI; the driver-volume automation covers apps. Host driver installation,
+kernel modesetting changes, vGPU management and broad card/driver compatibility
+are not part of this release. The host KDE crash-reporting workaround documented
+earlier remains separate from Wolf and is not shipped as image behavior.
+
+== Local rollout
+
+The maintainer explicitly approved restarting Wolf after the checks, including
+closure of both active Plasma apps. Metadata/config backups were written with
+restricted permissions in `/etc/wolf/backups/mixed-gpu-dev-20261009-101719`.
+Only Wolf was recreated; WolfDen and unrelated services remained running.
+The new local image is `wolf:nvidia-gpu-selection-dev`, image ID
+`sha256:2493aabc124963378ae69cd9eef6ee1853b37db948253507cb2753d5f3de9a73`.
+The previous image is retained as `wolf:nvidia-before-mixed-gpu-20261009`.
+
+The live environment has no `WOLF_GPU_BLACKLIST` or device allowlist override.
+It retains `WOLF_GPU_REQUIRE_ZERO_COPY=FALSE`. Startup accepted the four GPUs with
+the codec/zero-copy results described above, and reused the checked NVIDIA driver
+volume without rebuilding. The socket API returned HTTP 200 with no stale
+sessions/lobbies. Profile metadata matched the pre-restart snapshot exactly;
+Wolf and WolfDen HTTP checks both returned 200. The idle builder was stopped.
+
+== Tools and references
+
+Codex execution orchestration, command execution/polling, patch editing and UTC
+clock; Bash, Python standard library/unittest/tarfile/urllib/ctypes, Git and ripgrep;
+GitHub CLI for authentication and branch publication; Docker Engine, Compose,
+BuildKit, native CDI, logs/inspect/exec/copy; CMake, Ninja, CTest, Catch2, ccache and
+clang-format 18.1.8. The web tool attempted to open NVIDIA's manifest and timed out;
+Python HTTPS successfully retrieved the primary manifest. No delegated agents
+were used. Earlier tools and external references are listed in the linked records.
+
+* https://developer.download.nvidia.com/compute/cuda/redist/redistrib_12.4.1.json
+* https://developer.download.nvidia.com/compute/cuda/redist/cuda_nvrtc/linux-x86_64/cuda_nvrtc-linux-x86_64-12.4.127-archive.tar.xz

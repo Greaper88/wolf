@@ -87,6 +87,8 @@ Options read_options(const Environment &env) {
   o.auto_blacklist = boolean("WOLF_GPU_AUTO_BLACKLIST", true);
   o.use_zero_copy = boolean("WOLF_USE_ZERO_COPY", true);
   o.require_zero_copy = boolean("WOLF_GPU_REQUIRE_ZERO_COPY", false);
+  o.prefer_ray_tracing = boolean("WOLF_GPU_PREFER_RAY_TRACING", false);
+  o.allow_last_resort = boolean("WOLF_GPU_ALLOW_LAST_RESORT", true);
   if (o.require_zero_copy && !o.use_zero_copy)
     throw std::invalid_argument("WOLF_GPU_REQUIRE_ZERO_COPY requires WOLF_USE_ZERO_COPY=true");
   o.blacklist = list(env("WOLF_GPU_BLACKLIST").value_or(""));
@@ -144,6 +146,11 @@ std::optional<double> projected_encoder(const Device &d) {
   return *d.encoder_percent + (*d.encoder_percent / d.active_sessions) * (1.0 + d.pending_sessions);
 }
 
+bool is_last_resort(const Device &d, const Options &o) {
+  return d.last_resort || matches(d, o.last_resort) ||
+         (o.prefer_ray_tracing && !d.hardware_ray_tracing.value_or(false));
+}
+
 Selection select(const std::vector<Device> &snapshot, const Options &o, bool retry, bool existing_app) {
   Selection result;
   if (!o.enabled())
@@ -161,6 +168,10 @@ Selection select(const std::vector<Device> &snapshot, const Options &o, bool ret
       reason = "render node inaccessible; check device mounts and permissions";
     else if (!d.hardware_encoder)
       reason = "no verified hardware encoder on this node; check drivers and GStreamer";
+    else if (!existing_app && !o.allow_last_resort && is_last_resort(d, o))
+      reason = o.prefer_ray_tracing && !d.hardware_ray_tracing.value_or(false)
+                   ? "last-resort GPUs disabled: hardware ray tracing unavailable or unverified"
+                   : "last-resort GPUs disabled";
     else if (!valid(d.encoder_percent) || !valid(d.gpu_percent) || !valid(d.vram_percent))
       reason = "invalid telemetry";
     else if (d.vram_percent && *d.vram_percent >= (retry ? o.vram_retry_threshold : o.vram_threshold))
@@ -179,14 +190,20 @@ Selection select(const std::vector<Device> &snapshot, const Options &o, bool ret
       result.rejected.push_back({d.id, reason});
       continue;
     }
-    d.last_resort = d.last_resort || matches(d, o.last_resort);
     candidates.push_back(std::move(d));
   }
   if (candidates.empty())
     return result;
-  if (std::any_of(candidates.begin(), candidates.end(), [](const auto &d) { return !d.last_resort; }))
-    candidates.erase(std::remove_if(candidates.begin(), candidates.end(), [](const auto &d) { return d.last_resort; }),
-                     candidates.end());
+  // Preserve the original fallback classification within each RT group. Merely
+  // demoting non-RT discrete cards must not promote an iGPU ahead of them.
+  auto pool = [&](const Device &d) {
+    return (o.prefer_ray_tracing && !d.hardware_ray_tracing.value_or(false) ? 2 : 0) +
+           (d.last_resort || matches(d, o.last_resort) ? 1 : 0);
+  };
+  auto preferred_pool = pool(*std::min_element(candidates.begin(), candidates.end(), [&](const auto &a, const auto &b) {
+    return pool(a) < pool(b);
+  }));
+  std::erase_if(candidates, [&](const auto &d) { return pool(d) != preferred_pool; });
   auto count = [](const Device &d) {
     return static_cast<std::uint64_t>(d.active_sessions) + d.pending_sessions + d.retained_sessions;
   };
@@ -204,6 +221,7 @@ Selection select(const std::vector<Device> &snapshot, const Options &o, bool ret
     return std::make_pair(a.id, a.render_node) < std::make_pair(b.id, b.render_node);
   });
   result.device = *winner;
+  result.device->last_resort = is_last_resort(*winner, o);
   result.projected_encoder_percent = projected_encoder(*winner);
   return result;
 }

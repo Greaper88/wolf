@@ -1,0 +1,78 @@
+= GPU-selection primary promotion: 2026-10-20
+
+AI-Agent: ChatGPT Codex
+
+AI-Model-Version: GPT-6 family; exact serving version and reasoning setting unavailable
+
+AI-Inference-Date: 2026-10-20
+
+== Scope
+
+The maintainer requested promotion of `dev-gpu-selection` to the repository's
+default branch, `auto-gpu-selection`, before considering the NUMA branch.
+The primary publishing workflow maps this branch to `ghcr.io/greaper88/wolf:latest`.
+
+Merge development revision `876c298` into primary revision `c2a1744`, preserving
+primary-channel documentation and the `wolf-ui:latest` defaults in both generated
+configuration templates. Runtime C++ and tools match the tested development
+source. The development image channels remain available. NUMA placement, its
+launcher, and CPU-load-aware selection remain on `dev-NUMA-aware`.
+
+Update the primary README and GPU-selection guide to describe verified NVENC,
+shared application sessions, pinned assignments, and experimental NVIDIA limits.
+The inherited Codeberg mirror remains removed. Existing uncommitted work in the
+other checkouts is excluded from this promotion.
+
+== Upstream review
+
+Fetch upstream and resolve its actual default branch, now `beta` at `2d2ae00`.
+The previous stable tip `6a5053b` is already an ancestor of the development branch.
+Upstream has reset `stable` to historical release `40b0c5c`; that history is also
+already included.
+
+The commits unique to current upstream beta change Fedora packaging, release
+automation, and default guest images. They contain no runtime C++ changes.
+The fork already supports manually dispatched and serialized image publication.
+Do not combine the Fedora migration with this promotion of the tested Ubuntu
+image. Upstream's image smoke checks need adaptation to this image layout, and
+its organization administration tooling does not belong in this promotion.
+No upstream CUDA context ownership or producer recovery repair is available.
+
+== Validation
+
+Compare the merged `src` and `tools` trees with the tested development revision:
+only the two primary UI image defaults differ. Re-run the six existing standalone
+GPU suites against the byte-identical runtime source, the 14 driver-volume tests,
+and the 13 ray-tracing probe tests. The development revision's hosted Linux build
+and test matrix had passed all seven jobs before promotion.
+
+Validate both generated TOML configurations, the primary image channel mapping,
+the absence of NUMA source and the Codeberg workflow, and whitespace cleanliness.
+Source checks and existing development-image validation do not establish primary
+publication success. Keep the resulting hosted build, registry revision/digest,
+and unchanged development-image receipts separately after publication.
+
+The companion `wolf-ui:latest` and `wolf-ui:gpu-selection-dev` images have identical
+filesystem layers and runtime configuration; their labels differ. The committed
+UI source and tests also match, so a separate UI promotion is unnecessary.
+
+== Existing limits
+
+NVIDIA support remains experimental. A recent hardware session encountered a
+transient CUDA context initialization failure; the original video producer then
+continued supplying buffers rejected by the CUDA encoder. Recreating the Plasma
+producer recovered it. The initial OS-level failure remains unexplained.
+Read-only source review also identified an unreleased owning `GstContext`
+reference. This promotion does not repair either lifetime/recovery issue or claim
+that the reference leak caused that incident.
+
+The running development deployment and saved Compose configuration are not
+changed by branch or registry promotion. In particular, replacing it with the
+non-NUMA primary image would remove the NUMA behavior currently being tested.
+
+== Tools
+
+Codex execution and parallel source review, Git and GitHub CLI, Python, CTest,
+anonymous OCI registry inspection, Docker read-only inspection, and existing
+mock-based GPU regression binaries. No live application or GPU probes are run
+for this promotion.

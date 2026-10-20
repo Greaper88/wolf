@@ -1,9 +1,9 @@
 #include "runtime.hpp"
 
 namespace wolf::gpu {
-Runtime::Runtime(Options options, Inventory inventory, Generation generation, Probe probe)
+Runtime::Runtime(Options options, Inventory inventory, Generation generation, Probe probe, RayProbe ray_probe)
     : options_(std::move(options)), inventory_(std::move(inventory)), generation_(std::move(generation)),
-      probe_(std::move(probe)) {
+      probe_(std::move(probe)), ray_probe_(std::move(ray_probe)) {
   if (options_.enabled())
     worker_ = std::jthread([this](std::stop_token stop) { verify(stop); });
 }
@@ -48,6 +48,7 @@ Runtime::LaunchResult Runtime::prepare(const std::string &session_id, const std:
         for (auto &device : devices) {
           auto capability = cache_.lookup(device, generation);
           device.hardware_encoder = capability && capability->status == CapabilityCache::Status::ready;
+          device.hardware_ray_tracing = capability ? capability->ray_tracing.supported : std::nullopt;
           if (device.hardware_encoder)
             verified.emplace(device.id, std::make_pair(device, *capability));
           if (!blacklisted(device, options_) && device.accessible &&
@@ -93,31 +94,39 @@ Runtime::LaunchResult Runtime::retain(const std::string &app_id, const Launch &p
           false,
           {}};
 }
-std::string Runtime::resume(const Launch &launch) {
-  return launch.reservation->resume(options_, [&] {
-    auto devices = inventory_();
-    for (auto &device : devices) {
-      auto cached = cache_.lookup(device, generation_());
-      device.hardware_encoder = cached && cached->status == CapabilityCache::Status::ready &&
-                                cached->revision == launch.capabilities.revision;
-    }
-    return devices;
-  });
+std::string Runtime::resume(const Launch &launch, const Launch *replacing) {
+  return launch.reservation->resume(
+      options_,
+      [&] {
+        auto devices = inventory_();
+        for (auto &device : devices) {
+          auto cached = cache_.lookup(device, generation_());
+          device.hardware_encoder = cached && cached->status == CapabilityCache::Status::ready &&
+                                    cached->revision == launch.capabilities.revision;
+          device.hardware_ray_tracing = cached ? cached->ray_tracing.supported : std::nullopt;
+        }
+        return devices;
+      },
+      replacing ? replacing->reservation.get() : nullptr);
 }
 bool Runtime::supports(Codec codec) const {
   if (!options_.enabled())
     return false;
   try {
     auto generation = generation_();
-    for (const auto &device : inventory_()) {
+    for (auto device : inventory_()) {
       if (!device.accessible || blacklisted(device, options_))
         continue;
       auto capability = cache_.lookup(device, generation);
       if (capability && capability->status == CapabilityCache::Status::ready) {
+        device.hardware_ray_tracing = capability->ray_tracing.supported;
+        if (!options_.allow_last_resort && is_last_resort(device, options_))
+          continue;
         const auto &binding = capability->codecs[static_cast<std::size_t>(codec)].encoder;
         const auto &h264 = capability->codecs[0].encoder;
         const bool zero_copy = options_.use_zero_copy && h264 && h264->zero_copy_postproc.has_value();
-        if (binding && binding->plugin == "va" && (!zero_copy || binding->zero_copy_postproc))
+        if (binding && (binding->plugin == "va" || (binding->plugin == "nvcodec" && binding->cuda_device)) &&
+            (!zero_copy || binding->zero_copy_postproc))
           return true;
       }
     }
@@ -147,16 +156,22 @@ void Runtime::verify(std::stop_token stop) {
           return;
         if (!device.accessible || blacklisted(device, options_))
           continue;
-        cache_.verify(device, generation, [&](const Device &d, Codec codec) {
-          if (stop.stop_requested())
-            return EncoderProbeResult{};
-          auto result = probe_(d, codec, stop);
-          if (options_.require_zero_copy && result.encoder && !result.encoder->zero_copy_postproc) {
-            result.encoder.reset();
-            result.failures.emplace_back("Excluded by WOLF_GPU_REQUIRE_ZERO_COPY: no verified zero-copy path");
-          }
-          return result;
-        });
+        cache_.verify(
+            device,
+            generation,
+            [&](const Device &d, Codec codec) {
+              if (stop.stop_requested())
+                return EncoderProbeResult{};
+              auto result = probe_(d, codec, stop);
+              if (options_.require_zero_copy && result.encoder && !result.encoder->zero_copy_postproc) {
+                result.encoder.reset();
+                result.failures.emplace_back("Excluded by WOLF_GPU_REQUIRE_ZERO_COPY: no verified zero-copy path");
+              }
+              return result;
+            },
+            options_.prefer_ray_tracing && ray_probe_
+                ? CapabilityCache::RayProbe{[&](const Device &d) { return ray_probe_(d, stop); }}
+                : CapabilityCache::RayProbe{});
       }
     } catch (...) {
       // Failed discovery cannot authorize a formerly present device.

@@ -27,6 +27,14 @@ UnixSocketServer::UnixSocketServer(boost::asio::io_context &io_context,
                     // TODO: json_schema = rfl::json::to_schema<EventsVariant>()
                     .handler = [this](auto req, auto socket) { endpoint_Events(req, socket); }});
 
+  state_->http.add(HTTPMethod::GET,
+                   "/api/v1/status",
+                   {.summary = "Read live GPU, connection and app container status",
+                    .description = "Read-only monitoring. Bitrate is the negotiated encoder target in kbps. "
+                                   "Missing telemetry means unavailable. No pairing or stream secrets are returned.",
+                    .response_description = {{200, {.json_schema = rfl::json::to_schema<StatusResponse>()}}},
+                    .handler = [this](auto req, auto socket) { endpoint_Status(req, socket); }});
+
   /**
    * Pairing API
    */
@@ -376,7 +384,16 @@ void UnixSocketServer::send_http(std::shared_ptr<UnixSocket> socket,
                                  int status_code,
                                  const std::vector<std::string_view> &http_headers,
                                  std::string_view body) {
-  auto http_reply = fmt::format("HTTP/1.0 {} OK\r\n{}\r\n\r\n{}", status_code, fmt::join(http_headers, "\r\n"), body);
+  auto response_headers = http_headers;
+  // Ordinary API connections serve one request. Prevent clients from pooling
+  // their closing socket, while retaining the explicit keep-alive for SSE.
+  if (std::none_of(response_headers.begin(), response_headers.end(), [](std::string_view header) {
+        return utils::to_lower(header.substr(0, 11)) == "connection:";
+      })) {
+    response_headers.push_back("Connection: close");
+  }
+  auto http_reply =
+      fmt::format("HTTP/1.0 {} OK\r\n{}\r\n\r\n{}", status_code, fmt::join(response_headers, "\r\n"), body);
   send_data(socket, http_reply);
 }
 

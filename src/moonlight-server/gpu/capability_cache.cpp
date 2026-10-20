@@ -18,7 +18,7 @@ std::optional<CapabilityCache::Ticket> CapabilityCache::begin(const Device &devi
   entries_.insert_or_assign(device.id, Entry{device.render_node, device.driver, generation, sequence, {}});
   return Ticket{device.id, sequence};
 }
-bool CapabilityCache::complete(const Ticket &ticket, Results results) {
+bool CapabilityCache::complete(const Ticket &ticket, Results results, RayTracingResult ray_tracing) {
   std::lock_guard lock(mutex_);
   auto found = entries_.find(ticket.id);
   if (found == entries_.end() || found->second.sequence != ticket.sequence ||
@@ -33,10 +33,16 @@ bool CapabilityCache::complete(const Ticket &ticket, Results results) {
       result.failures.emplace_back("Probe result does not match the requested device/codec");
     }
   }
-  entry.snapshot = {results[0].encoder ? Status::ready : Status::unavailable, std::move(results), entry.sequence};
+  entry.snapshot = {results[0].encoder ? Status::ready : Status::unavailable,
+                    std::move(results),
+                    entry.sequence,
+                    std::move(ray_tracing)};
   return true;
 }
-bool CapabilityCache::verify(const Device &device, const std::string &generation, const Probe &probe) {
+bool CapabilityCache::verify(const Device &device,
+                             const std::string &generation,
+                             const Probe &probe,
+                             const RayProbe &ray_probe) {
   auto ticket = begin(device, generation);
   if (!ticket)
     return false;
@@ -49,7 +55,15 @@ bool CapabilityCache::verify(const Device &device, const std::string &generation
       results[i].failures.emplace_back("Encoder capability worker failed");
     }
   }
-  return complete(*ticket, std::move(results));
+  RayTracingResult ray_tracing;
+  if (ray_probe) {
+    try {
+      ray_tracing = ray_probe(device);
+    } catch (...) {
+      ray_tracing.reason = "Ray-tracing capability worker failed";
+    }
+  }
+  return complete(*ticket, std::move(results), std::move(ray_tracing));
 }
 std::optional<CapabilityCache::Snapshot> CapabilityCache::lookup(const Device &device,
                                                                  const std::string &generation) const {

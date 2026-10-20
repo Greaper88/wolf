@@ -16,6 +16,11 @@ struct AudioServer {
   std::optional<docker::Container> container = {};
 };
 
+// An old RTP waiter must not pause a newer connection with the same client ID.
+void pause_timed_out_video(const immer::box<state::AppState> &app_state,
+                           std::size_t session_id,
+                           const std::array<char, 16> &rtp_payload);
+
 immer::vector<immer::box<events::EventBusHandlers>>
 setup_moonlight_handlers(const immer::box<state::AppState> &app_state,
                          const std::string &runtime_dir,

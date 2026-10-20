@@ -201,6 +201,14 @@ void UnixSocketServer::endpoint_RemoveProfile(const HTTPRequest &req, std::share
   }
 }
 
+void UnixSocketServer::endpoint_Status(const HTTPRequest &req, std::shared_ptr<UnixSocket> socket) {
+  try {
+    send_http(socket, 200, rfl::json::write(make_status(*state_->app_state, wolf::gpu::discover())));
+  } catch (const std::exception &) {
+    send_http(socket, 500, rfl::json::write(GenericErrorResponse{.error = "Live status unavailable"}));
+  }
+}
+
 void UnixSocketServer::endpoint_StreamSessions(const HTTPRequest &req, std::shared_ptr<UnixSocket> socket) {
   auto res = StreamSessionListResponse{.success = true};
   auto sessions = state_->app_state->running_sessions->load();
@@ -365,6 +373,15 @@ void UnixSocketServer::endpoint_StreamSessionStart(const HTTPRequest &req, std::
     if (auto session = state::get_session_by_id(sessions.get(), session_id)) {
       auto video_session = start_req.value().video_session;
       video_session.session_id = session_id; // Can't be JSON encoded
+      video_session.monitoring = session->monitoring;
+      if (!video_session.gst_pipeline.empty()) {
+        if (video_session.gst_pipeline == session->app->av1_gst_pipeline)
+          video_session.monitoring_codec = std::string("AV1");
+        else if (video_session.gst_pipeline == session->app->hevc_gst_pipeline)
+          video_session.monitoring_codec = std::string("HEVC");
+        else if (video_session.gst_pipeline == session->app->h264_gst_pipeline)
+          video_session.monitoring_codec = std::string("H.264");
+      }
       video_session.gpu_route = session->gpu_route;
       video_session.gpu_launch = session->gpu_launch;
       video_session.video_context = session->video_context;
@@ -510,11 +527,11 @@ void UnixSocketServer::endpoint_LobbyCreate(const wolf::api::HTTPRequest &req, s
     auto lobby_id = state::gen_uuid();
     std::shared_ptr<const events::GpuStreamTarget> target;
     if (state_->app_state->gpu_runtime) {
-      if (!event->source_session_id || event->multi_user) {
+      if (!event->source_session_id) {
         send_http(socket,
                   400,
                   rfl::json::write(GenericErrorResponse{
-                      .error = "Automatic GPU apps require an updated Wolf UI and a single-user launch"}));
+                      .error = "Automatic GPU apps require an updated Wolf UI with a source session"}));
         return;
       }
       auto source = state::get_session_by_id(state_->app_state->running_sessions->load(), *event->source_session_id);
@@ -525,6 +542,14 @@ void UnixSocketServer::endpoint_LobbyCreate(const wolf::api::HTTPRequest &req, s
       for (const auto &existing : *state_->app_state->lobbies->load()) {
         if (existing.gpu_target && existing.started_by_profile_id == event->profile_id.get() &&
             existing.runner_state_folder == event->runner_state_folder) {
+          if (existing.multi_user != event->multi_user) {
+            send_http(socket,
+                      409,
+                      rfl::json::write(GenericErrorResponse{
+                          .error = "This app is already running in a different sharing mode. Stop it "
+                                   "before changing modes; unsaved progress may be lost."}));
+            return;
+          }
           send_http(socket, 200, rfl::json::write(LobbyCreateResponse{.lobby_id = existing.id}));
           return;
         }

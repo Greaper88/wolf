@@ -1,6 +1,20 @@
 #include "admission.hpp"
 
 namespace wolf::gpu {
+namespace {
+constexpr auto handshake_timeout = std::chrono::seconds(30);
+}
+Admission::Admission(Now now) : state_(std::make_shared<State>(std::move(now))) {}
+void Admission::State::expire_handshakes() {
+  const auto timestamp = now();
+  for (auto &[session, assignment] : assignments) {
+    if (assignment.handshake_deadline && timestamp >= *assignment.handshake_deadline) {
+      assignment.active = false;
+      assignment.retained = true;
+      assignment.handshake_deadline.reset();
+    }
+  }
+}
 Admission::Reservation::~Reservation() {
   release();
 }
@@ -18,12 +32,16 @@ void Admission::Reservation::cancel() {
     auto &assignment = state_->assignments.at(session_);
     assignment.active = false;
     assignment.retained = false;
+    assignment.handshake_deadline.reset();
   }
 }
 void Admission::Reservation::activate() {
   std::lock_guard lock(state_->mutex);
-  if (armed_ && !cancelled_)
-    state_->assignments.at(session_).active = true;
+  if (armed_ && !cancelled_) {
+    auto &assignment = state_->assignments.at(session_);
+    assignment.active = true;
+    assignment.handshake_deadline.reset();
+  }
 }
 void Admission::Reservation::deactivate() {
   std::lock_guard lock(state_->mutex);
@@ -34,12 +52,18 @@ bool Admission::Reservation::valid() const {
   std::lock_guard lock(state_->mutex);
   return armed_ && !cancelled_;
 }
+bool Admission::Reservation::encoding() const {
+  std::lock_guard lock(state_->mutex);
+  return armed_ && encoding_;
+}
 std::uint64_t Admission::Reservation::begin_encoder() {
   std::lock_guard lock(state_->mutex);
+  state_->expire_handshakes();
   if (!armed_ || cancelled_ || encoding_ || state_->assignments.at(session_).retained)
     return 0;
   encoding_ = true;
   state_->assignments.at(session_).active = false;
+  state_->assignments.at(session_).handshake_deadline.reset();
   return ++epoch_;
 }
 void Admission::Reservation::encoder_active(std::uint64_t epoch) {
@@ -49,11 +73,14 @@ void Admission::Reservation::encoder_active(std::uint64_t epoch) {
 }
 void Admission::Reservation::end_encoder(std::uint64_t epoch, bool handoff) {
   std::lock_guard lock(state_->mutex);
-  if (armed_ && !cancelled_ && epoch && epoch == epoch_) {
+  if (armed_ && epoch && epoch == epoch_) {
     encoding_ = false;
+    if (cancelled_)
+      return;
     auto &assignment = state_->assignments.at(session_);
     assignment.active = false;
     assignment.retained = !handoff;
+    assignment.handshake_deadline = handoff ? std::optional{state_->now() + handshake_timeout} : std::nullopt;
   }
 }
 void Admission::Reservation::pause() {
@@ -62,6 +89,7 @@ void Admission::Reservation::pause() {
     auto &assignment = state_->assignments.at(session_);
     assignment.active = false;
     assignment.retained = true;
+    assignment.handshake_deadline.reset();
   }
 }
 void Admission::Reservation::fail(const std::string &message) {
@@ -72,8 +100,11 @@ std::string Admission::Reservation::error() const {
   std::lock_guard lock(state_->mutex);
   return error_;
 }
-std::string Admission::Reservation::resume(const Options &options, const std::function<std::vector<Device>()> &sample) {
+std::string Admission::Reservation::resume(const Options &options,
+                                           const std::function<std::vector<Device>()> &sample,
+                                           const Reservation *replacing) {
   std::lock_guard lock(state_->mutex);
+  state_->expire_handshakes();
   if (!armed_ || cancelled_)
     return "Session is closing; wait for teardown to finish";
   if (encoding_)
@@ -89,6 +120,9 @@ std::string Admission::Reservation::resume(const Options &options, const std::fu
     device.active_sessions = device.pending_sessions = device.retained_sessions = 0;
     for (const auto &[session, assignment] : state_->assignments) {
       if (session == session_ || assignment.device_id != device.id)
+        continue;
+      if (replacing && replacing->state_ == state_ && replacing->armed_ && !replacing->cancelled_ &&
+          session == replacing->session_)
         continue;
       if (assignment.retained)
         ++device.retained_sessions;
@@ -112,6 +146,7 @@ std::string Admission::Reservation::resume(const Options &options, const std::fu
   }
   own.retained = false;
   own.active = false;
+  own.handshake_deadline = state_->now() + handshake_timeout;
   error_.clear();
   return {};
 }
@@ -120,7 +155,7 @@ Admission::Result Admission::retain(const std::string &id, const Reservation &pa
   if (parent.state_ != state_ || !parent.armed_ || parent.cancelled_ || state_->assignments.count(id))
     return {nullptr, false, "Cannot retain GPU for this app"};
   auto result = std::shared_ptr<Reservation>(new Reservation(state_, id, parent.metadata_));
-  state_->assignments.emplace(id, Assignment{parent.metadata_.id, false, true});
+  state_->assignments.emplace(id, Assignment{parent.metadata_.id, false, true, {}});
   result->armed_ = true;
   return {result, false, {}};
 }
@@ -143,6 +178,7 @@ Admission::Result Admission::acquire(const std::string &session_id,
     if (pass)
       delay(); // No allocator lock held during the retry delay.
     std::unique_lock lock(state_->mutex);
+    state_->expire_handshakes();
     if (state_->assignments.count(session_id))
       return {nullptr, false, "Session already has a GPU reservation; resume it or wait for teardown to finish"};
     auto snapshot = sample();
@@ -172,7 +208,7 @@ Admission::Result Admission::acquire(const std::string &session_id,
                         metadata(device,
                                  selection.projected_encoder_percent,
                                  device.active_sessions + device.pending_sessions + device.retained_sessions + 1)));
-    state_->assignments.emplace(session_id, Assignment{device.id});
+    state_->assignments.emplace(session_id, Assignment{device.id, false, false, state_->now() + handshake_timeout});
     reservation->armed_ = true;
     return {std::move(reservation), false, {}};
   }

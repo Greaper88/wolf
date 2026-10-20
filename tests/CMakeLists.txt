@@ -17,8 +17,10 @@ add_executable(wolftests main.cpp)
 set(SRC_LIST
         main.cpp
         testControl.cpp
+        testDockerHotplug.cpp
         testCrypto.cpp
         testGSTPlugin.cpp
+        testSharedVideo.cpp
         testMoonlight.cpp
         testRTSP.cpp
         testWolfAPI.cpp
@@ -119,3 +121,11 @@ catch_discover_tests(wolftests
 
 # Dependency-free policy/provider regression suite.
 add_subdirectory(gpu)
+
+find_package(Python3 COMPONENTS Interpreter)
+if(Python3_Interpreter_FOUND)
+  add_test(NAME ray_tracing_probe_tests
+           COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_SOURCE_DIR}/gpu/ray_tracing_probe_test.py)
+  add_test(NAME nvidia_driver_volume_policy_tests
+           COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_SOURCE_DIR}/docker/test_nvidia_driver_volume.py)
+endif()

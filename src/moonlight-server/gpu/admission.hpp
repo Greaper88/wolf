@@ -1,5 +1,6 @@
 #pragma once
 #include "selector.hpp"
+#include <chrono>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -8,14 +9,25 @@ namespace wolf::gpu {
 // Own one Admission per AppState, never one per request. Reservations span asynchronous startup.
 // This is the launch-time boundary; the runtime must supply device-specific encoder probing.
 class Admission {
+public:
+  using Clock = std::chrono::steady_clock;
+  using Now = std::function<Clock::time_point()>;
+  explicit Admission(Now now = [] { return Clock::now(); });
+
+private:
   struct Assignment {
     std::string device_id;
     bool active = false;
     bool retained = false;
+    std::optional<Clock::time_point> handshake_deadline;
   };
   struct State {
+    explicit State(Now clock) : now(std::move(clock)) {}
+    // Called only under mutex. Expiration releases encoder demand, never the app's GPU pin.
+    void expire_handshakes();
     std::mutex mutex;
     std::map<std::string, Assignment> assignments;
+    const Now now;
   };
 
 public:
@@ -32,7 +44,10 @@ public:
     void cancel();
     // Keep the app pinned; release encoder demand only after the pipeline has torn down.
     void pause();
-    std::string resume(const Options &options, const std::function<std::vector<Device>()> &sample);
+    // replacing is the joining viewer's dedicated encoder, which retires before the new one starts.
+    std::string resume(const Options &options,
+                       const std::function<std::vector<Device>()> &sample,
+                       const Reservation *replacing = nullptr);
     void fail(const std::string &message);
     std::string error() const;
     std::uint64_t begin_encoder();
@@ -40,6 +55,7 @@ public:
     // Preserve admission only while replacing the same viewer encoder on the same GPU.
     void end_encoder(std::uint64_t epoch, bool handoff = false);
     bool valid() const;
+    bool encoding() const;
     const SessionGpu &gpu() const {
       return metadata_;
     }
@@ -73,6 +89,6 @@ public:
   unsigned int count(const std::string &device_id) const;
 
 private:
-  std::shared_ptr<State> state_ = std::make_shared<State>();
+  std::shared_ptr<State> state_;
 };
 } // namespace wolf::gpu

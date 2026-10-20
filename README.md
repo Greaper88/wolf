@@ -1,7 +1,9 @@
 # Automatic GPU selection fork
 
 This fork automatically detects, selects, rejects, and balances assignments across GPUs
-in a multi-GPU system. `auto-gpu-selection` is the primary branch for the tested AMD/Mesa implementation.
+in a multi-GPU system. `auto-gpu-selection` is the primary branch and includes
+AMD/Mesa and Intel VA-API support, experimental NVIDIA CUDA/NVENC support, and
+shared application sessions.
 
 Use these matching images:
 
@@ -28,19 +30,32 @@ See the [GPU selection guide](docs/modules/user/pages/gpu-auto-selection.adoc) f
 | --- | --- | --- | --- |
 | Primary | `auto-gpu-selection` | `ghcr.io/greaper88/wolf:latest` | `ghcr.io/greaper88/wolf-ui:latest` |
 | Development | `dev-gpu-selection` | `ghcr.io/greaper88/wolf:gpu-selection-dev` | `ghcr.io/greaper88/wolf-ui:gpu-selection-dev` |
+| NUMA development | `dev-NUMA-aware` | `ghcr.io/greaper88/wolf:numa-aware-dev` | `ghcr.io/greaper88/wolf-ui:gpu-selection-dev` |
 
-Future NVIDIA and vGPU work continues on `dev-gpu-selection`. Wolf's `stable` branch
-is retained for upstream updates. Use both images from the same channel.
+The development channels remain available. NUMA placement and CPU-load-aware GPU
+selection remain on `dev-NUMA-aware`; they are not included in this primary release.
+Wolf's `stable` branch is retained for upstream updates. Use the companion UI image
+listed for the selected channel.
+
+Optional selection preferences: `WOLF_GPU_PREFER_RAY_TRACING=FALSE` and
+`WOLF_GPU_ALLOW_LAST_RESORT=TRUE`. Enable RT preference to favor verified RT
+cards; disable last-resort use to exclude fallback cards. Individual GPUs can
+be excluded with the existing `WOLF_GPU_BLACKLIST` Compose setting.
 
 ## Limitations
 
-- Automatic GPU selection currently requires verified VA-API hardware encoding.
-  Tested with AMD/Mesa; Intel GPUs must pass the startup capability checks.
-- NVIDIA-only users should continue using upstream Wolf for now.
-  Automatic NVIDIA/NVENC selection and load balancing are not yet implemented in this fork.
+- Automatic GPU selection requires startup-verified VA-API or NVENC hardware encoding.
+  AMD/Mesa and Intel use VA-API; NVIDIA uses device-bound CUDA/NVENC.
+- NVIDIA support remains experimental. Hardware validation includes GTX 1080 and
+  Quadro RTX 4000 cards. Wolf's container needs NVIDIA library/device injection
+  (for example, native CDI with the NVIDIA Container Toolkit) and DRM modesetting
+  enabled. Version-matched 64-bit and 32-bit app driver volumes are created and
+  checked at startup. See the [driver configuration](docs/modules/user/pages/configuration.adoc).
 - Running and paused apps remain pinned to their assigned GPU.
   Load balancing applies when assigning new sessions.
-- Simultaneous multi-user lobby sharing is not supported with automatic GPU selection.
+- Multi-user lobbies use their app's pinned GPU. Compatible viewers share an
+  encoder; different stream settings require a separately admitted encoder.
+- Virtual GPU slicing and management are not implemented.
 
 # games-on-whales/wolf
 
