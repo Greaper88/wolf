@@ -41,6 +41,12 @@ hosted build could not run the repository's APT installation steps. A filesystem
 export verified Ubuntu 25.04, APT and the existing package-source configuration
 in the pinned base; the configured official package endpoints were reachable.
 
+The hosted matrix built successfully on both architectures, then exposed a
+shared runner dependency gap: `h264parse` was absent in two shared-video tests.
+Install `gstreamer1.0-plugins-bad` alongside the existing base and ugly plug-ins
+so those existing tests can construct their pipelines. This changes the CI
+environment rather than streaming code.
+
 == Validation and limits
 
 The ordinary branch repair was previously built and deployed locally. All five
