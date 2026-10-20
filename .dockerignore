@@ -11,3 +11,4 @@
 !docker/supervisord.conf
 !docker/nvidia-driver-volume.py
 !docker/nvidia-driver.Dockerfile
+!tools/numa-run.c

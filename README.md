@@ -1,9 +1,12 @@
-# Automatic GPU selection development fork:
+# NUMA-aware GPU selection development fork
 
-This is the `dev-gpu-selection` branch with experimental NVIDIA support and ongoing vGPU work. For the
+This is the `dev-NUMA-aware` branch, based on `dev-gpu-selection`, with GPU-local
+CPU affinity, preferred local RAM, and CPU-aware GPU selection on NUMA hosts.
+It includes the GPU-selection branch's experimental NVIDIA support and reconnect fixes. For the
 primary AMD/Mesa release, use [`auto-gpu-selection`](https://github.com/Greaper88/wolf/tree/auto-gpu-selection)
 and the matching `ghcr.io/greaper88/wolf:latest` / `ghcr.io/greaper88/wolf-ui:latest` images.
-The development image pair below remains available for testing.
+The development images below remain available for testing. The ordinary GPU-selection
+branch continues to use `ghcr.io/greaper88/wolf:gpu-selection-dev`.
 
 **If migrating from an existing install from the upstream fork, the Wolf-UI image in the config.toml file will need to be updated.**
 
@@ -11,7 +14,7 @@ This fork aims to automatically detect, select, reject, and load balance across 
 This fork uses the following two images:
 
 In the Docker launch or Compose:
- -  ghcr.io/greaper88/wolf:gpu-selection-dev
+ -  ghcr.io/greaper88/wolf:numa-aware-dev
 
 In the `config.toml` file (change only if config is pre-existing):
  -  ghcr.io/greaper88/wolf-ui:gpu-selection-dev
@@ -20,6 +23,18 @@ Optional selection preferences: `WOLF_GPU_PREFER_RAY_TRACING=FALSE` and
 `WOLF_GPU_ALLOW_LAST_RESORT=TRUE`. Enable RT preference to favor verified RT
 cards; disable last-resort use to exclude fallback cards. Individual GPUs can
 be excluded with the existing `WOLF_GPU_BLACKLIST` Compose setting.
+
+`WOLF_NUMA_MODE=auto` is the default. Compatible multi-node hosts keep each
+session's CPUs local to its selected GPU and prefer local RAM with permitted
+remote fallback. Comparable GPUs can be ranked by their local CPU load. Ordinary
+single-node systems skip NUMA placement and CPU-load sampling. Use `on` to request
+placement explicitly or `off` for ordinary scheduling.
+
+Allow memory-policy syscalls in Wolf's container, for example with `cap_add: [SYS_NICE]`
+in its saved Compose configuration. Existing operator resource limits still apply;
+CPU affinity does not spill into the other node. See the
+[NUMA configuration guide](docs/modules/user/pages/numa-awareness.adoc) for setup,
+permissions and placement limits. The companion UI remains `wolf-ui:gpu-selection-dev`.
 
 ## Limitations
 - Automatic GPU selection requires startup-verified VA-API or NVENC hardware encoding.

@@ -217,7 +217,7 @@ jobs:
 
       - name: Test NUMA policy and guest launcher
         working-directory: ${{runner.workspace}}/build
-        run: ctest --test-dir tests -R '^(gpu_numa_tests|numa_bootstrap_tests)$' --output-on-failure
+        run: ctest --test-dir tests -R '^(gpu_numa_tests|gpu_numa_load_tests|numa_bootstrap_tests)$' --output-on-failure
 
       - name: Test Report
         uses: dorny/test-reporter@v3

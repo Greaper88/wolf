@@ -2,7 +2,7 @@ name: Publish container image
 
 on:
   push:
-    branches: [auto-gpu-selection, dev-gpu-selection]
+    branches: [auto-gpu-selection, dev-gpu-selection, dev-NUMA-aware]
     paths-ignore:
       - "docs/**"
       - "**/*.md"
@@ -18,7 +18,7 @@ concurrency:
 
 jobs:
   publish:
-    if: github.ref_name == 'auto-gpu-selection' || github.ref_name == 'dev-gpu-selection'
+    if: github.ref_name == 'auto-gpu-selection' || github.ref_name == 'dev-gpu-selection' || github.ref_name == 'dev-NUMA-aware'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -31,6 +31,7 @@ jobs:
           case "$GITHUB_REF_NAME" in
             auto-gpu-selection) tag=latest ;;
             dev-gpu-selection) tag=gpu-selection-dev ;;
+            dev-NUMA-aware) tag=numa-aware-dev ;;
             *) exit 1 ;;
           esac
           echo "tag=$tag" >> "$GITHUB_OUTPUT"

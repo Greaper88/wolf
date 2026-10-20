@@ -1,4 +1,5 @@
-ARG BASE_IMAGE=ghcr.io/games-on-whales/gstreamer:1.26.7
+# Pin the tested Ubuntu base: the mutable GStreamer tag can switch distributions and break apt-based stages.
+ARG BASE_IMAGE=ghcr.io/games-on-whales/gstreamer@sha256:512b53b03b256a87fb4bd204ed1d91219148b0b77ff4ee4fc121c37d869f8d29
 ########################################################
 # GStreamer's CUDA converter needs newer NVRTC APIs than the base image's
 # CUDA 11.0 compiler provides. Pin the same CUDA 12.4 compiler tested locally.
