@@ -11,13 +11,28 @@ namespace wolf::core::sessions {
 
 using session_devices = immer::map<std::string /* session_id */, std::shared_ptr<events::devices_atom_queue>>;
 
+void pause_timed_out_video(const immer::box<state::AppState> &app_state,
+                           std::size_t session_id,
+                           const std::array<char, 16> &rtp_payload) {
+  // Serialize the identity check and pause with HTTPS connection replacement.
+  std::lock_guard transition(*app_state->gpu_transitions);
+  auto current = state::get_session_by_id(app_state->running_sessions->load(), session_id);
+  if (current && current->rtp_secret_payload == rtp_payload && current->gpu_launch &&
+      current->gpu_launch->reservation->valid() && !(current->gpu_route && current->gpu_route->streaming.load())) {
+    logs::log(logs::warning, "[GPU] Video handshake timed out for session {}; retaining app GPU", session_id);
+    app_state->event_bus->fire_event(
+        immer::box<events::PauseStreamEvent>(events::PauseStreamEvent{.session_id = session_id}));
+  }
+}
+
 /**
  * Will stop the execution until an event of type RTPPingType is triggered
  * and the signature is matching the input `sess`.
  * Returns the RTPPingType event
  */
 template <typename RTPPingType>
-std::optional<RTPPingType> wait_for_ping(std::shared_ptr<events::EventBusType> ev_bus, const auto &sess) {
+std::optional<RTPPingType> wait_for_ping(const immer::box<state::AppState> &app_state, const auto &sess) {
+  auto ev_bus = app_state->event_bus;
   auto ping_promise = std::make_shared<std::promise<std::optional<RTPPingType>>>();
   auto ping_future = ping_promise->get_future();
   auto resolved = std::make_shared<std::atomic_bool>(false);
@@ -53,9 +68,7 @@ std::optional<RTPPingType> wait_for_ping(std::shared_ptr<events::EventBusType> e
   if (ping_future.wait_for(std::chrono::seconds(30)) == std::future_status::timeout) {
     cancel();
     if constexpr (std::is_same_v<RTPPingType, events::RTPVideoPingEvent>) {
-      if (auto launch = sess->gpu_launch.get(); launch && launch->reservation->valid())
-        ev_bus->fire_event(
-            immer::box<events::PauseStreamEvent>(events::PauseStreamEvent{.session_id = sess->session_id}));
+      pause_timed_out_video(app_state, sess->session_id, sess->rtp_secret_payload);
     }
   }
   auto ping_ev = ping_future.get();
@@ -319,11 +332,11 @@ setup_moonlight_handlers(const immer::box<state::AppState> &app_state,
       }));
 
   handlers.push_back(app_state->event_bus->register_handler<immer::box<events::VideoSession>>(
-      [ev_bus = app_state->event_bus,
-       gst_context = app_state->gst_context](const immer::box<events::VideoSession> &sess) {
+      [app_state, ev_bus = app_state->event_bus, gst_context = app_state->gst_context](
+          const immer::box<events::VideoSession> &sess) {
         // Start a thread that will wait for the RTP ping event
-        std::thread([sess, ev_bus, gst_context]() {
-          auto ping_ev = wait_for_ping<events::RTPVideoPingEvent>(ev_bus, sess);
+        std::thread([sess, app_state, ev_bus, gst_context]() {
+          auto ping_ev = wait_for_ping<events::RTPVideoPingEvent>(app_state, sess);
           if (!ping_ev)
             return;
           auto session_context = sess->video_context.get() ? sess->video_context.get() : gst_context;
@@ -354,10 +367,10 @@ setup_moonlight_handlers(const immer::box<state::AppState> &app_state,
       }));
 
   handlers.push_back(app_state->event_bus->register_handler<immer::box<events::AudioSession>>(
-      [ev_bus = app_state->event_bus, audio_server](const immer::box<events::AudioSession> &sess) {
+      [app_state, ev_bus = app_state->event_bus, audio_server](const immer::box<events::AudioSession> &sess) {
         // Start a thread that will wait for the RTP ping event
-        std::thread([sess, ev_bus, audio_server]() {
-          auto ping_ev = wait_for_ping<events::RTPAudioPingEvent>(ev_bus, sess);
+        std::thread([sess, app_state, ev_bus, audio_server]() {
+          auto ping_ev = wait_for_ping<events::RTPAudioPingEvent>(app_state, sess);
           if (!ping_ev)
             return;
 

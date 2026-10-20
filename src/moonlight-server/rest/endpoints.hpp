@@ -464,6 +464,7 @@ void resume(const std::shared_ptr<typename SimpleWeb::Server<SimpleWeb::HTTPS>::
             const state::PairedClient &current_client,
             const immer::box<state::AppState> &state) {
   log_req<SimpleWeb::HTTPS>(request);
+  std::lock_guard transition(*state->gpu_transitions);
 
   auto client_ip = get_client_ip<SimpleWeb::HTTPS>(request);
   auto old_session = state::get_session_by_client(state->running_sessions->load(), current_client);
