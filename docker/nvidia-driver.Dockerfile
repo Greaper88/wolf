@@ -7,9 +7,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 COPY nvidia-driver-volume.py /opt/wolf/nvidia-driver-volume.py
 RUN mkdir -p /usr/nvidia \
-    && curl --fail --location --retry 3 \
+    && (curl --fail --location --retry 3 \
         "https://download.nvidia.com/XFree86/Linux-x86_64/${NV_VERSION}/NVIDIA-Linux-x86_64-${NV_VERSION}.run" \
         -o /tmp/nvidia.run \
+        || curl --fail --location --retry 3 \
+        "https://us.download.nvidia.com/tesla/${NV_VERSION}/NVIDIA-Linux-x86_64-${NV_VERSION}.run" \
+        -o /tmp/nvidia.run) \
     && sh /tmp/nvidia.run --silent -z --skip-depmod --skip-module-unload \
         --no-nvidia-modprobe --no-kernel-modules --no-kernel-module-source \
         --opengl-prefix=/usr/nvidia --wine-prefix=/usr/nvidia \

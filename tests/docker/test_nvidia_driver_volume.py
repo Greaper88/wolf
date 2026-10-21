@@ -1,10 +1,15 @@
 """Startup policy regressions; no Docker daemon, NVIDIA driver or network needed."""
 import importlib.util
 import json
+import os
 from pathlib import Path
+import re
+import subprocess
+import sys
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
+import urllib.parse
 
 SCRIPT = Path(__file__).resolve().parents[2] / "docker/nvidia-driver-volume.py"
 spec = importlib.util.spec_from_file_location("driver_volume", SCRIPT)
@@ -149,6 +154,95 @@ class StartupPolicyTests(unittest.TestCase):
                 manager.select_volume(FakeDocker(), version, "wolf")
         with self.assertRaises(ValueError):
             manager.select_volume(FakeDocker(), VERSION, "wolf", "volume:/unexpected")
+
+class InstallerDownloadTests(unittest.TestCase):
+    def run_download(self, primary_status, tesla_status):
+        # Run the actual Dockerfile download expression, with no network or installer execution.
+        source = SCRIPT.with_name("nvidia-driver.Dockerfile").read_text().replace("\\\n", "")
+        download = re.search(r"&& (\(curl.*?)\s*&& sh /tmp/nvidia\.run", source, re.DOTALL)
+        self.assertIsNotNone(download)
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            curl = root / "curl"
+            curl.write_text("#!" + sys.executable + "\n" + '''import os, sys
+from pathlib import Path
+url = next(arg for arg in sys.argv[1:] if arg.startswith("https://"))
+kind = "primary" if "/XFree86/" in url else "tesla"
+with Path(os.environ["CURL_LOG"]).open("a") as log:
+    log.write(url + "\\n")
+status = int(os.environ[kind.upper() + "_STATUS"])
+Path(sys.argv[sys.argv.index("-o") + 1]).write_text(kind if status == 0 else "partial")
+sys.exit(status)
+''')
+            curl.chmod(0o755)
+            output, marker, log = root / "nvidia.run", root / "installer-reached", root / "curl.log"
+            command = download.group(1).replace("/tmp/nvidia.run", str(output))
+            result = subprocess.run(["/bin/sh", "-c", command + ' && touch "$INSTALLER_MARKER"'],
+                                    env={**os.environ, "PATH": str(root) + os.pathsep + os.environ.get("PATH", ""),
+                                         "NV_VERSION": "615.71.10", "PRIMARY_STATUS": str(primary_status),
+                                         "TESLA_STATUS": str(tesla_status), "CURL_LOG": str(log),
+                                         "INSTALLER_MARKER": str(marker)}, capture_output=True, text=True)
+            return result.returncode, log.read_text().splitlines(), output.read_text(), marker.exists()
+
+    def test_primary_success_does_not_request_tesla(self):
+        status, urls, payload, installer = self.run_download(0, 22)
+        self.assertEqual(status, 0)
+        self.assertEqual(urls, ["https://download.nvidia.com/XFree86/Linux-x86_64/615.71.10/NVIDIA-Linux-x86_64-615.71.10.run"])
+        self.assertEqual(payload, "primary")
+        self.assertTrue(installer)
+
+    def test_primary_404_uses_same_version_tesla_payload(self):
+        status, urls, payload, installer = self.run_download(22, 0)
+        self.assertEqual(status, 0)
+        self.assertEqual(len(urls), 2)
+        self.assertEqual(urls[1], "https://us.download.nvidia.com/tesla/615.71.10/NVIDIA-Linux-x86_64-615.71.10.run")
+        self.assertTrue(all("/615.71.10/" in url and url.endswith("-615.71.10.run") for url in urls))
+        self.assertEqual(payload, "tesla")
+        self.assertTrue(installer)
+
+    def test_both_downloads_fail_without_running_installer_or_using_old_version(self):
+        status, urls, _, installer = self.run_download(22, 22)
+        self.assertNotEqual(status, 0)
+        self.assertEqual(len(urls), 2)
+        self.assertTrue(all("/615.71.10/" in url and url.endswith("-615.71.10.run") for url in urls))
+        self.assertFalse(installer)
+
+class DockerBuildTests(unittest.TestCase):
+    @staticmethod
+    def connection(status=200, body=None, events=()):
+        response = MagicMock()
+        response.status = status
+        response.read.return_value = b"" if body is None else json.dumps(body).encode()
+        response.__iter__.return_value = iter(json.dumps(event).encode() + b"\n" for event in events)
+        connection = MagicMock()
+        connection.getresponse.return_value = response
+        return connection
+
+    def test_build_removes_failed_intermediates_and_passes_only_matching_version(self):
+        connections = [self.connection(404), self.connection(events=[{"stream": "built\n"}]),
+                       self.connection(body={"Id": "driver-image"})]
+        with patch.object(manager, "UnixHTTP", side_effect=connections):
+            image = manager.Docker("/unused.sock").build(VERSION)
+        self.assertEqual(image, "wolf-nvidia-driver:" + VERSION + "-v" + manager.SCHEMA)
+        method, path, *_ = connections[1].request.call_args.args
+        self.assertEqual(method, "POST")
+        query = urllib.parse.parse_qs(urllib.parse.urlsplit(path).query)
+        self.assertEqual(query["rm"], ["1"])
+        self.assertEqual(query["forcerm"], ["1"])
+        self.assertEqual(json.loads(query["buildargs"][0]), {"NV_VERSION": VERSION})
+        self.assertTrue(all(connection.close.called for connection in connections))
+
+    def test_failed_build_does_not_create_candidate_volume(self):
+        connections = [self.connection(body={"Volumes": []}), self.connection(404),
+                       self.connection(events=[{"error": "curl exited 22"}])]
+        with patch.object(manager, "UnixHTTP", side_effect=connections):
+            with self.assertRaisesRegex(RuntimeError, "Driver package build failed: curl exited 22"):
+                manager.select_volume(manager.Docker("/unused.sock"), VERSION, "wolf")
+        calls = [connection.request.call_args.args for connection in connections]
+        self.assertFalse(any(path == "/volumes/create" for _, path, *_ in calls))
+        query = urllib.parse.parse_qs(urllib.parse.urlsplit(calls[-1][1]).query)
+        self.assertEqual(query["forcerm"], ["1"])
+        self.assertTrue(all(connection.close.called for connection in connections))
 
 if __name__ == "__main__":
     unittest.main()

@@ -137,7 +137,7 @@ class Docker:
             for source, target in [(Path(__file__).with_name("nvidia-driver.Dockerfile"), "Dockerfile"),
                                    (Path(__file__), "nvidia-driver-volume.py")]:
                 archive.add(source, arcname=target)
-        query = urllib.parse.urlencode(dict(t=image, version="1", rm="1",
+        query = urllib.parse.urlencode(dict(t=image, version="1", rm="1", forcerm="1",
                                             buildargs=json.dumps({"NV_VERSION": version})))
         connection = UnixHTTP(self.path)
         try:
