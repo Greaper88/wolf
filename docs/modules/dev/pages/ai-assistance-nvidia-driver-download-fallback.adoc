@@ -1,0 +1,52 @@
+= NVIDIA driver installer fallback: 2026-10-20
+
+AI-Agent: ChatGPT Codex
+
+AI-Model-Version: GPT-6 family; exact serving version and reasoning setting unavailable
+
+AI-Inference-Date: 2026-10-20
+
+== Problem and change
+
+After the host updated from NVIDIA 615.71.09 to 615.71.10, the driver provisioner
+requested a missing XFree86 installer URL. Docker's restart policy retried the
+failed startup and accumulated failed legacy build containers.
+
+Try the canonical NVIDIA XFree86 URL first, then NVIDIA's official Tesla path
+for the same exact loaded driver version. The fallback does not select an older
+driver or bypass the existing version, ELF architecture, manifest, or independent
+volume checks. Fail startup if both downloads fail. Add `forcerm=1` to Docker's
+build request so failed intermediate build containers are removed as well.
+
+Wolf already receives host driver injection through NVIDIA Container Toolkit/CDI.
+This separate package supplies the app-container driver volume, including 32-bit
+graphics libraries. The inspected host had current 64-bit libraries but no NVIDIA
+i386 libraries, so simply copying the host libraries would produce an incomplete
+package. Matching official APT packages are another possible source; this narrow
+repair retains the existing installer-based packaging layout.
+
+== Validation and deployment boundary
+
+All 19 driver provisioning tests pass, including three tests that execute the
+actual Dockerfile download expression with fake HTTP outcomes and two that verify
+build failure handling and failed-intermediate cleanup. No candidate volume is
+created after a failed build. Whitespace checks pass.
+
+The canonical 615.71.10 URL returned HTTP 404; the matching Tesla URL returned
+HTTP 200. A real package build downloaded that installer, verified its embedded
+archive integrity, installed only container user-space files, and passed the
+existing sealing checks for both ELF architectures. It does not install or
+change the host kernel module. Final local-image and live-deployment receipts are
+kept separately from these source checks.
+
+The runtime C++ and tools remain byte-identical to the deployed NUMA revision
+`ae117c6`. A local repair image can layer only the two updated provisioner files
+over that deployed image, preserving its binary and NUMA behavior. Applying it
+must update the saved Compose image references and recreate Wolf through Compose
+so host CDI injection is refreshed after the driver update.
+
+== Tools
+
+Codex execution, patching and parallel review; Git, Python unittest, Docker,
+official NVIDIA download endpoint checks, SHA-256 and ELF/manifest validation.
+No host driver package installation, kernel replacement or version downgrade.
