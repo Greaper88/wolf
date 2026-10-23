@@ -130,6 +130,8 @@ struct StreamVideoStatus {
   int fps;
   std::string render_node;
   std::optional<std::string> gpu_id;
+  // Only the successfully started worker publishes its applied affinity.
+  std::vector<unsigned> cpus;
 };
 struct StreamMonitoring {
   std::atomic<std::shared_ptr<const StreamVideoStatus>> video;
@@ -265,6 +267,8 @@ struct DockerContainerCreated {
   std::string name;
   std::string image;
   std::string render_node;
+  // Final accepted Docker cpuset, including per-app restrictions and automatic fallback.
+  std::vector<unsigned> cpus;
 };
 
 struct DockerContainerStopped {

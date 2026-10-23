@@ -111,6 +111,19 @@ failures. Check `HostConfig.CpusetCpus`, `HostConfig.CpusetMems`, and
 show `prefer=static:N` in `/proc/<pid>/numa_maps` when local memory preference is
 active. Shared/file-backed mappings may reflect another process's allocations.
 
+The safe `/api/v1/status` dashboard response also reports detected physical CPU
+packages, their logical CPU IDs and NUMA nodes, and each GPU's physical locality.
+This topology is cached when first requested and is independent of the placement
+setting. A CPU package can contain several NUMA nodes; the IDs are not interchangeable.
+Session `placement` reports the active video worker's kernel-confirmed CPU mask. Container
+`placement` reports the final accepted Docker CPU mask, including app restrictions
+and automatic fallback. These masks describe eligible CPUs, not the core executing
+at an instant. Missing placement remains unknown rather than being inferred from
+the GPU. Masks are captured when each worker or container starts; later external
+affinity changes, Docker updates and CPU hotplug are not sampled. Restart Wolf to
+refresh cached hardware topology. Existing containers receive telemetry when
+relaunched with this Wolf version.
+
 Locality can reduce cross-socket traffic, but it does not establish the cause of
 stutter or guarantee better frame times. Wolf's negotiated FPS describes the
 requested stream rate, rather than measured rendered FPS or dropped frames.

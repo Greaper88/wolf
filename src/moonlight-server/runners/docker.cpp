@@ -525,6 +525,15 @@ void RunDocker::run(std::string_view session_id,
     std::string inspected_hostname;
     if (auto inspected = docker_api.get_by_id(container_id); inspected && inspected->status == RUNNING) {
       inspected_hostname = inspected->hostname;
+      std::vector<unsigned> applied_cpus;
+      try {
+        const auto options = utils::parse_json(final_json_opts).as_object();
+        if (const auto *host = options.if_contains("HostConfig"); host && host->is_object())
+          if (const auto *mask = host->as_object().if_contains("CpusetCpus"); mask && mask->is_string())
+            applied_cpus = wolf::numa::parse_list(std::string_view(mask->as_string()));
+      } catch (const std::exception &) {
+        // Telemetry must never disrupt a successfully launched app or infer affinity from its GPU.
+      }
       this->ev_bus->fire_event(immer::box<events::DockerContainerCreated>{events::DockerContainerCreated{
           .container_id = container_id,
           .hostname = inspected->hostname,
@@ -532,6 +541,7 @@ void RunDocker::run(std::string_view session_id,
           .name = new_container.name,
           .image = new_container.image,
           .render_node = std::string(render_node),
+          .cpus = std::move(applied_cpus),
       }});
     } else {
       logs::log(logs::warning, "[DOCKER] Unable to inspect container {} for hostname", container_id);

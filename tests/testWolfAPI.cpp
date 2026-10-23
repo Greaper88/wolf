@@ -3,6 +3,7 @@
 #include <catch2/matchers/catch_matchers_string.hpp>
 #include <curl/curl.h>
 #include <filesystem>
+#include <fstream>
 #include <helpers/tsqueue.hpp>
 #include <helpers/utils.hpp>
 #include <rfl/toml.hpp>
@@ -881,6 +882,78 @@ TEST_CASE("Dashboard reports retained apps without confusing owners and viewers"
   REQUIRE(status.containers[0].profile_id == "owner");
 }
 
+TEST_CASE("Dashboard distinguishes CPU sockets, GPU locality and applied CPU masks", "[dashboard][numa]") {
+  auto sessions = std::make_shared<immer::atom<immer::vector<events::StreamSession>>>();
+  state::AppState state{.config = immer::box<state::Config>{state::Config{
+                            .profiles = std::make_shared<immer::atom<state::ProfilesList>>()}},
+                        .lobbies = std::make_shared<immer::atom<immer::vector<events::Lobby>>>(),
+                        .running_sessions = sessions};
+  // A socket can contain multiple NUMA nodes; their IDs are not interchangeable.
+  StatusTopology topology{.host = {.cpus = {{.id = 2, .name = "CPU A", .cpus = {0, 1, 2, 3}, .numa_nodes = {0, 1}},
+                                            {.id = 8, .name = "CPU B", .cpus = {4, 5}, .numa_nodes = {4}}},
+                                   .node_cpus = {{0, {0, 1}}, {1, {2, 3}}, {4, {4, 5}}}},
+                          .gpus = {{"local-gpu", {.numa_node = 4, .cpus = {4, 5}, .cpu_ids = {8}}}}};
+  std::vector<wolf::gpu::Device> devices{{.id = "local-gpu", .render_node = "/dev/dri/renderD130"},
+                                         {.id = "unknown-gpu", .render_node = "/dev/dri/renderD131"}};
+  events::StreamSession session{.app = std::make_shared<events::App>(events::App{.base = {.title = "Desktop"}}),
+                                .session_id = 42};
+  session.connected->store(true);
+  auto video = events::StreamVideoStatus{.codec = "HEVC",
+                                         .bitrate_kbps = 12000,
+                                         .width = 1920,
+                                         .height = 1080,
+                                         .fps = 60,
+                                         .gpu_id = "local-gpu"};
+  session.monitoring->video.store(std::make_shared<const events::StreamVideoStatus>(video));
+  sessions->update([&](const auto &current) { return current.push_back(session); });
+  state.active_containers->update([](const auto &current) {
+    return current.set("app",
+                       events::DockerContainerCreated{.container_id = "app",
+                                                      .session_id = "42",
+                                                      .name = "Desktop_42",
+                                                      .render_node = "/dev/dri/renderD130",
+                                                      .cpus = {5}});
+  });
+  auto status = make_status(state, devices, topology);
+  REQUIRE(status.version == 1);
+  REQUIRE(status.cpus.size() == 2);
+  REQUIRE(status.cpus[0].id == 2);
+  REQUIRE(status.cpus[0].numa_nodes == std::vector<unsigned>{0, 1});
+  REQUIRE(status.gpus[0].cpu_ids == std::vector<int>{8});
+  REQUIRE(status.gpus[0].numa_node == 4);
+  REQUIRE(status.gpus[0].local_cpus == std::vector<unsigned>{4, 5});
+  REQUIRE(status.gpus[1].cpu_ids.empty());
+  REQUIRE_FALSE(status.gpus[1].numa_node);
+  // A GPU assignment alone does not establish that CPU affinity was applied.
+  REQUIRE_FALSE(status.sessions[0].placement);
+  REQUIRE(status.containers[0].placement->cpus == std::vector<unsigned>{5});
+  REQUIRE(status.containers[0].placement->cpu_ids == std::vector<int>{8});
+  REQUIRE(status.containers[0].placement->numa_node == 4);
+
+  // Actual worker telemetry takes precedence even when its mask differs from the GPU's local mask.
+  video.cpus = {1};
+  session.monitoring->video.store(std::make_shared<const events::StreamVideoStatus>(video));
+  status = make_status(state, devices, topology);
+  REQUIRE(status.sessions[0].placement->cpus == std::vector<unsigned>{1});
+  REQUIRE(status.sessions[0].placement->cpu_ids == std::vector<int>{2});
+  REQUIRE(status.sessions[0].placement->numa_node == 0);
+  session.connected->store(false);
+  REQUIRE_FALSE(make_status(state, devices, topology).sessions[0].placement);
+
+  // Automatic guest fallback can span sockets; do not relabel it as GPU-local placement.
+  state.active_containers->update([](const auto &current) {
+    auto container = current.at("app");
+    container.cpus = {0, 5};
+    return current.set("app", container);
+  });
+  status = make_status(state, devices, topology);
+  REQUIRE(status.containers[0].placement->cpu_ids == std::vector<int>{2, 8});
+  REQUIRE_FALSE(status.containers[0].placement->numa_node);
+  auto json = rfl::json::write(status);
+  REQUIRE(json.find("\"cpu_ids\":[2,8]") != std::string::npos);
+  REQUIRE(json.find("\"cpus\":[0,5]") != std::string::npos);
+}
+
 TEST_CASE("Dashboard follows container lifecycle events", "[dashboard]") {
   auto app_state = immer::box<state::AppState>(
       state::AppState{.event_bus = std::make_shared<events::EventBusType>(),
@@ -901,8 +974,12 @@ namespace {
 struct DashboardVideoWorker {
   std::shared_ptr<events::EventBusType> bus = std::make_shared<events::EventBusType>();
   std::jthread worker;
-  explicit DashboardVideoWorker(events::VideoSession settings) {
-    worker = std::jthread([this, settings](std::stop_token stop) {
+  explicit DashboardVideoWorker(events::VideoSession settings, std::vector<unsigned> cpus = {}) {
+    worker = std::jthread([this, settings, cpus](std::stop_token stop) {
+      std::optional<wolf::numa::Placement> placement;
+      if (!cpus.empty())
+        placement = wolf::numa::Placement{.cpus = cpus};
+      wolf::numa::ThreadScope affinity(placement);
       // Repeat cancellation to also cover startup before its event handlers are installed.
       std::jthread cancellation([this, stop, id = settings.session_id](std::stop_token done) {
         while (!done.stop_requested()) {
@@ -953,13 +1030,14 @@ TEST_CASE("Dashboard monitors route-less video workers and clears retiring strea
   session.connected->store(true);
   session.monitoring->profile_id.store(std::make_shared<const std::string>("manual-user"));
   sessions->update([&](const auto &current) { return current.push_back(session); });
-  std::vector<wolf::gpu::Device> devices{{.id = "manual-gpu", .render_node = "/dev/dri/renderD128"}};
+  const std::string render_node = "/dev/dri/wolf-dashboard-test-no-gpu";
+  std::vector<wolf::gpu::Device> devices{{.id = "manual-gpu", .render_node = render_node}};
   REQUIRE_FALSE(make_status(state, devices).sessions[0].streaming);
   events::VideoSession settings{.monitoring = session.monitoring,
                                 .monitoring_codec = std::string("HEVC"),
                                 .display_mode = {.width = 1920, .height = 1080, .refreshRate = 60},
                                 .gst_pipeline = "videotestsrc is-live=true ! fakesink sync=true",
-                                .render_node = "/dev/dri/renderD128",
+                                .render_node = render_node,
                                 .session_id = 42,
                                 .packet_size = 1392,
                                 .bitrate_kbps = 12000};
@@ -998,4 +1076,21 @@ TEST_CASE("Dashboard monitors route-less video workers and clears retiring strea
   REQUIRE_FALSE(status.sessions[0].streaming);
   REQUIRE_FALSE(status.sessions[0].codec);
   REQUIRE_FALSE(status.sessions[0].bitrate_kbps);
+#ifdef __linux__
+  // A real worker reports its eligible mask even without GPU-local placement.
+  std::ifstream process_status("/proc/thread-self/status");
+  std::string line;
+  std::vector<unsigned> allowed_cpus;
+  while (std::getline(process_status, line))
+    if (line.starts_with("Cpus_allowed_list:"))
+      allowed_cpus = wolf::numa::parse_list(std::string_view(line).substr(18));
+  REQUIRE_FALSE(allowed_cpus.empty());
+  DashboardVideoWorker pinned(settings, {allowed_cpus.front()});
+  REQUIRE(dashboard_eventually([&] { return session.monitoring->video.load() != nullptr; }));
+  status = make_status(state, devices);
+  REQUIRE(status.sessions[0].placement);
+  REQUIRE(status.sessions[0].placement->cpus == std::vector<unsigned>{allowed_cpus.front()});
+  pinned.stop();
+  REQUIRE_FALSE(make_status(state, devices).sessions[0].placement);
+#endif
 }

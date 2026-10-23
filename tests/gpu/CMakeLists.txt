@@ -79,3 +79,8 @@ target_include_directories(gpu_numa_load_tests PRIVATE ${GPU}/..)
 target_link_libraries(gpu_numa_load_tests PRIVATE Threads::Threads)
 target_compile_options(gpu_numa_load_tests PRIVATE -Wall -Wextra -Wpedantic)
 add_test(NAME gpu_numa_load_tests COMMAND gpu_numa_load_tests)
+
+add_executable(gpu_cpu_topology_tests cpu_topology_test.cpp ${GPU}/cpu_topology.cpp ${GPU}/numa.cpp)
+target_include_directories(gpu_cpu_topology_tests PRIVATE ${GPU}/..)
+target_compile_options(gpu_cpu_topology_tests PRIVATE -Wall -Wextra -Wpedantic)
+add_test(NAME gpu_cpu_topology_tests COMMAND gpu_cpu_topology_tests)

@@ -4,6 +4,7 @@
 #include <chrono>
 #include <control/control.hpp>
 #include <core/batched_send.hpp>
+#include <fstream>
 #include <gst-video-context.hpp>
 #include <gstreamer-1.0/gst/app/gstappsink.h>
 #include <gstreamer-1.0/gst/app/gstappsrc.h>
@@ -12,6 +13,7 @@
 #include <immer/box.hpp>
 #include <memory>
 #include <state/config.hpp>
+#include <stdexcept>
 #include <streaming/streaming.hpp>
 #include <thread>
 #include <vector>
@@ -743,6 +745,21 @@ SharedVideoResult prepare_shared_video(const events::VideoSession &settings,
 struct VideoMonitoringActivity {
   std::shared_ptr<events::StreamMonitoring> monitoring;
   std::shared_ptr<const events::StreamVideoStatus> snapshot;
+  static std::vector<unsigned> current_cpus() {
+    // Read this worker, not the process leader or requested NUMA mask: the kernel may narrow it.
+    // Ordinary scheduling and automatic fallback also have a real eligible mask.
+    std::ifstream status("/proc/thread-self/status");
+    std::string line;
+    while (std::getline(status, line))
+      if (line.starts_with("Cpus_allowed_list:")) {
+        try {
+          return wolf::numa::parse_list(std::string_view(line).substr(18));
+        } catch (const std::invalid_argument &) {
+          return {};
+        }
+      }
+    return {};
+  }
   explicit VideoMonitoringActivity(const events::VideoSession &video) : monitoring(video.monitoring.get()) {
     if (!monitoring)
       return;
@@ -754,7 +771,8 @@ struct VideoMonitoringActivity {
                                   .height = video.display_mode.height,
                                   .fps = video.display_mode.refreshRate,
                                   .render_node = video.render_node,
-                                  .gpu_id = launch ? std::optional<std::string>(launch->device.id) : std::nullopt});
+                                  .gpu_id = launch ? std::optional<std::string>(launch->device.id) : std::nullopt,
+                                  .cpus = current_cpus()});
     monitoring->video.store(snapshot);
   }
   ~VideoMonitoringActivity() {

@@ -124,7 +124,7 @@ catch_discover_tests(wolftests
 # Dependency-free policy/provider regression suite.
 add_subdirectory(gpu)
 if(TARGET wolf-numa-run)
-  add_dependencies(wolftests wolf-numa-run gpu_numa_tests gpu_numa_load_tests)
+  add_dependencies(wolftests wolf-numa-run gpu_numa_tests gpu_numa_load_tests gpu_cpu_topology_tests)
 endif()
 
 find_package(Python3 COMPONENTS Interpreter)
