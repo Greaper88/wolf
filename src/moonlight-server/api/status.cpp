@@ -1,4 +1,5 @@
 #include <api/status.hpp>
+#include <helpers/utils.hpp>
 
 namespace wolf::api {
 
@@ -20,14 +21,21 @@ StatusResponse make_status(const state::AppState &state, const std::vector<wolf:
     return wolf::cpu::make_usage_sampler(std::move(sockets));
   }();
   static const auto sample_memory = wolf::numa::make_memory_sampler(topology.host);
-  return make_status(state, devices, topology, sample_cpu_usage(), sample_memory());
+  static const auto sample_containers = wolf::numa::make_container_memory_sampler(
+      topology.host,
+      utils::get_env("WOLF_HOST_CGROUP_ROOT", "/host/sys/fs/cgroup"));
+  wolf::numa::ContainerCpuSets containers;
+  for (const auto &[id, container] : *state.active_containers->load())
+    containers.emplace(id, container.cpus);
+  return make_status(state, devices, topology, sample_cpu_usage(), sample_memory(), sample_containers(containers));
 }
 
 StatusResponse make_status(const state::AppState &state,
                            const std::vector<wolf::gpu::Device> &devices,
                            const StatusTopology &topology,
                            const wolf::cpu::Usage &cpu_usage,
-                           const std::vector<wolf::numa::MemoryNode> &memory_nodes) {
+                           const std::vector<wolf::numa::MemoryNode> &memory_nodes,
+                           const wolf::numa::ContainerMemories &container_memory) {
   StatusResponse result;
   result.memory_nodes = memory_nodes;
   for (const auto &cpu : topology.host.cpus) {
@@ -120,6 +128,10 @@ StatusResponse make_status(const state::AppState &state,
                            .app = container.name,
                            .render_node = container.render_node};
     status.placement = placement(container.cpus);
+    if (auto memory = container_memory.find(id); memory != container_memory.end())
+      if (auto nodes = wolf::numa::container_memory_nodes(container.cpus, topology.host);
+          nodes && *nodes == memory->second.local_nodes)
+        status.memory = memory->second;
     for (const auto &device : devices)
       if (device.render_node == container.render_node || device.by_path == container.render_node)
         status.gpu_id = device.id;

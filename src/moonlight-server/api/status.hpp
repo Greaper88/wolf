@@ -1,5 +1,6 @@
 #pragma once
 
+#include <gpu/container_memory.hpp>
 #include <gpu/cpu_topology.hpp>
 #include <gpu/cpu_usage.hpp>
 #include <gpu/numa_memory.hpp>
@@ -54,6 +55,7 @@ struct StatusContainer {
   std::optional<std::string> gpu_id;
   std::string render_node;
   std::optional<StatusPlacement> placement;
+  std::optional<wolf::numa::ContainerMemory> memory;
 };
 struct StatusProfile {
   std::string id;
@@ -89,6 +91,7 @@ StatusResponse make_status(const state::AppState &state,
                            const std::vector<wolf::gpu::Device> &devices,
                            const StatusTopology &topology,
                            const wolf::cpu::Usage &cpu_usage = {},
-                           const std::vector<wolf::numa::MemoryNode> &memory_nodes = {});
+                           const std::vector<wolf::numa::MemoryNode> &memory_nodes = {},
+                           const wolf::numa::ContainerMemories &container_memory = {});
 
 } // namespace wolf::api

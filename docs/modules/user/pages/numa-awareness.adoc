@@ -143,6 +143,46 @@ affinity changes, Docker updates and CPU hotplug are not sampled. Restart Wolf t
 refresh cached hardware topology. Existing containers receive telemetry when
 relaunched with this Wolf version.
 
+Each active container may also report optional `memory` residency with
+`local_nodes`, `anon` and `file`. Each category contains `local_bytes` and
+`remote_bytes` charged to the container cgroup, including its descendant cgroups.
+Local means a RAM node containing one of the container's accepted logical CPUs;
+it is not an inferred GPU location or proof of a preferred memory policy. A mask
+covering several nodes treats all those nodes as local. Empty, incomplete or
+ambiguous CPU-to-node mappings leave the measurement unavailable.
+
+The source is cgroup v2 `memory.numa_stat`, whose counters are already bytes.
+Anonymous memory and file/cache memory remain separate. File accounting includes
+shared memory and tmpfs; `shmem` and other overlapping kernel categories are not
+added again. Shared pages are charged to their owning cgroup, rather than counted
+for every container accessing them. These counters describe RAM residency, not
+VRAM, swap, container limits or exclusive physical memory. They can differ from
+host node totals and from process RSS.
+
+Wolf's private cgroup namespace normally hides sibling app containers. To expose
+this optional telemetry, merge this read-only host hierarchy bind into Compose:
+
+[source,yaml]
+----
+services:
+  wolf:
+    environment:
+      WOLF_HOST_CGROUP_ROOT: /host/sys/fs/cgroup
+    volumes:
+      - /sys/fs/cgroup:/host/sys/fs/cgroup:ro
+----
+
+The default root is `/host/sys/fs/cgroup`. Wolf only reads that hierarchy; this
+mount does not require host PID mode or change affinity/memory policy. Exact full
+Docker container IDs are resolved in cgroupfs- and systemd-driver layouts,
+including custom parent groups. Unsupported layouts (including Podman-specific
+names), cgroup v1, missing permissions, ambiguous paths or malformed counters
+remain unavailable, rather than reporting zero. Genuine zero byte counts remain
+valid. Directory traversal is bounded and does not follow symlinks. Resolved
+paths and concurrent samples are cached; missing paths are retried at most every
+five seconds. All work occurs only when status is requested, with a 250 ms sample
+cache and no background sampler. No monitoring work runs when no dashboard polls.
+
 Locality can reduce cross-socket traffic, but it does not establish the cause of
 stutter or guarantee better frame times. Wolf's negotiated FPS describes the
 requested stream rate, rather than measured rendered FPS or dropped frames.

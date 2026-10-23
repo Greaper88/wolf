@@ -986,6 +986,48 @@ TEST_CASE("Dashboard distinguishes CPU sockets, GPU locality and applied CPU mas
   REQUIRE(json.find("\"used_percent\":25") != std::string::npos);
 }
 
+TEST_CASE("Dashboard reports container RAM residency only against known current placement", "[dashboard][numa]") {
+  state::AppState state{.config = immer::box<state::Config>{state::Config{
+                            .profiles = std::make_shared<immer::atom<state::ProfilesList>>()}},
+                        .lobbies = std::make_shared<immer::atom<immer::vector<events::Lobby>>>(),
+                        .running_sessions = std::make_shared<immer::atom<immer::vector<events::StreamSession>>>()};
+  StatusTopology topology{.host = {.cpus = {{.id = 2, .name = "CPU", .cpus = {0, 1}, .numa_nodes = {0, 2}}},
+                                   .node_cpus = {{0, {0}}, {2, {1}}}}};
+  state.active_containers->update([](const auto &current) {
+    return current.set("app", events::DockerContainerCreated{.container_id = "app", .name = "Desktop", .cpus = {0}});
+  });
+  wolf::numa::ContainerMemories samples{{"app", {.local_nodes = {0}, .anon = {4096, 0}, .file = {1024, 2048}}}};
+  auto status = make_status(state, {}, topology, {}, {}, samples);
+  REQUIRE(status.version == 1);
+  REQUIRE(status.containers[0].memory);
+  REQUIRE(status.containers[0].memory->local_nodes == std::vector<int>{0});
+  REQUIRE(status.containers[0].memory->anon.local_bytes == 4096);
+  REQUIRE(status.containers[0].memory->anon.remote_bytes == 0);
+  REQUIRE(status.containers[0].memory->file.remote_bytes == 2048);
+  auto json = rfl::json::write(status);
+  REQUIRE(json.find("\"memory\":{") != std::string::npos);
+  REQUIRE(json.find("\"local_nodes\":[0]") != std::string::npos);
+  REQUIRE((json.find("\"remote_bytes\":0") != std::string::npos ||
+           json.find("\"remote_bytes\":\"0\"") != std::string::npos));
+  REQUIRE_FALSE(make_status(state, {}, topology).containers[0].memory);
+  state.active_containers->update([](const auto &current) {
+    auto container = current.at("app");
+    container.cpus = {0, 1};
+    return current.set("app", container);
+  });
+  REQUIRE_FALSE(make_status(state, {}, topology, {}, {}, samples).containers[0].memory);
+  samples.at("app").local_nodes = {0, 2};
+  REQUIRE(make_status(state, {}, topology, {}, {}, samples).containers[0].memory);
+  state.active_containers->update([](const auto &current) {
+    auto container = current.at("app");
+    container.cpus = {0, 99};
+    return current.set("app", container);
+  });
+  REQUIRE_FALSE(make_status(state, {}, topology, {}, {}, samples).containers[0].memory);
+  state.active_containers->update([](const auto &current) { return current.erase("app"); });
+  REQUIRE(make_status(state, {}, topology, {}, {}, samples).containers.empty());
+}
+
 TEST_CASE("Dashboard follows container lifecycle events", "[dashboard]") {
   auto app_state = immer::box<state::AppState>(
       state::AppState{.event_bus = std::make_shared<events::EventBusType>(),
