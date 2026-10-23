@@ -1,6 +1,8 @@
 #pragma once
 
 #include <gpu/cpu_topology.hpp>
+#include <gpu/cpu_usage.hpp>
+#include <gpu/numa_memory.hpp>
 #include <state/data-structures.hpp>
 
 namespace wolf::api {
@@ -57,6 +59,13 @@ struct StatusProfile {
   std::string id;
   std::string name;
 };
+struct StatusCpu {
+  int id;
+  std::string name;
+  std::vector<unsigned> cpus;
+  std::vector<unsigned> numa_nodes;
+  std::optional<double> usage_percent;
+};
 struct StatusResponse {
   bool success = true;
   int version = 1;
@@ -64,7 +73,8 @@ struct StatusResponse {
   std::vector<StatusSession> sessions;
   std::vector<StatusContainer> containers;
   std::vector<StatusProfile> profiles;
-  std::vector<wolf::numa::CpuSocket> cpus;
+  std::vector<StatusCpu> cpus;
+  std::vector<wolf::numa::MemoryNode> memory_nodes;
 };
 
 // Static topology is independent of NUMA mode and does not sample CPU load.
@@ -77,6 +87,8 @@ StatusTopology discover_status_topology(const std::vector<wolf::gpu::Device> &de
 StatusResponse make_status(const state::AppState &state, const std::vector<wolf::gpu::Device> &devices);
 StatusResponse make_status(const state::AppState &state,
                            const std::vector<wolf::gpu::Device> &devices,
-                           const StatusTopology &topology);
+                           const StatusTopology &topology,
+                           const wolf::cpu::Usage &cpu_usage = {},
+                           const std::vector<wolf::numa::MemoryNode> &memory_nodes = {});
 
 } // namespace wolf::api

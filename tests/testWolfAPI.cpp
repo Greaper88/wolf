@@ -919,6 +919,7 @@ TEST_CASE("Dashboard distinguishes CPU sockets, GPU locality and applied CPU mas
   REQUIRE(status.cpus.size() == 2);
   REQUIRE(status.cpus[0].id == 2);
   REQUIRE(status.cpus[0].numa_nodes == std::vector<unsigned>{0, 1});
+  REQUIRE_FALSE(status.cpus[0].usage_percent);
   REQUIRE(status.gpus[0].cpu_ids == std::vector<int>{8});
   REQUIRE(status.gpus[0].numa_node == 4);
   REQUIRE(status.gpus[0].local_cpus == std::vector<unsigned>{4, 5});
@@ -952,6 +953,37 @@ TEST_CASE("Dashboard distinguishes CPU sockets, GPU locality and applied CPU mas
   auto json = rfl::json::write(status);
   REQUIRE(json.find("\"cpu_ids\":[2,8]") != std::string::npos);
   REQUIRE(json.find("\"cpus\":[0,5]") != std::string::npos);
+
+  // Device-wide utilization is additive; zero must survive serialization while
+  // unavailable measurements stay optional. Topology and placements are unchanged.
+  status = make_status(state, devices, topology, {{2, 0.0}, {8, 42.5}});
+  REQUIRE(status.cpus[0].usage_percent == 0.0);
+  REQUIRE(status.cpus[1].usage_percent == 42.5);
+  json = rfl::json::write(status);
+  REQUIRE(json.find("\"usage_percent\":0") != std::string::npos);
+  REQUIRE(json.find("\"usage_percent\":42.5") != std::string::npos);
+  status = make_status(state, devices, topology, {{2, std::nullopt}});
+  REQUIRE_FALSE(status.cpus[0].usage_percent);
+  REQUIRE_FALSE(status.cpus[1].usage_percent);
+
+  status = make_status(state,
+                       devices,
+                       topology,
+                       {},
+                       {{.id = 0, .cpu_ids = {2}, .total_bytes = 4096, .used_bytes = 1024, .used_percent = 25.0},
+                        {.id = 1, .cpu_ids = {2}, .total_bytes = 8192, .used_bytes = 0, .used_percent = 0.0},
+                        {.id = 9, .cpu_ids = {2, 8}}});
+  REQUIRE(status.memory_nodes.size() == 3);
+  REQUIRE(status.memory_nodes[0].total_bytes == 4096);
+  REQUIRE(status.memory_nodes[1].used_bytes == 0);
+  REQUIRE(status.memory_nodes[2].cpu_ids == std::vector<int>{2, 8});
+  REQUIRE_FALSE(status.memory_nodes[2].total_bytes);
+  json = rfl::json::write(status);
+  REQUIRE(json.find("\"memory_nodes\":[") != std::string::npos);
+  // Wolf's size_t reflector also covers uint64_t on 64-bit platforms and writes strings.
+  REQUIRE(
+      (json.find("\"used_bytes\":0") != std::string::npos || json.find("\"used_bytes\":\"0\"") != std::string::npos));
+  REQUIRE(json.find("\"used_percent\":25") != std::string::npos);
 }
 
 TEST_CASE("Dashboard follows container lifecycle events", "[dashboard]") {

@@ -115,6 +115,25 @@ The safe `/api/v1/status` dashboard response also reports detected physical CPU
 packages, their logical CPU IDs and NUMA nodes, and each GPU's physical locality.
 This topology is cached when first requested and is independent of the placement
 setting. A CPU package can contain several NUMA nodes; the IDs are not interchangeable.
+
+Each package's optional `usage_percent` is the device-wide busy percentage across
+its logical CPUs, including work outside Wolf. It works with a single CPU and with
+NUMA placement disabled. Wolf reads `/proc/stat` only when status is requested;
+concurrent requests share a short cache, and no background sampler runs. Two
+recent samples are required, so the first request and the first request after
+more than 30 seconds without sampling report utilization as unavailable. Missing,
+malformed or reset counters also remain unavailable rather than appearing idle.
+Idle and I/O wait are excluded from busy time; guest time is not counted twice.
+
+The additive `memory_nodes` list reports OS-usable RAM totals and used bytes for
+each NUMA node, with physical CPU owners in `cpu_ids`. A CPU can own several nodes;
+nodes shared by CPUs or without a detected CPU owner remain identifiable rather
+than being counted twice. These are Linux memory totals rather than installed
+DIMM capacities. Used RAM is `MemTotal - MemFree` from each node's `meminfo`, so it
+includes cache and reclaimable memory; it does not describe RAM allocated to a
+particular app or container. Memory counters use a request-only short cache,
+without warmup. Missing or inconsistent counters are unavailable rather than zero.
+
 Session `placement` reports the active video worker's kernel-confirmed CPU mask. Container
 `placement` reports the final accepted Docker CPU mask, including app restrictions
 and automatic fallback. These masks describe eligible CPUs, not the core executing

@@ -13,14 +13,29 @@ StatusTopology discover_status_topology(const std::vector<wolf::gpu::Device> &de
 StatusResponse make_status(const state::AppState &state, const std::vector<wolf::gpu::Device> &devices) {
   // Host identity/topology is stable for this Wolf process; no background work or per-view sysfs scan.
   static const auto topology = discover_status_topology(devices);
-  return make_status(state, devices, topology);
+  static const auto sample_cpu_usage = [&] {
+    wolf::cpu::CpuSets sockets;
+    for (const auto &cpu : topology.host.cpus)
+      sockets.emplace(cpu.id, cpu.cpus);
+    return wolf::cpu::make_usage_sampler(std::move(sockets));
+  }();
+  static const auto sample_memory = wolf::numa::make_memory_sampler(topology.host);
+  return make_status(state, devices, topology, sample_cpu_usage(), sample_memory());
 }
 
 StatusResponse make_status(const state::AppState &state,
                            const std::vector<wolf::gpu::Device> &devices,
-                           const StatusTopology &topology) {
+                           const StatusTopology &topology,
+                           const wolf::cpu::Usage &cpu_usage,
+                           const std::vector<wolf::numa::MemoryNode> &memory_nodes) {
   StatusResponse result;
-  result.cpus = topology.host.cpus;
+  result.memory_nodes = memory_nodes;
+  for (const auto &cpu : topology.host.cpus) {
+    auto &status = result.cpus.emplace_back(
+        StatusCpu{.id = cpu.id, .name = cpu.name, .cpus = cpu.cpus, .numa_nodes = cpu.numa_nodes});
+    if (const auto usage = cpu_usage.find(cpu.id); usage != cpu_usage.end())
+      status.usage_percent = usage->second;
+  }
   auto placement = [&](const std::vector<unsigned> &cpus) -> std::optional<StatusPlacement> {
     if (cpus.empty())
       return {};

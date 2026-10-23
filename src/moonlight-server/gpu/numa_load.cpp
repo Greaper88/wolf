@@ -1,90 +1,19 @@
 #include "numa_load.hpp"
-#include <array>
-#include <charconv>
+#include "cpu_usage.hpp"
 #include <fstream>
 #include <iterator>
 #include <map>
 #include <memory>
 #include <mutex>
-#include <set>
-#include <sstream>
-#include <string_view>
 #include <utility>
 
 namespace wolf::gpu {
 namespace {
 using Clock = std::chrono::steady_clock;
-using Counters = std::array<std::uint64_t, 8>;
-using Sample = std::map<unsigned, Counters>;
+using wolf::cpu::Sample;
 using Identity = std::pair<std::string, std::string>;
 constexpr auto minimum_interval = std::chrono::milliseconds(250);
 constexpr auto maximum_interval = std::chrono::seconds(30);
-
-template <typename T> bool number(std::string_view text, T &value) {
-  const auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), value);
-  return error == std::errc{} && end == text.data() + text.size();
-}
-
-Sample parse_sample(const std::string &text) {
-  Sample result;
-  std::set<unsigned> seen;
-  std::istringstream input(text);
-  std::string line;
-  while (std::getline(input, line)) {
-    std::istringstream fields(line);
-    std::string label;
-    fields >> label;
-    unsigned cpu = 0;
-    if (!label.starts_with("cpu") || label.size() == 3 || !number(std::string_view(label).substr(3), cpu))
-      continue;
-    // Duplicate or malformed CPU lines must never look like idle CPUs.
-    if (!seen.insert(cpu).second) {
-      result.erase(cpu);
-      continue;
-    }
-    Counters counters{};
-    bool valid = true;
-    for (auto &counter : counters) {
-      std::string token;
-      if (!(fields >> token) || !number(token, counter)) {
-        valid = false;
-        break;
-      }
-    }
-    // guest and guest_nice are already included in user and nice. Only the
-    // first eight fields contribute to the total.
-    if (valid)
-      result.emplace(cpu, counters);
-  }
-  return result;
-}
-
-std::optional<double> load(const std::vector<unsigned> &cpus, const Sample &before, const Sample &after) {
-  long double busy = 0, total = 0;
-  for (const auto cpu : cpus) {
-    auto previous = before.find(cpu), current = after.find(cpu);
-    if (previous == before.end() || current == after.end())
-      return std::nullopt;
-    long double cpu_total = 0, cpu_idle = 0;
-    for (std::size_t field = 0; field < current->second.size(); ++field) {
-      // This also handles the kernel's occasionally decreasing iowait field:
-      // discard the interval rather than manufacture a zero or negative load.
-      if (current->second[field] < previous->second[field])
-        return std::nullopt;
-      auto delta = current->second[field] - previous->second[field];
-      cpu_total += delta;
-      if (field == 3 || field == 4)
-        cpu_idle += delta;
-    }
-    if (cpu_total == 0)
-      return std::nullopt;
-    busy += cpu_total - cpu_idle;
-    total += cpu_total;
-  }
-  if (total == 0)
-    return std::nullopt;
-  return static_cast<double>(100 * busy / total);
-}
 
 struct Provider {
   std::map<Identity, std::size_t> devices;
@@ -118,7 +47,7 @@ struct Provider {
       invalidate();
       return;
     }
-    auto current = parse_sample(*text);
+    auto current = wolf::cpu::parse_sample(*text);
     if (current.empty()) {
       invalidate();
       return;
@@ -129,7 +58,7 @@ struct Provider {
       cached_at.reset();
     } else {
       for (std::size_t set = 0; set < cpu_sets.size(); ++set)
-        cached[set] = load(cpu_sets[set], *baseline, current);
+        cached[set] = wolf::cpu::usage_percent(cpu_sets[set], *baseline, current);
       cached_at = now;
     }
     baseline = std::move(current);
