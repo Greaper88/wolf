@@ -85,7 +85,7 @@ services:
   wolfden:
     image: ghcr.io/greaper88/wolf-den:latest
     ports:
-      - "3000:8080"
+      - "8080:8080"
     environment:
       - WOLF_SOCKET_PATH=/var/run/wolf/wolf.sock
     volumes:
