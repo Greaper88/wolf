@@ -67,6 +67,10 @@ Wolf is configured via a TOML config file and some additional optional ENV varia
 |/dev/dri/renderD128
 |The default render node used for virtual desktops; see: <<_multiple_gpu>>
 
+|WOLF_NUMA_MODE
+|auto
+|`auto` enables GPU-local CPU affinity and preferred local RAM on compatible multi-node hosts; `on` requests placement explicitly; `off` uses ordinary scheduling. CPU affinity remains local, while RAM can fall back to other permitted nodes. With usable multi-node GPU topology, `auto` and `on` also consider local CPU load for fresh automatic GPU assignments. See xref:numa-awareness.adoc[NUMA placement].
+
 |WOLF_GPU_PREFER_RAY_TRACING
 |FALSE
 |Prefer GPUs with verified dedicated RT hardware and usable Vulkan RT features. Other or unverified GPUs enter the last-resort pool. Checks are cached at startup/refresh and skipped when this preference is off.
@@ -137,6 +141,46 @@ explicit blacklist gates still protect reconnects.
 Set these options on Wolf's container and recreate it to change the policy.
 They do not affect the legacy path selected by `WOLF_GPU_AUTO_SELECT=FALSE` or
 an explicit `WOLF_RENDER_NODE`/`WOLF_ENCODER_NODE` override.
+
+=== GPU-local CPU and memory placement
+
+`WOLF_NUMA_MODE=auto` is the default. On compatible multi-node hosts, it keeps each
+session's CPUs local to the selected GPU and prefers local RAM. CPU affinity stays
+within the local node; RAM can fall back to other permitted nodes. Single-node
+systems skip placement. `on` requests placement explicitly, while `off` keeps
+ordinary scheduling. Existing operator CPU and memory limits still apply.
+
+Allow memory-policy syscalls in Wolf's saved Compose configuration:
+
+[source,yaml]
+----
+services:
+  wolf:
+    cap_add:
+      - SYS_NICE
+    environment:
+      WOLF_NUMA_MODE: "auto"
+----
+
+Recreate Wolf through that saved Compose configuration to apply the change.
+Without the necessary permission, local CPU affinity remains available, but
+Wolf logs that it could not apply the memory preference. See
+xref:numa-awareness.adoc[NUMA placement] for guest-app behavior, topology limits
+and optional memory-residency monitoring.
+
+=== GPU-local CPU load in automatic selection
+
+With `WOLF_NUMA_MODE=auto` or `on`, fresh automatic GPU assignments can favor less
+busy GPU-local CPUs on compatible multi-node hosts, including single-socket NUMA
+systems. Existing eligibility checks, preferred/fallback pools, session counts,
+and encoder/GPU load bands take priority; local CPU load is compared before VRAM
+usage. Only the GPU-local CPUs allowed to Wolf contribute to this estimate.
+Unknown or stale samples do not exclude devices or block launch.
+
+Uniform-memory hosts skip this CPU sampling, and `WOLF_NUMA_MODE=off` disables
+the comparison. There is no extra setting. Running, retained, manual, and pinned
+assignments stay unchanged; this policy does not migrate sessions. See
+xref:numa-awareness.adoc[NUMA placement and load ranking].
 
 === Automatic NVIDIA app driver volumes
 
@@ -601,7 +645,9 @@ There are two main separated parts that make use of HW acceleration in Wolf:
 * *Gstreamer video encoding*: this will use HW acceleration in order to efficiently encode the video stream with H.264 or HEVC.
 
 Since Wolf supports HW accelerated zero-copy pipelines it's best to keep both the Wayland rendering and the Gstreamer encoding on the same GPU.
-Support for multi-GPU load balancing is planned for future releases.
+Automatic GPU selection balances fresh assignments across eligible GPUs; manual
+overrides retain their selected GPU. On compatible NUMA hosts, GPU-local CPU load
+can also break otherwise comparable automatic choices as described above.
 
 [#_keyboard_layout]
 == Changing and Switching Keyboard Layouts in wolf Apps Containers

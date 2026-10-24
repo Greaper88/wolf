@@ -1,9 +1,56 @@
 #include <api/status.hpp>
+#include <helpers/utils.hpp>
 
 namespace wolf::api {
 
+StatusTopology discover_status_topology(const std::vector<wolf::gpu::Device> &devices,
+                                        const wolf::numa::TopologyPaths &paths) {
+  StatusTopology result{.host = wolf::numa::discover_topology(paths)};
+  for (const auto &device : devices)
+    result.gpus.emplace(device.id, wolf::numa::gpu_locality(device.render_node, result.host, paths));
+  return result;
+}
+
 StatusResponse make_status(const state::AppState &state, const std::vector<wolf::gpu::Device> &devices) {
+  // Host identity/topology is stable for this Wolf process; no background work or per-view sysfs scan.
+  static const auto topology = discover_status_topology(devices);
+  static const auto sample_cpu_usage = [&] {
+    wolf::cpu::CpuSets sockets;
+    for (const auto &cpu : topology.host.cpus)
+      sockets.emplace(cpu.id, cpu.cpus);
+    return wolf::cpu::make_usage_sampler(std::move(sockets));
+  }();
+  static const auto sample_memory = wolf::numa::make_memory_sampler(topology.host);
+  static const auto sample_containers = wolf::numa::make_container_memory_sampler(
+      topology.host,
+      utils::get_env("WOLF_HOST_CGROUP_ROOT", "/host/sys/fs/cgroup"));
+  wolf::numa::ContainerCpuSets containers;
+  for (const auto &[id, container] : *state.active_containers->load())
+    containers.emplace(id, container.cpus);
+  return make_status(state, devices, topology, sample_cpu_usage(), sample_memory(), sample_containers(containers));
+}
+
+StatusResponse make_status(const state::AppState &state,
+                           const std::vector<wolf::gpu::Device> &devices,
+                           const StatusTopology &topology,
+                           const wolf::cpu::Usage &cpu_usage,
+                           const std::vector<wolf::numa::MemoryNode> &memory_nodes,
+                           const wolf::numa::ContainerMemories &container_memory) {
   StatusResponse result;
+  result.memory_nodes = memory_nodes;
+  for (const auto &cpu : topology.host.cpus) {
+    auto &status = result.cpus.emplace_back(
+        StatusCpu{.id = cpu.id, .name = cpu.name, .cpus = cpu.cpus, .numa_nodes = cpu.numa_nodes});
+    if (const auto usage = cpu_usage.find(cpu.id); usage != cpu_usage.end())
+      status.usage_percent = usage->second;
+  }
+  auto placement = [&](const std::vector<unsigned> &cpus) -> std::optional<StatusPlacement> {
+    if (cpus.empty())
+      return {};
+    return StatusPlacement{.cpus = cpus,
+                           .cpu_ids = wolf::numa::socket_ids(cpus, topology.host),
+                           .numa_node = wolf::numa::single_numa_node(cpus, topology.host)};
+  };
   for (const auto &device : devices) {
     result.gpus.push_back({.id = device.id,
                            .name = device.name,
@@ -13,6 +60,12 @@ StatusResponse make_status(const state::AppState &state, const std::vector<wolf:
                            .vram_percent = device.vram_percent,
                            .gpu_percent = device.gpu_percent,
                            .encoder_percent = device.encoder_percent});
+    if (const auto locality = topology.gpus.find(device.id); locality != topology.gpus.end()) {
+      auto &gpu = result.gpus.back();
+      gpu.cpu_ids = locality->second.cpu_ids;
+      gpu.numa_node = locality->second.numa_node;
+      gpu.local_cpus = locality->second.cpus;
+    }
     if (state.gpu_runtime) {
       if (auto cached = state.gpu_runtime->capabilities(device)) {
         auto &gpu = result.gpus.back();
@@ -54,6 +107,7 @@ StatusResponse make_status(const state::AppState &state, const std::vector<wolf:
       status.width = video->width;
       status.height = video->height;
       status.fps = video->fps;
+      status.placement = placement(video->cpus);
       status.gpu_id = video->gpu_id;
       if (!status.gpu_id)
         for (const auto &device : devices)
@@ -73,6 +127,11 @@ StatusResponse make_status(const state::AppState &state, const std::vector<wolf:
                            .image = container.image,
                            .app = container.name,
                            .render_node = container.render_node};
+    status.placement = placement(container.cpus);
+    if (auto memory = container_memory.find(id); memory != container_memory.end())
+      if (auto nodes = wolf::numa::container_memory_nodes(container.cpus, topology.host);
+          nodes && *nodes == memory->second.local_nodes)
+        status.memory = memory->second;
     for (const auto &device : devices)
       if (device.render_node == container.render_node || device.by_path == container.render_node)
         status.gpu_id = device.id;

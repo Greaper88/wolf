@@ -216,6 +216,9 @@ Selection select(const std::vector<Device> &snapshot, const Options &o, bool ret
   // In session_count mode, a group containing unknown encoder load proceeds to GPU/VRAM ranking.
   band(candidates, projected_encoder, o.encoder_variance);
   band(candidates, [](const auto &d) { return d.gpu_percent; }, o.gpu_variance);
+  // CPU locality only breaks otherwise comparable GPU choices. Incomplete or
+  // invalid CPU telemetry skips this optional band instead of rejecting a GPU.
+  band(candidates, [](const auto &d) { return valid(d.local_cpu_percent) ? d.local_cpu_percent : std::nullopt; }, 5.0);
   band(candidates, [](const auto &d) { return d.vram_percent; }, 0);
   auto winner = std::min_element(candidates.begin(), candidates.end(), [](const auto &a, const auto &b) {
     return std::make_pair(a.id, a.render_node) < std::make_pair(b.id, b.render_node);

@@ -215,6 +215,10 @@ jobs:
           RUST_LOG: FATAL
         run: ./wolftests --reporter JUnit::out=${{runner.workspace}}/report.xml --reporter console::out=-::colour-mode=ansi
 
+      - name: Test NUMA policy and guest launcher
+        working-directory: ${{runner.workspace}}/build
+        run: ctest --test-dir tests -R '^(gpu_numa_tests|gpu_numa_load_tests|gpu_cpu_topology_tests|gpu_cpu_usage_tests|gpu_numa_memory_tests|gpu_container_memory_tests|numa_bootstrap_tests)$' --output-on-failure
+
       - name: Test Report
         uses: dorny/test-reporter@v3
         if: success() || failure()    # run this step even if previous step failed

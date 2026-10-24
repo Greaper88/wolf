@@ -122,6 +122,80 @@ int main(int argc, char **argv) {
     check(!runtime.acquire("blacklist").reservation, "blacklisted GPU excluded");
   }
   check(probes == 6, "blacklisted device never test-encoded");
+  // CPU ranking is an optional module, not part of inventory or a pinned app's lifecycle.
+  {
+    auto second = d;
+    second.id = "0000:04:00.0";
+    second.render_node = "/dev/dri/renderD130";
+    const auto caller = std::this_thread::get_id();
+    std::atomic<unsigned> background_rankings = 0;
+    unsigned launch_rankings = 0;
+    bool ranking_fails = false;
+    auto inventory = [&] {
+      auto first = d;
+      auto other = second;
+      first.gpu_percent = other.gpu_percent = 20;
+      first.encoder_percent = other.encoder_percent = 20;
+      first.vram_percent = 20;
+      other.vram_percent = 21;
+      return std::vector{first, other};
+    };
+    auto cached_probe = [](const Device &device, Codec codec, std::stop_token) {
+      return EncoderProbeResult{EncoderBinding{"vah264enc", "va", codec, device.render_node, std::nullopt}, {}};
+    };
+    // Runtime invokes the module concurrently from the worker and new launches.
+    // Test state shared with the worker is atomic; caller-only controls stay on the caller.
+    auto ranking = [&](std::vector<Device> &devices) {
+      if (std::this_thread::get_id() != caller) {
+        ++background_rankings;
+        return;
+      }
+      ++launch_rankings;
+      for (auto &device : devices)
+        device.local_cpu_percent = device.id == d.id ? 90 : 10;
+      if (ranking_fails)
+        throw std::runtime_error("CPU counters unavailable");
+    };
+    {
+      Runtime runtime(Options{}, inventory, [] { return "numa-ranking"; }, cached_probe, {}, ranking);
+      eventually([&] {
+        auto c = runtime.capabilities(second);
+        return c && c->status == CapabilityCache::Status::ready;
+      });
+      check(background_rankings > 0, "optional ranking samples on the existing refresh worker");
+      auto launch = runtime.prepare("local-cpu-load");
+      check(launch.launch && launch.launch->device.id == second.id && launch_rankings == 1,
+            "fresh automatic admission consumes GPU-local CPU telemetry");
+      check(launch.launch->device.local_cpu_percent == 10, "launch keeps the selected telemetry snapshot");
+      launch.launch->reservation->pause();
+      check(runtime.resume(*launch.launch).empty() && launch_rankings == 1,
+            "resume does not invoke optional CPU ranking");
+      auto app = runtime.retain("ranked-app", *launch.launch);
+      check(app.launch && launch_rankings == 1, "retained apps preserve their original GPU without ranking");
+      check(runtime.supports(Codec::h264) && launch_rankings == 1, "codec advertisement does not rank CPUs");
+      auto pinned = runtime.prepare("pinned-cpu-load", d.id);
+      check(pinned.launch && pinned.launch->device.id == d.id && launch_rankings == 1,
+            "explicit device admission bypasses CPU ranking");
+      pinned.launch.reset();
+      app.launch.reset();
+      launch.launch.reset();
+      ranking_fails = true;
+      auto fallback = runtime.prepare("cpu-load-unavailable");
+      check(fallback.launch && fallback.launch->device.id == d.id && !fallback.launch->device.local_cpu_percent,
+            "failed optional ranking clears partial telemetry and retains normal GPU selection");
+    }
+    auto rankings_before = launch_rankings;
+    auto background_before = background_rankings.load();
+    for (bool manual_pin : {false, true}) {
+      Options disabled;
+      disabled.auto_select = manual_pin;
+      disabled.manual_override = manual_pin;
+      Runtime runtime(disabled, inventory, [] { return "disabled-ranking"; }, cached_probe, {}, ranking);
+      check(runtime.prepare("disabled-cpu-load").bypass && launch_rankings == rankings_before &&
+                background_rankings == background_before,
+            "disabled selection and manual override never invoke optional ranking");
+    }
+  }
   // A launch must carry the bindings from the exact device snapshot used for admission.
   {
     Device second = d;

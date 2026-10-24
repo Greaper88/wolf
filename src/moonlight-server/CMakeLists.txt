@@ -200,6 +200,9 @@ target_compile_features(wolf_runner PUBLIC cxx_std_17)
 ####################
 # Executable
 add_executable(wolf wolf.cpp)
+if(TARGET wolf-numa-run)
+    add_dependencies(wolf wolf-numa-run)
+endif()
 target_link_libraries(wolf wolf::runner
         #-static # enable to statically link all libraries
 )

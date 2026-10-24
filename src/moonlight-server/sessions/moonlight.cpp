@@ -222,12 +222,17 @@ setup_moonlight_handlers(const immer::box<state::AppState> &app_state,
           session->audio_sink->store(v_device);
 
           std::thread([session, audio_server = audio_server->server]() {
-            auto sink_name = fmt::format("{}{}.monitor", VIRTUAL_SINK_PREFIX, session->session_id);
-            streaming::start_audio_producer(std::to_string(session->session_id),
-                                            session->event_bus,
-                                            session->audio_channel_count,
-                                            sink_name,
-                                            audio::get_server_name(audio_server));
+            try {
+              auto sink_name = fmt::format("{}{}.monitor", VIRTUAL_SINK_PREFIX, session->session_id);
+              streaming::start_audio_producer(std::to_string(session->session_id),
+                                              session->event_bus,
+                                              session->audio_channel_count,
+                                              sink_name,
+                                              audio::get_server_name(audio_server),
+                                              session->app->render_node);
+            } catch (const std::exception &error) {
+              logs::log(logs::error, "[NUMA] Audio producer startup failed: {}", error.what());
+            }
           }).detach();
         }
 
@@ -237,6 +242,15 @@ setup_moonlight_handlers(const immer::box<state::AppState> &app_state,
           if (session->gpu_launch && !session->gpu_launch->reservation->valid())
             return;
 
+          std::unique_ptr<streaming::GpuLocality> locality;
+          try {
+            locality = std::make_unique<streaming::GpuLocality>(session->app->render_node, "session compositor");
+          } catch (const std::exception &error) {
+            logs::log(logs::error, "[NUMA] Compositor startup failed: {}", error.what());
+            session->event_bus->fire_event(
+                immer::box<events::StopStreamEvent>(events::StopStreamEvent{.session_id = session->session_id}));
+            return;
+          }
           auto wl_state = virtual_display::create_wayland_display(ready.wayland_plugin, ready.wayland_socket_name);
           // Set the wayland display
           session->wayland_display->store(wl_state);
@@ -367,9 +381,10 @@ setup_moonlight_handlers(const immer::box<state::AppState> &app_state,
       }));
 
   handlers.push_back(app_state->event_bus->register_handler<immer::box<events::AudioSession>>(
-      [app_state, ev_bus = app_state->event_bus, audio_server](const immer::box<events::AudioSession> &sess) {
+      [app_state, ev_bus = app_state->event_bus, audio_server, sessions = app_state->running_sessions](
+          const immer::box<events::AudioSession> &sess) {
         // Start a thread that will wait for the RTP ping event
-        std::thread([sess, app_state, ev_bus, audio_server]() {
+        std::thread([sess, app_state, ev_bus, audio_server, sessions]() {
           auto ping_ev = wait_for_ping<events::RTPAudioPingEvent>(app_state, sess);
           if (!ping_ev)
             return;
@@ -380,13 +395,22 @@ setup_moonlight_handlers(const immer::box<state::AppState> &app_state,
           auto sink_name = fmt::format("{}{}.monitor", VIRTUAL_SINK_PREFIX, sess->session_id);
           auto server_name = audio_server_name ? audio_server_name.value() : "";
 
-          streaming::start_streaming_audio(sess,
-                                           ev_bus,
-                                           ping_ev->client_ip,
-                                           ping_ev->client_port,
-                                           ping_ev->audio_socket.get(),
-                                           sink_name,
-                                           server_name);
+          auto session = state::get_session_by_id(sessions->load(), sess->session_id);
+          auto render_node = session ? session->app->render_node : std::string{};
+          if (session && session->gpu_route)
+            render_node = session->gpu_route->target.load()->launch->device.render_node;
+          try {
+            streaming::start_streaming_audio(sess,
+                                             ev_bus,
+                                             ping_ev->client_ip,
+                                             ping_ev->client_port,
+                                             ping_ev->audio_socket.get(),
+                                             sink_name,
+                                             server_name,
+                                             render_node);
+          } catch (const std::exception &error) {
+            logs::log(logs::error, "[NUMA] Audio stream startup failed: {}", error.what());
+          }
         }).detach();
       }));
 

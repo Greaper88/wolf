@@ -41,6 +41,11 @@ fi
 export WOLF_DOCKER_FAKE_UDEV_PATH=${WOLF_DOCKER_FAKE_UDEV_PATH:-$HOST_APPS_STATE_FOLDER/fake-udev}
 cp /wolf/fake-udev $WOLF_DOCKER_FAKE_UDEV_PATH
 
+# A static launcher applies soft NUMA preference before the app's original entrypoint.
+# Store it in the shared state mount so the Docker daemon can bind it into guests.
+cp /wolf/wolf-numa-run "$HOST_APPS_STATE_FOLDER/wolf-numa-run"
+chmod 755 "$HOST_APPS_STATE_FOLDER/wolf-numa-run"
+
 # Run PulseAudio and Wolf side by side under supervisord. PulseAudio lives
 # inside the Wolf container instead of the legacy "WolfPulseAudio" sidecar:
 # supervisord starts PA first, restarts it if it dies, and stops both cleanly

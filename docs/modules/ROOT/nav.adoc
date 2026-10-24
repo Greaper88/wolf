@@ -1,6 +1,9 @@
 * User guide
 ** xref:user:quickstart.adoc[]
 ** xref:user:configuration.adoc[]
+** xref:user:gpu-auto-selection.adoc[]
+** xref:user:numa-awareness.adoc[]
+** xref:user:branch-status.adoc[]
 ** xref:user:wolf-ui.adoc[]
 ** xref:user:troubleshooting.adoc[]
 ** xref:user:environment-considerations.adoc[]

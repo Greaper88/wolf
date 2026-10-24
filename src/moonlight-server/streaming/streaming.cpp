@@ -1,8 +1,10 @@
 #include "platforms/hw.hpp"
 
+#include <algorithm>
 #include <chrono>
 #include <control/control.hpp>
 #include <core/batched_send.hpp>
+#include <fstream>
 #include <gst-video-context.hpp>
 #include <gstreamer-1.0/gst/app/gstappsink.h>
 #include <gstreamer-1.0/gst/app/gstappsrc.h>
@@ -11,13 +13,144 @@
 #include <immer/box.hpp>
 #include <memory>
 #include <state/config.hpp>
+#include <stdexcept>
 #include <streaming/streaming.hpp>
 #include <thread>
+#include <vector>
 
 namespace streaming {
 
 using namespace wolf::core::gstreamer;
 using namespace wolf::core;
+
+namespace {
+std::optional<wolf::numa::Placement> gpu_placement(std::string_view render_node, std::string_view worker) {
+  if (!wolf::numa::enabled() || render_node.empty())
+    return {};
+  auto resolved = wolf::numa::resolve(render_node);
+  if (resolved.conflict)
+    throw std::runtime_error(fmt::format("[NUMA] {} on {}: {}", worker, render_node, resolved.reason));
+  if (!resolved.placement) {
+    logs::log(wolf::numa::read_mode() == wolf::numa::Mode::on ? logs::warning : logs::debug,
+              "[NUMA] {} on {}: {}",
+              worker,
+              render_node,
+              resolved.reason);
+    return {};
+  }
+  const auto &placement = *resolved.placement;
+  logs::log(logs::info,
+            "[NUMA] {} on {} uses local node {}, CPUs {}, memory preferred locally with fallback",
+            worker,
+            render_node,
+            placement.node,
+            wolf::numa::format_list(placement.cpus));
+  return resolved.placement;
+}
+
+struct TaskPolicy {
+  wolf::numa::Placement placement;
+  std::atomic_bool cpu_warning{false};
+  std::atomic_bool memory_warning{false};
+};
+
+struct ActiveTaskPolicy {
+  std::shared_ptr<TaskPolicy> policy;
+  GstTask *task;
+  std::unique_ptr<wolf::numa::ThreadScope> scope;
+};
+
+// Destruction on LEAVE occurs on the task thread, before the pool can reuse it.
+thread_local std::vector<ActiveTaskPolicy> active_task_policies;
+
+void task_placement_error(GstBus *bus, GstMessage *source, const char *reason) noexcept {
+  auto error = g_error_new_literal(GST_CORE_ERROR, GST_CORE_ERROR_FAILED, reason);
+  auto message = gst_message_new_error(GST_MESSAGE_SRC(source), error, "NUMA task CPU placement failed");
+  g_error_free(error);
+  gst_bus_post(bus, message);
+}
+
+void task_stream_status(GstBus *bus, GstMessage *message, gpointer data) noexcept {
+  try {
+    auto policy = *static_cast<std::shared_ptr<TaskPolicy> *>(data);
+    GstStreamStatusType type;
+    GstElement *owner;
+    gst_message_parse_stream_status(message, &type, &owner);
+    const auto value = gst_message_get_stream_status_object(message);
+    if (!value || !G_VALUE_HOLDS(value, GST_TYPE_TASK))
+      return;
+    auto task = GST_TASK(g_value_get_object(value));
+    auto current = std::find_if(active_task_policies.begin(), active_task_policies.end(), [&](const auto &active) {
+      return active.policy == policy && active.task == task;
+    });
+    if (type == GST_STREAM_STATUS_TYPE_ENTER && current == active_task_policies.end()) {
+      auto scope = std::make_unique<wolf::numa::ThreadScope>(policy->placement);
+      if (!scope->cpu_applied()) {
+        if (!policy->cpu_warning.exchange(true))
+          logs::log(logs::error, "[NUMA] GStreamer task CPU affinity failed: {}", scope->cpu_error());
+        task_placement_error(bus, message, scope->cpu_error().c_str());
+        return;
+      }
+      if (!scope->memory_error().empty() && !policy->memory_warning.exchange(true))
+        logs::log(logs::warning,
+                  "[NUMA] GStreamer task memory policy failed: {}; CPU affinity remains available",
+                  scope->memory_error());
+      active_task_policies.push_back({std::move(policy), task, std::move(scope)});
+    } else if (type == GST_STREAM_STATUS_TYPE_LEAVE && current != active_task_policies.end()) {
+      active_task_policies.erase(current);
+    }
+  } catch (const std::exception &error) {
+    // Never allow a C++ exception to cross the GStreamer signal boundary.
+    logs::log(logs::error, "[NUMA] GStreamer task placement failed: {}", error.what());
+    task_placement_error(bus, message, error.what());
+  } catch (...) {
+    logs::log(logs::error, "[NUMA] GStreamer task placement failed");
+    task_placement_error(bus, message, "NUMA task placement failed");
+  }
+}
+} // namespace
+
+GpuLocality::GpuLocality(std::string_view render_node, std::string_view worker)
+    : placement_(gpu_placement(render_node, worker)), thread_(placement_) {
+  if (placement_ && !thread_.cpu_applied())
+    throw std::runtime_error(fmt::format("[NUMA] {} CPU affinity failed: {}", worker, thread_.cpu_error()));
+  if (!thread_.memory_error().empty())
+    logs::log(logs::warning,
+              "[NUMA] {} memory policy failed: {}; CPU affinity remains available",
+              worker,
+              thread_.memory_error());
+}
+
+struct PipelineNumaPolicy::State {
+  GstBus *bus;
+  gulong handler;
+
+  State(GstBus *source, const wolf::numa::Placement &placement) : bus(source) {
+    auto policy = std::make_shared<TaskPolicy>();
+    policy->placement = placement;
+    auto data = std::make_unique<std::shared_ptr<TaskPolicy>>(std::move(policy));
+    gst_object_ref(bus);
+    gst_bus_enable_sync_message_emission(bus);
+    handler = g_signal_connect_data(
+        bus,
+        "sync-message::stream-status",
+        G_CALLBACK(task_stream_status),
+        data.release(),
+        [](gpointer data, GClosure *) { delete static_cast<std::shared_ptr<TaskPolicy> *>(data); },
+        static_cast<GConnectFlags>(0));
+  }
+  ~State() {
+    g_signal_handler_disconnect(bus, handler);
+    gst_bus_disable_sync_message_emission(bus);
+    gst_object_unref(bus);
+  }
+};
+
+PipelineNumaPolicy::PipelineNumaPolicy(GstBus *bus, const std::optional<wolf::numa::Placement> &placement) {
+  if (placement)
+    state_ = std::make_unique<State>(bus, *placement);
+}
+PipelineNumaPolicy::~PipelineNumaPolicy() = default;
 
 struct GstBusData {
   std::shared_ptr<boost::promise<WaylandDisplayReady>> on_ready;
@@ -100,6 +233,8 @@ void start_video_producer(const std::string &session_id,
                           std::shared_ptr<immer::atom<gst_video_context::gst_context_ptr>> video_context,
                           std::shared_ptr<boost::promise<WaylandDisplayReady>> on_ready,
                           std::shared_ptr<events::EventBusType> event_bus) {
+  GpuLocality locality(render_node, "video producer " + session_id);
+  std::unique_ptr<PipelineNumaPolicy> task_policy;
   auto pipeline = fmt::format("waylanddisplaysrc name=wolf_wayland_source render_node={render_node} ! "
                               "{buffer_format}, width={width}, height={height}, framerate={fps}/1 ! \n"    //
                               "interpipesink sync=true async=false name={session_id}_video max-buffers=1", //
@@ -114,7 +249,7 @@ void start_video_producer(const std::string &session_id,
       std::make_shared<GstBusData>(GstBusData{.on_ready = std::move(on_ready), .wayland_plugin = nullptr});
   std::shared_ptr<NeedContextData> ctx_data_ptr =
       std::make_shared<NeedContextData>(NeedContextData{.device_path = render_node, .gst_context = video_context});
-  run_pipeline(pipeline, [=](auto pipeline) {
+  run_pipeline(pipeline, [=, &locality, &task_policy](auto pipeline) {
     logs::log(logs::debug, "Setting up waylanddisplaysrc");
 
     auto wayland_plugin_el = gst_bin_get_by_name(GST_BIN(pipeline.get()), "wolf_wayland_source");
@@ -122,6 +257,7 @@ void start_video_producer(const std::string &session_id,
     bus_data_ptr->wayland_plugin.swap(wayland_plugin_ptr);
 
     auto bus = gst_pipeline_get_bus(GST_PIPELINE(pipeline.get()));
+    task_policy = std::make_unique<PipelineNumaPolicy>(bus, locality.placement());
     g_signal_connect(bus, "message::application", G_CALLBACK(application_message_handler), bus_data_ptr.get());
     gst_bus_set_sync_handler(bus, bus_sync_handler, ctx_data_ptr.get(), nullptr);
     gst_object_unref(bus);
@@ -150,7 +286,10 @@ void start_audio_producer(const std::string &session_id,
                           const std::shared_ptr<events::EventBusType> &event_bus,
                           int channel_count,
                           const std::string &sink_name,
-                          const std::string &server_name) {
+                          const std::string &server_name,
+                          std::string_view render_node) {
+  GpuLocality locality(render_node, "audio producer " + session_id);
+  std::unique_ptr<PipelineNumaPolicy> task_policy;
   std::string channel_mask;
   switch (channel_count) {
   case 2:
@@ -177,7 +316,10 @@ void start_audio_producer(const std::string &session_id,
                               fmt::arg("server_name", server_name));
   logs::log(logs::debug, "[GSTREAMER] Starting audio producer: {}", pipeline);
 
-  run_pipeline(pipeline, [=](auto pipeline) {
+  run_pipeline(pipeline, [=, &locality, &task_policy](auto pipeline) {
+    auto bus = gst_pipeline_get_bus(GST_PIPELINE(pipeline.get()));
+    task_policy = std::make_unique<PipelineNumaPolicy>(bus, locality.placement());
+    gst_object_unref(bus);
     auto stop_handler = event_bus->register_handler<immer::box<events::StopStreamEvent>>(
         [session_id, pipeline](const immer::box<events::StopStreamEvent> &ev) {
           if (std::to_string(ev->session_id) == session_id) {
@@ -516,6 +658,8 @@ SharedVideoResult prepare_shared_video(const events::VideoSession &settings,
          parent = lobby.launch,
          context = lobby.context,
          replacing](SharedVideoEncoder &shared, std::stop_token stop) {
+          GpuLocality locality(launch->device.render_node, "shared video encoder");
+          std::unique_ptr<PipelineNumaPolicy> task_policy;
           // Another matching viewer can arrive before the original viewer's route finishes switching.
           const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
           while (replacing && replacing->reservation->encoding() && !stop.stop_requested()) {
@@ -536,6 +680,7 @@ SharedVideoResult prepare_shared_video(const events::VideoSession &settings,
               [&](auto pipeline) {
                 running = pipeline;
                 auto bus = gst_pipeline_get_bus(GST_PIPELINE(pipeline.get()));
+                task_policy = std::make_unique<PipelineNumaPolicy>(bus, locality.placement());
                 gst_bus_set_sync_handler(bus, bus_sync_handler, context_data.get(), nullptr);
                 gst_object_unref(bus);
                 // Repeat codec headers at every IDR, including viewers joining an existing encoder.
@@ -600,6 +745,21 @@ SharedVideoResult prepare_shared_video(const events::VideoSession &settings,
 struct VideoMonitoringActivity {
   std::shared_ptr<events::StreamMonitoring> monitoring;
   std::shared_ptr<const events::StreamVideoStatus> snapshot;
+  static std::vector<unsigned> current_cpus() {
+    // Read this worker, not the process leader or requested NUMA mask: the kernel may narrow it.
+    // Ordinary scheduling and automatic fallback also have a real eligible mask.
+    std::ifstream status("/proc/thread-self/status");
+    std::string line;
+    while (std::getline(status, line))
+      if (line.starts_with("Cpus_allowed_list:")) {
+        try {
+          return wolf::numa::parse_list(std::string_view(line).substr(18));
+        } catch (const std::invalid_argument &) {
+          return {};
+        }
+      }
+    return {};
+  }
   explicit VideoMonitoringActivity(const events::VideoSession &video) : monitoring(video.monitoring.get()) {
     if (!monitoring)
       return;
@@ -611,7 +771,8 @@ struct VideoMonitoringActivity {
                                   .height = video.display_mode.height,
                                   .fps = video.display_mode.refreshRate,
                                   .render_node = video.render_node,
-                                  .gpu_id = launch ? std::optional<std::string>(launch->device.id) : std::nullopt});
+                                  .gpu_id = launch ? std::optional<std::string>(launch->device.id) : std::nullopt,
+                                  .cpus = current_cpus()});
     monitoring->video.store(snapshot);
   }
   ~VideoMonitoringActivity() {
@@ -633,6 +794,9 @@ static void stream_video_once(immer::box<events::VideoSession> video_session,
                               const std::string &producer,
                               const std::function<bool()> &interrupted,
                               const std::shared_ptr<SharedVideoEncoder> &shared = {}) {
+  // Routes can switch sockets while the viewer worker stays alive.
+  GpuLocality locality(video_session->render_node, fmt::format("video stream {}", video_session->session_id));
+  std::unique_ptr<PipelineNumaPolicy> task_policy;
   auto launch = video_session->gpu_launch.get();
   if (launch && !launch->reservation->valid())
     return;
@@ -675,7 +839,8 @@ static void stream_video_once(immer::box<events::VideoSession> video_session,
   std::unique_ptr<VideoMonitoringActivity> monitoring;
   run_pipeline(
       pipeline,
-      [video_session, event_bus, udp_sink, ctx_data_ptr, activity, shared, &feed, &sequence](auto pipeline) {
+      [video_session, event_bus, udp_sink, ctx_data_ptr, activity, shared, &feed, &sequence, &locality, &task_policy](
+          auto pipeline) {
         if (activity || shared) {
           auto pay = gst_bin_get_by_name(GST_BIN(pipeline.get()), "moonlight_pay");
           if (!pay)
@@ -726,6 +891,7 @@ static void stream_video_once(immer::box<events::VideoSession> video_session,
         }
 
         auto bus = gst_pipeline_get_bus(GST_PIPELINE(pipeline.get()));
+        task_policy = std::make_unique<PipelineNumaPolicy>(bus, locality.placement());
         gst_bus_set_sync_handler(bus, bus_sync_handler, ctx_data_ptr.get(), nullptr);
         gst_object_unref(bus);
 
@@ -915,7 +1081,10 @@ void start_streaming_audio(immer::box<events::AudioSession> audio_session,
                            unsigned short client_port,
                            std::shared_ptr<udp::socket> audio_socket,
                            const std::string &sink_name,
-                           const std::string &server_name) {
+                           const std::string &server_name,
+                           std::string_view render_node) {
+  GpuLocality locality(render_node, fmt::format("audio stream {}", audio_session->session_id));
+  std::unique_ptr<PipelineNumaPolicy> task_policy;
   auto pipeline = fmt::format(
       fmt::runtime(audio_session->gst_pipeline),
       fmt::arg("session_id", audio_session->session_id),
@@ -940,67 +1109,72 @@ void start_streaming_audio(immer::box<events::AudioSession> audio_session,
       .socket = audio_socket,
       .client_endpoint = std::make_shared<udp::endpoint>(boost::asio::ip::make_address(client_ip), client_port)});
 
-  run_pipeline(pipeline, [session_id = audio_session->session_id, udp_sink, event_bus](auto pipeline) {
-    if (auto app_sink_el = gst_bin_get_by_name(GST_BIN(pipeline.get()), "wolf_udp_sink")) {
-      logs::log(logs::debug, "Setting up wolf_udp_sink");
-      g_assert(GST_IS_APP_SINK(app_sink_el));
-      custom_sink::configure_appsink(app_sink_el, udp_sink.get());
-      gst_object_unref(app_sink_el);
-    }
+  run_pipeline(
+      pipeline,
+      [session_id = audio_session->session_id, udp_sink, event_bus, &locality, &task_policy](auto pipeline) {
+        auto bus = gst_pipeline_get_bus(GST_PIPELINE(pipeline.get()));
+        task_policy = std::make_unique<PipelineNumaPolicy>(bus, locality.placement());
+        gst_object_unref(bus);
+        if (auto app_sink_el = gst_bin_get_by_name(GST_BIN(pipeline.get()), "wolf_udp_sink")) {
+          logs::log(logs::debug, "Setting up wolf_udp_sink");
+          g_assert(GST_IS_APP_SINK(app_sink_el));
+          custom_sink::configure_appsink(app_sink_el, udp_sink.get());
+          gst_object_unref(app_sink_el);
+        }
 
-    auto pause_handler = event_bus->register_handler<immer::box<events::PauseStreamEvent>>(
-        [session_id, pipeline](const immer::box<events::PauseStreamEvent> &ev) {
-          if (ev->session_id == session_id) {
-            logs::log(logs::debug, "[GSTREAMER] Pausing pipeline: {}", session_id);
+        auto pause_handler = event_bus->register_handler<immer::box<events::PauseStreamEvent>>(
+            [session_id, pipeline](const immer::box<events::PauseStreamEvent> &ev) {
+              if (ev->session_id == session_id) {
+                logs::log(logs::debug, "[GSTREAMER] Pausing pipeline: {}", session_id);
 
-            /**
-             * Unfortunately here we can't just pause the pipeline,
-             * when a pipeline will be resumed there are a lot of breaking changes
-             * like:
-             *  - Client IP:PORT
-             *  - AES key and IV for encrypted payloads
-             *  - Client resolution, framerate, and encoding
-             *
-             *  The only solution is to kill the pipeline and re-create it again
-             * when a resume happens
-             */
+                /**
+                 * Unfortunately here we can't just pause the pipeline,
+                 * when a pipeline will be resumed there are a lot of breaking changes
+                 * like:
+                 *  - Client IP:PORT
+                 *  - AES key and IV for encrypted payloads
+                 *  - Client resolution, framerate, and encoding
+                 *
+                 *  The only solution is to kill the pipeline and re-create it again
+                 * when a resume happens
+                 */
 
-            gst_element_send_event(pipeline.get(), gst_event_new_eos());
-          }
-        });
+                gst_element_send_event(pipeline.get(), gst_event_new_eos());
+              }
+            });
 
-    auto switch_producer_handler = event_bus->register_handler<immer::box<events::SwitchStreamProducerEvents>>(
-        [session_id, pipeline](const immer::box<events::SwitchStreamProducerEvents> &switch_ev) {
-          if (switch_ev->session_id == session_id) {
-            logs::log(logs::debug,
-                      "[GSTREAMER] Switching audio producer for {} to {}",
-                      session_id,
-                      switch_ev->interpipe_src_id);
+        auto switch_producer_handler = event_bus->register_handler<immer::box<events::SwitchStreamProducerEvents>>(
+            [session_id, pipeline](const immer::box<events::SwitchStreamProducerEvents> &switch_ev) {
+              if (switch_ev->session_id == session_id) {
+                logs::log(logs::debug,
+                          "[GSTREAMER] Switching audio producer for {} to {}",
+                          session_id,
+                          switch_ev->interpipe_src_id);
 
-            auto pipe_name = fmt::format("interpipesrc_{}_audio", session_id);
-            if (auto src = gst_bin_get_by_name(GST_BIN(pipeline.get()), pipe_name.c_str())) {
-              /* Perform the switch */
-              auto audio_interpipe = fmt::format("{}_audio", switch_ev->interpipe_src_id);
-              g_object_set(src, "listen-to", audio_interpipe.c_str(), nullptr);
-              gst_object_unref(src);
-            } else {
-              logs::log(logs::error, "[GSTREAMER] Failed to get audio interpipesrc for {}", session_id);
-            }
-          }
-        });
+                auto pipe_name = fmt::format("interpipesrc_{}_audio", session_id);
+                if (auto src = gst_bin_get_by_name(GST_BIN(pipeline.get()), pipe_name.c_str())) {
+                  /* Perform the switch */
+                  auto audio_interpipe = fmt::format("{}_audio", switch_ev->interpipe_src_id);
+                  g_object_set(src, "listen-to", audio_interpipe.c_str(), nullptr);
+                  gst_object_unref(src);
+                } else {
+                  logs::log(logs::error, "[GSTREAMER] Failed to get audio interpipesrc for {}", session_id);
+                }
+              }
+            });
 
-    auto stop_handler = event_bus->register_handler<immer::box<events::StopStreamEvent>>(
-        [session_id, pipeline](const immer::box<events::StopStreamEvent> &ev) {
-          if (ev->session_id == session_id) {
-            logs::log(logs::debug, "[GSTREAMER] Stopping pipeline: {}", session_id);
-            gst_element_send_event(pipeline.get(), gst_event_new_eos());
-          }
-        });
+        auto stop_handler = event_bus->register_handler<immer::box<events::StopStreamEvent>>(
+            [session_id, pipeline](const immer::box<events::StopStreamEvent> &ev) {
+              if (ev->session_id == session_id) {
+                logs::log(logs::debug, "[GSTREAMER] Stopping pipeline: {}", session_id);
+                gst_element_send_event(pipeline.get(), gst_event_new_eos());
+              }
+            });
 
-    return immer::array<immer::box<events::EventBusHandlers>>{std::move(pause_handler),
-                                                              std::move(switch_producer_handler),
-                                                              std::move(stop_handler)};
-  });
+        return immer::array<immer::box<events::EventBusHandlers>>{std::move(pause_handler),
+                                                                  std::move(switch_producer_handler),
+                                                                  std::move(stop_handler)};
+      });
 }
 
 } // namespace streaming

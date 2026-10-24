@@ -1,0 +1,40 @@
+= Branch status
+
+As of 2026-10-24, this fork has two maintained release channels:
+
+[cols="1,2,3",options="header"]
+|===
+|Status |Branch |Purpose
+|Default release |`NUMA-aware` |Automatic GPU selection and GPU-local CPU/RAM placement; publishes `ghcr.io/greaper88/wolf:latest` and defaults to `wolf-ui:latest`.
+|Development |`dev-NUMA-aware` |Ongoing development; publishes `wolf:numa-aware-dev` and defaults to `wolf-ui:gpu-selection-dev`.
+|Upstream baseline |`stable` |Preserved upstream history; separate from this fork's maintained release channels.
+|===
+
+== Stale branches
+
+The branches below are stale and retained for history and existing references.
+Their names and commits are preserved. New fork work should start from the
+default release or `dev-NUMA-aware` rather than these branches.
+
+[cols="2,2,3",options="header"]
+|===
+|Branch |Tip when marked stale |Disposition
+|`auto-gpu-selection` |`49d484f8a6564054006af97ae4420f63c49038a8` |Former default; superseded by `NUMA-aware`.
+|`dev-gpu-selection` |`babf1d3ef687296cf294c70275e932cf0bada4cf` |Former GPU development channel; superseded by `dev-NUMA-aware`.
+|`dev-fake-uinput` |`9d2e31530c7d43191d962fcd25db88e922ebc4e7` |Historical experiment.
+|`dev-manual-gpu-selection` |`922a6290130899cf28ae3c2ad2166be5aee0b455` |Historical development branch.
+|`dev-nix` |`c85b63c12425b75db1961922aab0102491b1d4b5` |Historical experiment.
+|`dev-shared-ip-sessions` |`f52027aee4c9ac681ba8994fed1c73b4a96484ab` |Historical development branch.
+|`dev-tracy` |`90b4e1ad992775fc976091af9ae487dde35a7979` |Historical experiment.
+|`fix/gst_vaapi` |`5dce43283f319bf3fa49392d8d6356192d265f62` |Historical fix branch.
+|`patch-1` |`38078def52c76c46be46a940071a5e3b81f846dc` |Historical patch branch.
+|`patch-2` |`58434e1e127706a4ad64b341ec79966dcfcfa8ef` |Historical patch branch.
+|===
+
+This is a maintainer status designation. GitHub's automatic Stale view still
+classifies branches by commit activity. No branch is renamed or deleted, and
+this status does not claim that unique experimental work was merged.
+
+Existing `wolf:gpu-selection-dev` images remain legacy references. For future
+updates use one of the maintained channels above. Existing saved Compose and
+Wolf app image references are not changed automatically by a branch promotion.

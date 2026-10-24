@@ -1,6 +1,7 @@
 #pragma once
 
 #include <events/events.hpp>
+#include <gpu/numa.hpp>
 #include <gpu/pipeline.hpp>
 #include <helpers/logger.hpp>
 #include <helpers/utils.hpp>
@@ -158,18 +159,31 @@ gpu_target(const AppState &state,
   return target;
 }
 
+inline void validate_gpu_locality(std::string_view render_node) {
+  if (!wolf::numa::enabled())
+    return;
+  const auto locality = wolf::numa::resolve(render_node);
+  if (locality.conflict)
+    throw std::runtime_error("NUMA placement for " + std::string(render_node) + ": " + locality.reason);
+}
+
 // Called only for a new launch. Resume retains the existing bundle and context.
 inline void prepare_gpu_session(const AppState &state, events::StreamSession &session) {
-  if (!state.gpu_runtime || !session.app->gpu_auto_select)
+  if (!state.gpu_runtime || !session.app->gpu_auto_select) {
+    validate_gpu_locality(session.app->render_node);
     return;
+  }
   if (session.app->video)
     throw std::runtime_error(
         "Automatic GPU selection cannot retarget custom video overrides; pin this app's render node");
   auto result = state.gpu_runtime->prepare(std::to_string(session.session_id));
-  if (result.bypass)
+  if (result.bypass) {
+    validate_gpu_locality(session.app->render_node);
     return;
+  }
   if (!result.launch)
     throw std::runtime_error(result.error);
+  validate_gpu_locality(result.launch->device.render_node);
   auto home = gpu_target(state, result.launch, std::to_string(session.session_id));
   auto app = std::make_shared<events::App>(*session.app);
   app->h264_gst_pipeline = home->pipelines[0];

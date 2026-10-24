@@ -1,0 +1,47 @@
+= NUMA-aware default promotion: 2026-10-24
+
+AI-Agent: ChatGPT Codex +
+AI-Model-Version: GPT-6 family; exact serving version and reasoning setting unavailable +
+AI-Inference-Date: 2026-10-24
+
+== Scope
+
+The maintainer requested promotion of NUMA development to the default release,
+selected the new release branch name `NUMA-aware`, and requested that older
+branches keep their names and be documented as stale. Preserve `dev-NUMA-aware`
+as the maintained development channel and `stable` as the upstream baseline.
+
+Merge NUMA development revision `c18173d` with the former primary revision
+`49d484f`, retaining both histories. Runtime C++, Docker packaging, the static
+NUMA launcher and regression tests match the NUMA development source. The two
+default application templates retain `wolf-ui:latest` for the release channel.
+
+The release publishes `wolf:latest`; ongoing NUMA development publishes
+`wolf:numa-aware-dev`. Update the release workflow mapping to the new branch,
+preserve corrected GPU/NVIDIA/shared-session documentation, and document all
+ten older branch tips as stale. The designation does not rename, delete or
+change those branch tips. It does not merge their unique experimental changes.
+
+== Behavior and validation
+
+`WOLF_NUMA_MODE=auto` remains the default. Single-node hosts bypass placement
+and GPU-local CPU-load ranking. Compatible multi-node hosts keep CPU affinity
+local to the selected GPU and prefer local RAM with permitted remote RAM
+fallback. Existing operator limits and explicit security restrictions apply.
+There is no adaptive CPU spillover or migration of running applications.
+
+Use the existing NUMA topology, policy, load, memory accounting, launcher, GPU,
+API and session regressions against the byte-identical runtime source. Verify
+the release channel mapping, both TOML templates, merge ancestry, whitespace,
+the unchanged legacy branch tips, and the published image revision/digest.
+Record exact test and hosted CI outcomes in the sibling promotion receipts;
+preparation of this document does not itself establish publication success.
+
+No live Wolf service or saved Compose deployment is changed by this source and
+registry promotion. Existing driver, CUDA producer recovery and shared-memory
+placement limitations remain as documented in the user guides.
+
+== Tools
+
+Codex execution and parallel review, Git and GitHub CLI, Python, existing cached
+CMake/CTest binaries, Docker test environments, and anonymous OCI inspection.
