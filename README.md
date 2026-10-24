@@ -69,6 +69,86 @@ permissions and placement limits.
   encoder; different stream settings require a separately admitted encoder.
 - Virtual GPU slicing and management are not implemented.
 
+## Getting started
+
+Install [Docker Engine and the Compose plugin](https://docs.docker.com/engine/install/).
+Install the host's [Wolf udev rules](85-wolf.rules) and reload them as described under
+[virtual device support](docs/modules/user/pages/quickstart.adoc#_virtual_devices_support).
+Make sure `/dev/dri`, `/dev/uinput`, and `/dev/uhid` are available on the host.
+
+Save the following as `docker-compose.yml`. It starts Wolf and Wolf Den, the browser-based
+management interface. The default example supports AMD/Intel GPUs; NVIDIA and mixed-GPU
+hosts should also follow the NVIDIA setup below.
+
+```yaml
+services:
+  wolfden:
+    image: ghcr.io/greaper88/wolf-den:latest
+    ports:
+      - "3000:8080"
+    environment:
+      - WOLF_SOCKET_PATH=/var/run/wolf/wolf.sock
+    volumes:
+      - /etc/wolf/wolf-den:/app/wolf-den/
+      - /var/run/wolf:/var/run/wolf
+      - /etc/wolf/covers:/etc/wolf/covers
+      - /etc/wolf/compatibilitytools.d:/etc/wolf/compatibilitytools.d
+    restart: unless-stopped
+    depends_on:
+      - wolf
+
+  wolf:
+    image: ghcr.io/greaper88/wolf:latest
+    cap_add:
+      - SYS_NICE
+    environment:
+      - WOLF_LOG_LEVEL=INFO
+      - WOLF_SOCKET_PATH=/var/run/wolf/wolf.sock
+      - WOLF_NUMA_MODE=auto
+      - WOLF_HOST_CGROUP_ROOT=/host/sys/fs/cgroup
+
+    volumes:
+      - /etc/wolf:/etc/wolf:rw
+      - /var/run/docker.sock:/var/run/docker.sock:rw
+      - /dev/:/dev/:rw
+      - /run/udev:/run/udev:rw
+      - /var/run/wolf:/var/run/wolf
+      - /sys/fs/cgroup:/host/sys/fs/cgroup:ro
+
+    devices:
+      - /dev/dri
+      - /dev/uinput
+      - /dev/uhid
+      # NVIDIA or mixed-GPU hosts only: enable after setting up NVIDIA CDI.
+      # - "nvidia.com/gpu=all"
+      # - "/dev/nvidia-modeset"
+
+    device_cgroup_rules:
+      - 'c 13:* rmw'
+    network_mode: host
+    restart: unless-stopped
+```
+
+For NVIDIA or mixed-GPU hosts, install the host driver and configure
+[NVIDIA Container Toolkit CDI](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/cdi-support.html),
+then uncomment the two NVIDIA device entries. DRM modesetting must be enabled; see the
+[GPU selection guide](docs/modules/user/pages/gpu-auto-selection.adoc) for Wolf's driver requirements.
+
+Start both services from the directory containing the saved Compose file:
+
+```bash
+docker compose up -d
+```
+
+Open Wolf Den at `http://<host-ip>:3000`, replacing `<host-ip>` with the server's IP address.
+Connect with [Moonlight](https://moonlight-stream.org/) to launch Wolf UI and your apps.
+The read-only cgroup mount enables optional per-container NUMA RAM reporting in the dashboard;
+`SYS_NICE` allows Wolf's preferred-memory policy. See the
+[NUMA guide](docs/modules/user/pages/numa-awareness.adoc) for permissions and placement behavior.
+
+Wolf UI's `WOLF_UI_AUTOUPDATE` setting belongs in its app runner environment in `config.toml`;
+fresh configurations already set it to `False`.
+
 # games-on-whales/wolf
 
 [![Linux build and test](https://github.com/games-on-whales/wolf/actions/workflows/linux-build-test.yml/badge.svg)](https://github.com/games-on-whales/wolf/actions/workflows/linux-build-test.yml)
