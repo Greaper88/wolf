@@ -104,6 +104,22 @@ describe(const RTSP_PACKET &req, const events::StreamSession &session) {
   payloads.push_back(
       {"a", fmt::format("x-ss-general.featureFlags: {}", FS_PEN_TOUCH_EVENTS | FS_CONTROLLER_TOUCH_EVENTS)});
 
+  if (session.dual_display && session.dual_display->config.dual()) {
+    const auto &cfg = session.dual_display->config;
+    payloads.emplace_back("a", "x-gd-version:1");
+    payloads.emplace_back("a", "x-gd-transport:rtp-ssrc-v1");
+    payloads.emplace_back("a", "x-gd-mode:" + cfg.mode);
+    payloads.emplace_back("a", "x-gd-layout:" + cfg.layout);
+    payloads.emplace_back("a", "x-gd-primary:" + std::to_string(cfg.primary));
+    for (const auto &d : cfg.displays) {
+      const auto prefix = fmt::format("x-gd-video[{}].", d.id);
+      payloads.emplace_back("a", prefix + "width:" + std::to_string(d.width));
+      payloads.emplace_back("a", prefix + "height:" + std::to_string(d.height));
+      payloads.emplace_back("a", prefix + "fps:" + std::to_string(d.fps));
+      payloads.emplace_back("a", prefix + "ssrc:" + std::to_string(moonlight::dual_display::ssrc(d.id)));
+    }
+  }
+
   return ok_msg(req.seq_number, {}, payloads);
 }
 
@@ -221,6 +237,33 @@ announce(const RTSP_PACKET &req, const events::StreamSession &session) {
     logs::log(logs::debug, "[RTSP] Adjusted video bitrate to {} Kbps", bitrate);
   }
 
+  if (session.dual_display && session.dual_display->config.dual()) {
+    std::map<std::string, std::string> attributes;
+    for (const auto &[kind, line] : req.payloads) {
+      const auto colon = line.find(':');
+      if (colon == std::string::npos)
+        continue;
+      auto value = line.substr(colon + 1);
+      value.erase(0, value.find_first_not_of(" \t"));
+      if (!attributes.emplace(line.substr(0, colon), value).second && line.starts_with("x-gd-"))
+        return error_msg(400, "Duplicate display agreement", req.seq_number);
+    }
+    const auto &cfg = session.dual_display->config;
+    if (attributes["x-gd-version"] != "1" || attributes["x-gd-transport"] != "rtp-ssrc-v1" ||
+        attributes["x-gd-mode"] != cfg.mode || attributes["x-gd-layout"] != cfg.layout ||
+        attributes["x-gd-primary"] != std::to_string(cfg.primary))
+      return error_msg(400, "Display transport agreement does not match launch", req.seq_number);
+    for (const auto &d : cfg.displays) {
+      const auto prefix = fmt::format("x-gd-video[{}].", d.id);
+      if (attributes[prefix + "width"] != std::to_string(d.width) ||
+          attributes[prefix + "height"] != std::to_string(d.height) ||
+          attributes[prefix + "fps"] != std::to_string(d.fps) ||
+          attributes[prefix + "ssrc"] != std::to_string(moonlight::dual_display::ssrc(d.id)))
+        return error_msg(400, "Display track agreement does not match launch", req.seq_number);
+    }
+    session.dual_display->negotiated.store(true);
+  }
+
   // Video session
   events::VideoSession video = {
       .monitoring = session.monitoring,
@@ -252,6 +295,8 @@ announce(const RTSP_PACKET &req, const events::StreamSession &session) {
 
       .client_ip = session.ip,
       .rtp_secret_payload = session.rtp_secret_payload,
+      .dual_display = session.dual_display,
+      .display_generation = session.dual_display ? session.dual_display->generation.load() : 0,
   };
   if (session.gpu_route) {
     auto settings = video;

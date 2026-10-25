@@ -1,0 +1,147 @@
+= Experimental dual-display sessions
+
+The `feature/dual-display-modes` development branches implement a negotiated
+Grimm Display v1 extension. Enable the Wolf test server with
+`WOLF_ENABLE_DUAL_DISPLAY=TRUE`; the default is disabled. Existing clients retain
+their normal single-video protocol. This branch has not been deployed to the
+maintainer's running services.
+
+== Modes
+
+* `off`: the ordinary single-display session.
+* `controls`: one video stream; the client's second screen is a keyboard/touchpad.
+* `dual_monitor`: one guest desktop with two real Wayland outputs. The client
+  chooses each monitor's dimensions, frame rate, horizontal/vertical arrangement,
+  and primary monitor. Both raw monitor regions are encoded separately.
+* `dual_app`: two independent app sources attached to one client connection.
+  Wolf-UI selects the first app's display, remains visible on the other stream,
+  and selects the second app there. The same persistent app cannot be attached
+  to both slots as though it were two independent instances.
+
+The client selects exactly one mode. In both video modes, each track has its own
+encoder, decoder, sequence/frame indices, and FEC recovery state. Both tracks use
+the client's existing UDP video endpoint and authenticated session binding. The
+server does not wait for matching frame numbers before sending either track.
+
+== Required components
+
+Wolf requires automatic GPU selection for the experimental two-encoder path.
+Both encoders are admitted separately; failed replacement admission leaves the
+existing app assignment intact. Encoder capacity and GPU memory still apply.
+
+Dual-monitor mode additionally requires the matching `gst-wayland-display`
+feature build. Wolf checks for the `display-layout` source property before
+advertising that mode. That compositor advertises `HEADLESS-1` and `HEADLESS-2`
+while capturing one hidden raw canvas. Wolf crops that canvas before two
+independent encode pipelines; the network does not carry a single stitched
+codec frame. The first implementation uses CPU-buffer capture for this crop
+path and still uses the selected hardware encoders.
+
+The matching GOW feature images are needed to configure nested Sway, KWin, and
+Xwayland. Existing published guest images do not acquire a second output merely
+by replacing the Wolf binary. Wayland has no universal primary-output flag;
+the guest-specific startup configuration applies the requested primary monitor
+where its desktop exposes that setting.
+
+The current Sunshine feature branch provides strict negotiation and rejects
+unsupported two-video modes before mutating Windows displays or starting apps.
+It does not advertise working dual capture. Sunshine's shared capture context
+needs a separate per-output implementation, Windows layout save/restore, and
+display-aware app/input routing before that capability can be enabled.
+
+== Wire contract
+
+Version 1 uses these HTTPS launch/resume query parameters:
+
+[source,text]
+----
+gd_version=1
+gd_mode=off|controls|dual_monitor|dual_app
+gd_layout=horizontal|vertical
+gd_primary=0|1
+gd_width2=<even integer 128..8192>
+gd_height2=<even integer 128..8192>
+gd_fps2=<integer 1..240>
+----
+
+The existing `mode=widthxheightxfps` describes Video 1. All three secondary
+dimensions are mandatory for video modes. Monitor IDs are stable and independent
+of the client's local screen assignment. Video 2 is right of Video 1 in a
+horizontal layout and below it in a vertical layout. A monitor canvas is limited
+to 64 Mi pixels and 16384 pixels in either dimension. App sources have separate
+coordinate spaces. Changing a live session's mode or geometry requires stopping
+it and starting again; reconnect preserves its existing configuration.
+
+Serverinfo advertises `GrimmDisplayVersion`, `GrimmDisplayModes` (comma-separated),
+and `GrimmDisplayTransport=rtp-ssrc-v1`. Launch/resume acknowledges
+`GrimmDisplayVersion` and the exact accepted `GrimmDisplayMode`. Clients fail
+closed if the requested mode or transport is not supported.
+
+RTSP DESCRIBE and ANNOUNCE agree on `x-gd-version:1`,
+`x-gd-transport:rtp-ssrc-v1`, `x-gd-mode`, `x-gd-layout`, `x-gd-primary`, and
+`x-gd-video[0].width/height/fps/ssrc` plus the same fields for index 1. A mismatched
+ANNOUNCE is rejected before starting video. The ordinary RTP SSRC field is the
+per-packet track header: unsigned network-order `0x47440000` for Video 1 and
+`0x47440001` for Video 2. Data and parity packets retain that identity. Existing
+Moonlight frame headers provide the per-track frame ID and boundaries. Legacy
+packet formatting remains unchanged when the extension is not negotiated.
+
+Version 1 retains FEC parity but disables ambiguous reference-frame invalidation
+and per-frame feedback in the dual client. An IDR request refreshes both encoders.
+
+== Input and focus
+
+Touch selects that display. Physical keyboard, mouse, and controller input goes
+to the active display. Non-touch clients have a switch action and a
+Ctrl+Alt+Shift+Tab shortcut. Android exposes the shortcut when a physical keyboard
+is present, including desktop/DeX setups. Clients release held input on its old
+target before changing focus and suppress still-held physical controls until
+they are released; queued packets retain their original display assignment.
+
+The existing encrypted input channel carries a wrapper NV_INPUT_HEADER with
+big-endian size (excluding its own four bytes), little-endian input magic
+`0x55000010`, one display-ID byte, three zero reserved bytes, and the original
+complete NV_INPUT_HEADER plus payload. There is no nested control-channel header.
+Unknown IDs, nested wrappers, invalid lengths, and unnegotiated wrappers are
+rejected. Monitor input maps into the shared desktop geometry; app input routes
+to its assigned app compositor and virtual devices. The primary display supplies
+the session's single audio stream.
+
+== Wolf-UI API
+
+`GET /api/v1/sessions` includes optional `dual_display` with version, mode, layout,
+primary, active_display (the launcher destination), available, displays
+`[{id,width,height,fps,x,y}]`, and slots
+`[{display_id,app_id,state:"launcher"|"running"}]`.
+
+`POST /api/v1/lobbies/create` and `/lobbies/join` accept an optional `display_id`
+for dual-app sessions. Dual-monitor apps retain the full monitor descriptor and
+do not target a single slot. The server owns producer switching and launcher
+relocation. A return-to-Wolf-UI shortcut detaches the focused app slot rather than
+terminating the app on the other display. Session disconnect detaches both slots.
+
+== Verification
+
+`wolftests '[dual-display]'` validates negotiation, geometry, input envelopes,
+packetizer track identity on actual data/parity, and production lobby routing.
+It also runs two real software H.264 encoders through the production UDP sender,
+checking both SSRCs, reconnect, and cancellation while startup admission settles.
+Monitor handoffs preflight both encoder reservations before publishing either
+route; an exact peer in that batch can pass the initial telemetry wait without
+relaxing unrelated pending-session or GPU utilization limits.
+`WOLF_DUAL_FIXTURE_OUT=/path/fixture.bin` writes real sender datagrams as repeated
+big-endian uint32 lengths followed by UDP payload. The native Moonlight
+`tests/run-dual-display-interop.sh fixture.bin 128 3` exercises demux, both real
+depacketizers, and parity recovery after an intentionally missing secondary data
+shard. Compositor tests use real Wayland clients and software-rendered capture;
+Wolf-UI tests drive actual Godot scenes against a mock control API.
+
+An isolated real nested KWin guest was also checked with unequal monitor sizes:
+horizontal and vertical positioning and either primary monitor matched actual
+KScreen output. Its nested backend reports 60 Hz for the secondary guest monitor
+even when that video track captures at 30 FPS; guest refresh-rate matching is not
+established. Android and desktop dual-video builds currently select H.264 SDR.
+
+Automated builds and these fixtures do not establish real handheld, Windows,
+GPU encoder, or desktop-mode compatibility. Test those on the intended devices
+before deploying these development branches.

@@ -8,6 +8,119 @@
 
 namespace wolf::core::sessions {
 
+// The caller holds gpu_transitions. Publish both routing changes atomically so
+// protocol copies and both encoder workers observe one coherent assignment.
+static std::string join_display_lobby(const immer::box<state::AppState> &state,
+                                      const events::StreamSession &session,
+                                      const events::Lobby &lobby,
+                                      const events::JoinLobbyEvent &request) {
+  const auto dual = session.dual_display;
+  const auto &cfg = dual->config;
+  if (!dual->negotiated.load() || !dual->streaming.load())
+    return "The dual-display video transport is not ready";
+  const int selected = request.display_id.value_or(dual->routing.load()->active_display);
+  if (selected < 0 || selected > 1 || (cfg.mode == "dual_monitor" && request.display_id))
+    return "Invalid display target for this mode";
+  if (!lobby.gpu_target || !session.gpu_route)
+    return "Dual display requires an automatically selected app GPU";
+  if (!lobby.gpu_target->launch->reservation->valid() || !session.gpu_route->home->launch->reservation->valid())
+    return "The app or launcher is closing; wait and retry";
+  if (!lobby.multi_user && (!request.profile_id || *request.profile_id != lobby.started_by_profile_id))
+    return "Select the profile that owns this app before reconnecting";
+  if (cfg.mode == "dual_monitor" &&
+      (!lobby.display_config || rfl::json::write(*lobby.display_config) != rfl::json::write(cfg)))
+    return "This desktop was started with a different monitor layout; stop it before changing layouts";
+  const auto current = dual->routing.load();
+  const bool monitor = cfg.mode == "dual_monitor";
+  if (!monitor && current->slots[1 - selected].lobby_id == lobby.id)
+    return "This app is already assigned to the other display";
+  if (!lobby.multi_user && !lobby.connected_sessions->load()->empty() && current->slots[selected].lobby_id != lobby.id)
+    return "This app is in use on another device";
+  auto next = std::make_shared<events::DisplayRouting>(*current);
+  for (int index = 0; index < 2; ++index) {
+    if (!monitor && index != selected)
+      continue;
+    if (current->slots[index].lobby_id == lobby.id)
+      continue;
+    auto held = state->gpu_runtime->retain(
+        "dual-viewer:" + std::to_string(session.session_id) + ":" + std::to_string(index) + ":" + lobby.id,
+        *lobby.gpu_target->launch);
+    if (!held.launch)
+      return held.error;
+    auto target = state::gpu_target(*state, held.launch, lobby.id, lobby.gpu_target->context);
+    if (target->pipelines[session.gpu_route->codec.load()].empty())
+      return "The app GPU cannot encode this session's codec";
+    const auto error = state->gpu_runtime->resume(
+        *held.launch,
+        current->slots[index].target->launch.get(),
+        monitor ? current->slots[1 - index].target->launch.get() : nullptr,
+        monitor && index == 1 ? next->slots[0].target->launch.get() : nullptr);
+    if (!error.empty())
+      return error;
+    const auto wl = lobby.wayland_display->load();
+    if (!wl.get())
+      return "The app display is not ready";
+    auto &slot = next->slots[index];
+    slot.producer = lobby.id;
+    slot.lobby_id = lobby.id;
+    slot.target = target;
+    slot.mouse = std::make_shared<std::optional<events::MouseTypes>>();
+    slot.keyboard = std::make_shared<std::optional<events::KeyboardTypes>>();
+    slot.touch_screen = std::make_shared<std::optional<events::TouchScreenTypes>>();
+    slot.mouse->emplace(virtual_display::WaylandMouse(wl));
+    slot.keyboard->emplace(virtual_display::WaylandKeyboard(wl));
+    slot.touch_screen->emplace(virtual_display::WaylandTouchScreen(wl));
+    slot.wayland_display = lobby.wayland_display;
+    slot.held_modifiers = std::make_shared<immer::atom<char>>();
+    slot.pen_tablet = std::make_shared<std::optional<input::PenTablet>>();
+  }
+  next->active_display = !monitor && !next->slots[1 - selected].lobby_id ? 1 - selected : selected;
+  for (int index = 0; index < 2; ++index) {
+    if (next->slots[index].producer == current->slots[index].producer)
+      continue;
+    for (const auto &[number, pad] : *current->slots[index].joypads->load()) {
+      events::PlugDeviceEvent plug{.session_id = lobby.id};
+      std::visit(
+          [&](const auto &device) {
+            plug.udev_events = device.get_udev_events();
+            plug.udev_hw_db_entries = device.get_udev_hw_db_entries();
+          },
+          *pad);
+      state->event_bus->fire_event(immer::box<events::UnplugDeviceEvent>{events::UnplugDeviceEvent{
+          .session_id = current->slots[index].producer,
+          .udev_events = plug.udev_events,
+          .udev_hw_db_entries = plug.udev_hw_db_entries,
+          .direct_to_launcher = current->slots[index].producer == std::to_string(session.session_id)}});
+      lobby.plugged_devices_queue->push(immer::box<events::PlugDeviceEvent>(plug));
+    }
+  }
+  dual->routing.store(next);
+  lobby.connected_sessions->update([&](const auto &connected) {
+    const auto id = std::to_string(session.session_id);
+    for (const auto &existing : connected)
+      if (*existing == id)
+        return connected;
+    return connected.push_back({id});
+  });
+  // A replaced app stays alive according to its normal lobby ownership policy.
+  for (const auto &old : current->slots) {
+    if (!old.lobby_id || old.lobby_id == next->slots[0].lobby_id || old.lobby_id == next->slots[1].lobby_id)
+      continue;
+    if (auto previous = state::get_lobby_by_id(state->lobbies->load(), *old.lobby_id)) {
+      previous->connected_sessions->update([&](const auto &connected) {
+        return connected |
+               ranges::views::filter([&](const auto &id) { return *id != std::to_string(session.session_id); }) |
+               ranges::to<immer::vector<immer::box<std::string>>>();
+      });
+      if (previous->stop_when_everyone_leaves && previous->connected_sessions->load()->empty())
+        state->event_bus->fire_event(immer::box<events::StopLobbyEvent>{events::StopLobbyEvent{previous->id}});
+    }
+  }
+  state->event_bus->fire_event(immer::box<events::SwitchStreamProducerEvents>{
+      events::SwitchStreamProducerEvents{session.session_id, next->slots[cfg.primary].producer}});
+  return {};
+}
+
 /**
  * @brief Removes the StreamSession from the input Lobby and switches everything to the original session
  *
@@ -18,6 +131,53 @@ void leave_lobby(const std::shared_ptr<events::EventBusType> &ev_bus,
                  const events::Lobby &lobby,
                  const events::StreamSession &session,
                  bool disconnected = false) {
+  if (session.dual_display && session.dual_display->config.dual()) {
+    const auto dual = session.dual_display;
+    const auto old = dual->routing.load();
+    auto next = std::make_shared<events::DisplayRouting>(*old);
+    for (int i = 0; i < 2; ++i) {
+      if (old->slots[i].lobby_id != lobby.id)
+        continue;
+      auto &slot = next->slots[i];
+      slot.producer = std::to_string(session.session_id);
+      slot.lobby_id.reset();
+      slot.target = dual->home[i];
+      slot.mouse = session.mouse;
+      slot.keyboard = session.keyboard;
+      slot.touch_screen = session.touch_screen;
+      slot.wayland_display = session.wayland_display;
+      slot.held_modifiers = std::make_shared<immer::atom<char>>();
+      slot.pen_tablet = std::make_shared<std::optional<input::PenTablet>>();
+      next->active_display = i;
+      if (!disconnected) {
+        for (const auto &[number, pad] : *slot.joypads->load()) {
+          events::PlugDeviceEvent plug{.session_id = slot.producer, .direct_to_launcher = true};
+          std::visit(
+              [&](const auto &device) {
+                plug.udev_events = device.get_udev_events();
+                plug.udev_hw_db_entries = device.get_udev_hw_db_entries();
+              },
+              *pad);
+          ev_bus->fire_event(immer::box<events::UnplugDeviceEvent>{
+              events::UnplugDeviceEvent{.session_id = lobby.id,
+                                        .udev_events = plug.udev_events,
+                                        .udev_hw_db_entries = plug.udev_hw_db_entries}});
+          ev_bus->fire_event(immer::box<events::PlugDeviceEvent>(plug));
+        }
+      }
+    }
+    dual->routing.store(next);
+    lobby.connected_sessions->update([&](const auto &connected) {
+      return connected |
+             ranges::views::filter([&](const auto &id) { return *id != std::to_string(session.session_id); }) |
+             ranges::to<immer::vector<immer::box<std::string>>>();
+    });
+    ev_bus->fire_event(immer::box<events::SwitchStreamProducerEvents>{
+        events::SwitchStreamProducerEvents{session.session_id, next->slots[dual->config.primary].producer}});
+    if (lobby.stop_when_everyone_leaves && lobby.connected_sessions->load()->empty())
+      ev_bus->fire_event(immer::box<events::StopLobbyEvent>{events::StopLobbyEvent{lobby.id}});
+    return;
+  }
   if (session.gpu_route) {
     auto route = session.gpu_route;
     auto current = route->target.load();
@@ -108,7 +268,8 @@ setup_lobbies_handlers(const immer::box<state::AppState> &app_state,
                           .multi_user = lobby_settings->multi_user,
                           .pin = lobby_settings->pin,
                           .stop_when_everyone_leaves = lobby_settings->stop_when_everyone_leaves,
-                          .runner = lobby_settings->runner});
+                          .runner = lobby_settings->runner,
+                          .display_config = lobby_settings->display_config});
         app_state->lobbies->update(
             [lobby](const immer::vector<events::Lobby> &lobbies) { return lobbies.push_back(*lobby); });
 
@@ -131,7 +292,8 @@ setup_lobbies_handlers(const immer::box<state::AppState> &app_state,
                                              .refreshRate = lobby_settings->video_settings.refresh_rate},
                                             gst_context,
                                             on_ready,
-                                            ev_bus);
+                                            ev_bus,
+                                            lobby_settings->display_config.value_or(moonlight::dual_display::Config{}));
           }).detach();
 
           auto w_display_ready = on_ready->get_future().then(
@@ -187,7 +349,8 @@ setup_lobbies_handlers(const immer::box<state::AppState> &app_state,
                                      .app_host_state_folder = std::filesystem::path(host->host_base_state_folder) /
                                                               lobby_settings->runner_state_folder,
                                      .xdg_runtime_dir = runtime_dir,
-                                     .client_settings = lobby_settings->client_settings}});
+                                     .client_settings = lobby_settings->client_settings,
+                                     .display_config = lobby_settings->display_config}});
                     // Runner process ended, stop the lobby
                     lobby->wayland_display->store(nullptr);
 
@@ -239,6 +402,11 @@ setup_lobbies_handlers(const immer::box<state::AppState> &app_state,
                     join_lobby_event->lobby_id,
                     join_lobby_event->moonlight_session_id);
           join_lobby_event->error_message.get()->set_value("Lobby or session not found");
+          return;
+        }
+        if (session->dual_display && session->dual_display->config.dual()) {
+          join_lobby_event->error_message.get()->set_value(
+              join_display_lobby(app_state, *session, *lobby, *join_lobby_event));
           return;
         }
         std::shared_ptr<const events::GpuStreamTarget> next_target;
@@ -464,7 +632,13 @@ setup_lobbies_handlers(const immer::box<state::AppState> &app_state,
   // On a PlugDeviceEvent, we have to add the device to the lobby queue so that the runner will pick it up
   handlers.push_back(app_state->event_bus->register_handler<immer::box<events::PlugDeviceEvent>>(
       [=](const immer::box<events::PlugDeviceEvent> &plug_device_event) {
+        if (plug_device_event->direct_to_launcher.get())
+          return;
         immer::vector<events::Lobby> lobbies = app_state->lobbies->load();
+        if (auto addressed = state::get_lobby_by_id(lobbies, plug_device_event->session_id)) {
+          addressed->plugged_devices_queue->push(plug_device_event);
+          return;
+        }
         if (auto lobby = state::get_lobby_by_connected_session(lobbies, plug_device_event->session_id)) {
           logs::log(logs::info,
                     "[LOBBY] adding device to session {} in lobby {}",
@@ -481,6 +655,8 @@ setup_lobbies_handlers(const immer::box<state::AppState> &app_state,
   // When a device is unplugged from a Moonlight session, we have to re-fire the event on our lobby
   handlers.push_back(app_state->event_bus->register_handler<immer::box<events::UnplugDeviceEvent>>(
       [=](const immer::box<events::UnplugDeviceEvent> &unplug_device_event) {
+        if (unplug_device_event->direct_to_launcher.get())
+          return;
         immer::vector<events::Lobby> lobbies = app_state->lobbies->load();
         if (auto lobby = state::get_lobby_by_connected_session(lobbies, unplug_device_event->session_id)) {
           logs::log(logs::debug, "[LOBBY] Unplug device for session {}", unplug_device_event->session_id);
@@ -491,25 +667,31 @@ setup_lobbies_handlers(const immer::box<state::AppState> &app_state,
         }
       }));
 
-  auto on_moonlight_session_over = [app_state](std::size_t moonlight_session_id) {
+  auto on_moonlight_session_over = [app_state](std::size_t id) {
     std::lock_guard transition(*app_state->gpu_transitions);
-    immer::vector<events::Lobby> lobbies = app_state->lobbies->load();
-    if (auto lobby = state::get_lobby_by_connected_session(lobbies, std::to_string(moonlight_session_id))) {
-      logs::log(logs::info, "[LOBBY] Moonlight stream {} over, leaving lobby {}", moonlight_session_id, lobby->id);
-      if (!state::get_session_by_id(app_state->running_sessions->load(), moonlight_session_id)) {
-        lobby->connected_sessions->update([&](const auto &connected) {
-          return connected |
-                 ranges::views::filter([&](const auto &id) { return *id != std::to_string(moonlight_session_id); }) |
+    const auto session = state::get_session_by_id(app_state->running_sessions->load(), id);
+    const auto lobbies = app_state->lobbies->load();
+    for (const auto &lobby : *lobbies) {
+      bool member = false;
+      for (const auto &connected : *lobby.connected_sessions->load())
+        member = member || *connected == std::to_string(id);
+      if (!member)
+        continue;
+      if (session) {
+        if (session->dual_display && session->dual_display->config.dual()) {
+          leave_lobby(app_state->event_bus, lobby, *session, true);
+        } else {
+          app_state->event_bus->fire_event(immer::box<events::LeaveLobbyEvent>{
+              events::LeaveLobbyEvent{.lobby_id = lobby.id, .moonlight_session_id = id}});
+        }
+      } else {
+        lobby.connected_sessions->update([&](const auto &connected) {
+          return connected | ranges::views::filter([&](const auto &v) { return *v != std::to_string(id); }) |
                  ranges::to<immer::vector<immer::box<std::string>>>();
         });
-        if (lobby->stop_when_everyone_leaves && lobby->connected_sessions->load()->empty())
-          app_state->event_bus->fire_event(
-              immer::box<events::StopLobbyEvent>{events::StopLobbyEvent{.lobby_id = lobby->id}});
-        return;
+        if (lobby.stop_when_everyone_leaves && lobby.connected_sessions->load()->empty())
+          app_state->event_bus->fire_event(immer::box<events::StopLobbyEvent>{events::StopLobbyEvent{lobby.id}});
       }
-      // Fire the LeaveLobbyEvent so that it can also be picked up by WolfUI via SSE
-      app_state->event_bus->fire_event(immer::box<events::LeaveLobbyEvent>{
-          events::LeaveLobbyEvent{.lobby_id = lobby->id, .moonlight_session_id = moonlight_session_id}});
     }
   };
 
@@ -518,7 +700,9 @@ setup_lobbies_handlers(const immer::box<state::AppState> &app_state,
       [=](const immer::box<events::PauseStreamEvent> &pause_stream_event) {
         std::lock_guard transition(*app_state->gpu_transitions);
         auto session = state::get_session_by_id(app_state->running_sessions->load(), pause_stream_event->session_id);
-        if (session && session->gpu_route) {
+        if (session && session->dual_display && session->dual_display->config.dual()) {
+          on_moonlight_session_over(pause_stream_event->session_id);
+        } else if (session && session->gpu_route) {
           auto lobby =
               state::get_lobby_by_connected_session(app_state->lobbies->load(), std::to_string(session->session_id));
           if (lobby)
@@ -537,6 +721,16 @@ setup_lobbies_handlers(const immer::box<state::AppState> &app_state,
   handlers.push_back(app_state->event_bus->register_handler<immer::box<events::ClientWolfUIComboEvent>>(
       [=](const immer::box<events::ClientWolfUIComboEvent> &event) {
         logs::log(logs::info, "Detected WolfUI combo for session {}", event->session_id);
+        if (auto session = state::get_session_by_id(app_state->running_sessions->load(), event->session_id);
+            session && session->dual_display && session->dual_display->config.dual()) {
+          auto dual = session->dual_display;
+          auto route = dual->routing.load();
+          const auto &lobby_id = route->slots[dual->input_display.load()].lobby_id;
+          if (lobby_id)
+            app_state->event_bus->fire_event(immer::box<events::LeaveLobbyEvent>{
+                events::LeaveLobbyEvent{.lobby_id = *lobby_id, .moonlight_session_id = session->session_id}});
+          return;
+        }
         on_moonlight_session_over(event->session_id);
       }));
 

@@ -52,7 +52,7 @@ create_rtp_header(const gst_rtp_moonlight_pay_video &rtpmoonlightpay, int packet
   packet->rtp.header = 0x80 | FLAG_EXTENSION;
   packet->rtp.packetType = 0x00;
   packet->rtp.timestamp = 0x00;
-  packet->rtp.ssrc = 0x00;
+  packet->rtp.ssrc = boost::endian::native_to_big(rtpmoonlightpay.ssrc);
 
   uint32_t sequence_number = rtpmoonlightpay.cur_seq_number + packet_nr;
   packet->rtp.sequenceNumber = boost::endian::native_to_big((uint16_t)sequence_number);
@@ -154,6 +154,7 @@ static void update_fec_info(const gst_rtp_moonlight_pay_video &rtpmoonlightpay,
   rtp_packet->packet.multiFecFlags = 0x10;
 
   rtp_packet->rtp.header = 0x80 | FLAG_EXTENSION;
+  rtp_packet->rtp.ssrc = boost::endian::native_to_big(rtpmoonlightpay.ssrc);
   uint32_t sequence_number = rtpmoonlightpay.cur_seq_number + shard_idx;
   rtp_packet->rtp.sequenceNumber = boost::endian::native_to_big((uint16_t)sequence_number);
 }

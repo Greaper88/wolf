@@ -26,6 +26,24 @@ namespace endpoints {
 using namespace control;
 using namespace wolf::core;
 
+inline bool dual_video_enabled() {
+  return utils::get_env("WOLF_ENABLE_DUAL_DISPLAY", "FALSE") == std::string("TRUE");
+}
+
+inline bool dual_monitor_enabled() {
+  if (!dual_video_enabled())
+    return false;
+  auto source = gstreamer::gst_element_ptr(gst_element_factory_make("waylanddisplaysrc", nullptr), gst_object_unref);
+  return source && g_object_class_find_property(G_OBJECT_GET_CLASS(source.get()), "display-layout");
+}
+
+inline void acknowledge_displays(XML &xml, const events::StreamSession &session) {
+  if (session.dual_display) {
+    xml.put("root.GrimmDisplayVersion", 1);
+    xml.put("root.GrimmDisplayMode", session.dual_display->config.mode);
+  }
+}
+
 template <class T> void server_error(const std::shared_ptr<typename SimpleWeb::Server<T>::Response> &response) {
   XML xml;
   xml.put("root.<xmlattr>.status_code", 400);
@@ -83,6 +101,14 @@ void serverinfo(const std::shared_ptr<typename SimpleWeb::Server<T>::Response> &
                                    : state->gpu_runtime ? state->gpu_runtime->supports(wolf::gpu::Codec::av1)
                                                         : cfg->support_av1);
 
+  xml.put("root.GrimmDisplayVersion", 1);
+  xml.put("root.GrimmDisplayTransport", "rtp-ssrc-v1");
+  auto modes = std::string("off,controls");
+  if (dual_video_enabled())
+    modes += ",dual_app";
+  if (dual_monitor_enabled())
+    modes += ",dual_monitor";
+  xml.put("root.GrimmDisplayModes", modes);
   send_xml<T>(response, SimpleWeb::StatusCode::success_ok, xml);
 }
 
@@ -384,6 +410,22 @@ auto create_run_session(const SimpleWeb::CaseInsensitiveMultimap &headers,
                                          state->config->support_hevc,
                                          state->config->support_av1};
 
+  std::map<std::string, std::string> display_query;
+  for (const auto &[key, value] : headers) {
+    if (key.starts_with("gd_")) {
+      if (!display_query.emplace(key, value).second)
+        throw std::invalid_argument("Duplicate display option: " + key);
+    }
+  }
+  auto display_config =
+      moonlight::dual_display::parse(display_query, display_mode.width, display_mode.height, display_mode.refreshRate);
+  if (display_config.dual() && !dual_video_enabled())
+    throw std::invalid_argument("Dual video is disabled; set WOLF_ENABLE_DUAL_DISPLAY=TRUE on the test server");
+  if (display_config.dual() && !run_app.start_virtual_compositor)
+    throw std::invalid_argument("Dual video requires an app with a virtual compositor");
+  if (display_config.mode == "dual_monitor" && !dual_monitor_enabled())
+    throw std::invalid_argument("Dual monitor requires the matching gst-wayland-display feature build");
+
   auto surround_info = std::stoi(get_header(headers, "surroundAudioInfo").value_or("196610"));
   int channelCount = surround_info & (0xffff /* last 16 bits */);
 
@@ -396,6 +438,10 @@ auto create_run_session(const SimpleWeb::CaseInsensitiveMultimap &headers,
                                             get_header(headers, "rikeyid").value());
 
   base_session->ip = client_ip;
+  if (display_config.version) {
+    base_session->dual_display = std::make_shared<events::DualDisplayState>();
+    base_session->dual_display->config = std::move(display_config);
+  }
   return std::move(base_session);
 }
 
@@ -433,9 +479,11 @@ void launch(const std::shared_ptr<typename SimpleWeb::Server<SimpleWeb::HTTPS>::
   }
 
   auto client_ip = get_client_ip<SimpleWeb::HTTPS>(request);
-  auto new_session = create_run_session(request->parse_query_string(), client_ip, current_client, state, app.value());
+  std::shared_ptr<events::StreamSession> new_session;
   try {
+    new_session = create_run_session(request->parse_query_string(), client_ip, current_client, state, app.value());
     state::prepare_gpu_session(*state, *new_session);
+    state::prepare_dual_session(*state, *new_session);
   } catch (const std::exception &error) {
     logs::log(logs::warning, "[GPU] Launch rejected: {}", error.what());
     server_error<SimpleWeb::HTTPS>(response);
@@ -456,6 +504,7 @@ void launch(const std::shared_ptr<typename SimpleWeb::Server<SimpleWeb::HTTPS>::
 
   auto rtsp_ip = get_rtsp_ip_string(get_host_ip<SimpleWeb::HTTPS>(request, state), *new_session);
   auto xml = moonlight::launch_success(rtsp_ip, std::to_string(get_port(state::RTSP_SETUP_PORT)));
+  acknowledge_displays(xml, *new_session);
   send_xml<SimpleWeb::HTTPS>(response, SimpleWeb::StatusCode::success_ok, xml);
 }
 
@@ -484,8 +533,28 @@ void resume(const std::shared_ptr<typename SimpleWeb::Server<SimpleWeb::HTTPS>::
         return;
       }
     }
-    auto new_session =
-        create_run_session(request->parse_query_string(), client_ip, current_client, state, *old_session->app);
+    std::shared_ptr<events::StreamSession> new_session;
+    try {
+      new_session =
+          create_run_session(request->parse_query_string(), client_ip, current_client, state, *old_session->app);
+      const auto old_dual = old_session->dual_display;
+      const auto next_dual = new_session->dual_display;
+      if (old_dual && old_dual->config.dual()) {
+        if (!next_dual || rfl::json::write(old_dual->config) != rfl::json::write(next_dual->config))
+          throw std::invalid_argument("Stop this session before changing its dual-display mode or geometry");
+        new_session->dual_display = old_dual;
+        old_dual->generation.fetch_add(1);
+        old_dual->negotiated.store(false);
+      } else if (next_dual && next_dual->config.dual()) {
+        throw std::invalid_argument("Stop the single-display session before enabling dual video");
+      }
+    } catch (const std::exception &error) {
+      XML xml;
+      xml.put("root.<xmlattr>.status_code", 400);
+      xml.put("root.<xmlattr>.status_message", error.what());
+      send_xml<SimpleWeb::HTTPS>(response, SimpleWeb::StatusCode::success_ok, xml);
+      return;
+    }
     new_session->gpu_route = old_session->gpu_route;
     new_session->gpu = old_session->gpu;
     new_session->gpu_launch = old_session->gpu_launch;
@@ -507,6 +576,7 @@ void resume(const std::shared_ptr<typename SimpleWeb::Server<SimpleWeb::HTTPS>::
 
     auto rtsp_ip = get_rtsp_ip_string(get_host_ip<SimpleWeb::HTTPS>(request, state), *new_session);
     auto xml = moonlight::launch_resume(rtsp_ip, std::to_string(get_port(state::RTSP_SETUP_PORT)));
+    acknowledge_displays(xml, *new_session);
     send_xml<SimpleWeb::HTTPS>(response, SimpleWeb::StatusCode::success_ok, xml);
     return;
   } else {

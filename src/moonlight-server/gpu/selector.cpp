@@ -151,7 +151,11 @@ bool is_last_resort(const Device &d, const Options &o) {
          (o.prefer_ray_tracing && !d.hardware_ray_tracing.value_or(false));
 }
 
-Selection select(const std::vector<Device> &snapshot, const Options &o, bool retry, bool existing_app) {
+Selection select(const std::vector<Device> &snapshot,
+                 const Options &o,
+                 bool retry,
+                 bool existing_app,
+                 bool allow_coordinated_start) {
   Selection result;
   if (!o.enabled())
     return result; // Caller executes the unchanged legacy path.
@@ -184,7 +188,7 @@ Selection select(const std::vector<Device> &snapshot, const Options &o, bool ret
       reason = "projected encoder saturated";
     else if (!d.encoder_percent && o.encoder_unknown_policy == "reject")
       reason = "encoder utilization unavailable";
-    else if (d.pending_sessions && d.active_sessions == 0)
+    else if (d.pending_sessions && d.active_sessions == 0 && !allow_coordinated_start)
       reason = "first session still starting; retry after encoder telemetry settles";
     if (!reason.empty()) {
       result.rejected.push_back({d.id, reason});

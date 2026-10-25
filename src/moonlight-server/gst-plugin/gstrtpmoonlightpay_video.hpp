@@ -27,6 +27,7 @@ struct _gst_rtp_moonlight_pay_video {
 
   u_int32_t cur_seq_number;
   u_int32_t frame_num;
+  u_int32_t ssrc;
 };
 
 struct _gst_rtp_moonlight_pay_videoClass {

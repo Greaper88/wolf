@@ -143,6 +143,7 @@ struct CreateLobbyRequest {
 
   std::string runner_state_folder;
   events::RunnerTypes runner;
+  std::optional<int> display_id;
 };
 
 struct LobbiesResponse {

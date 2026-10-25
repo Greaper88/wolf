@@ -102,7 +102,9 @@ std::string Admission::Reservation::error() const {
 }
 std::string Admission::Reservation::resume(const Options &options,
                                            const std::function<std::vector<Device>()> &sample,
-                                           const Reservation *replacing) {
+                                           const Reservation *replacing,
+                                           const Reservation *replacing_second,
+                                           const Reservation *coordinated_peer) {
   std::lock_guard lock(state_->mutex);
   state_->expire_handshakes();
   if (!armed_ || cancelled_)
@@ -114,29 +116,43 @@ std::string Admission::Reservation::resume(const Options &options,
     return {}; // Initial launch/already admitted handshake.
   auto devices = sample();
   std::vector<Device> pinned;
+  bool allow_coordinated_start = false;
   for (auto device : devices) {
     if (device.id != own.device_id || device.render_node != metadata_.render_node)
       continue;
     device.active_sessions = device.pending_sessions = device.retained_sessions = 0;
+    bool peer_pending = false;
     for (const auto &[session, assignment] : state_->assignments) {
       if (session == session_ || assignment.device_id != device.id)
         continue;
       if (replacing && replacing->state_ == state_ && replacing->armed_ && !replacing->cancelled_ &&
           session == replacing->session_)
         continue;
+      if (replacing_second && replacing_second->state_ == state_ && replacing_second->armed_ &&
+          !replacing_second->cancelled_ && session == replacing_second->session_)
+        continue;
       if (assignment.retained)
         ++device.retained_sessions;
       else if (assignment.active)
         ++device.active_sessions;
-      else
+      else {
         ++device.pending_sessions;
+        peer_pending = peer_pending || (coordinated_peer && coordinated_peer->state_ == state_ &&
+                                        coordinated_peer->armed_ && !coordinated_peer->cancelled_ &&
+                                        coordinated_peer->metadata_.render_node == metadata_.render_node &&
+                                        session == coordinated_peer->session_);
+      }
     }
+    // Two tracks in one atomic monitor handoff may start together. Keep the
+    // peer's encoder demand in every capacity estimate; relax only the startup
+    // telemetry gate, and only when no unrelated pending encoder exists.
+    allow_coordinated_start = peer_pending && device.pending_sessions == 1;
     pinned.push_back(std::move(device));
   }
   // This app already renders on its pinned GPU. Reconnecting adds an encoder,
   // not another rendering workload. Keep memory/encoder/device gates, but do not
   // lock out its owner because the app or another desktop saturates the core.
-  auto selection = select(pinned, options, false, true);
+  auto selection = select(pinned, options, false, true, allow_coordinated_start);
   if (!selection.device) {
     error_ = "GPU too busy or unavailable. Wait and retry, or force-close the app and restart it "
              "(unsaved data may be lost).";

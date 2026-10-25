@@ -147,6 +147,22 @@ template <> struct Reflector<events::StartRunner> {
   }
 };
 
+struct DisplaySlotStatus {
+  int display_id;
+  std::optional<std::string> app_id;
+  std::string state;
+};
+struct DualDisplayStatus {
+  int version;
+  std::string mode;
+  std::string layout;
+  int primary;
+  int active_display;
+  bool available;
+  std::vector<moonlight::dual_display::Display> displays;
+  std::vector<DisplaySlotStatus> slots;
+};
+
 template <> struct Reflector<events::StreamSession> {
   struct ReflType {
     std::string client_ip;
@@ -166,9 +182,26 @@ template <> struct Reflector<events::StreamSession> {
     std::optional<std::string> client_id;
     std::optional<ClientSettings> client_settings;
     std::optional<wolf::gpu::SessionGpu> gpu;
+    std::optional<DualDisplayStatus> dual_display;
   };
 
   static ReflType from(const events::StreamSession &v) {
+    std::optional<DualDisplayStatus> dual;
+    if (v.dual_display) {
+      const auto &cfg = v.dual_display->config;
+      const auto routing = v.dual_display->routing.load();
+      dual = DualDisplayStatus{cfg.version,
+                               cfg.mode,
+                               cfg.layout,
+                               cfg.primary,
+                               routing ? routing->active_display : cfg.primary,
+                               v.dual_display->negotiated.load() && v.dual_display->streaming.load(),
+                               cfg.displays,
+                               {}};
+      if (routing)
+        for (int i = 0; i < 2; ++i)
+          dual->slots.push_back({i, routing->slots[i].lobby_id, routing->slots[i].lobby_id ? "running" : "launcher"});
+    }
     return {.client_ip = v.ip,
             .aes_key = v.aes_key,
             .aes_iv = v.aes_iv,
@@ -180,7 +213,8 @@ template <> struct Reflector<events::StreamSession> {
             .app_id = v.app->base.id,
             .client_id = std::to_string(v.session_id),
             .client_settings = v.client_settings,
-            .gpu = v.gpu};
+            .gpu = v.gpu,
+            .dual_display = std::move(dual)};
   }
 };
 

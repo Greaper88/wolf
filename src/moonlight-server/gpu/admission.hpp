@@ -45,9 +45,12 @@ public:
     // Keep the app pinned; release encoder demand only after the pipeline has torn down.
     void pause();
     // replacing is the joining viewer's dedicated encoder, which retires before the new one starts.
+    // coordinated_peer is the already-admitted first track of one atomic monitor handoff.
     std::string resume(const Options &options,
                        const std::function<std::vector<Device>()> &sample,
-                       const Reservation *replacing = nullptr);
+                       const Reservation *replacing = nullptr,
+                       const Reservation *replacing_second = nullptr,
+                       const Reservation *coordinated_peer = nullptr);
     void fail(const std::string &message);
     std::string error() const;
     std::uint64_t begin_encoder();

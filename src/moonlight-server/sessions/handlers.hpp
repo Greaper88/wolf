@@ -46,6 +46,7 @@ struct RunnerArgs {
   const std::string &xdg_runtime_dir;
 
   immer::box<config::ClientSettings> client_settings;
+  std::optional<moonlight::dual_display::Config> display_config;
 };
 
 /**

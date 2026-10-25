@@ -90,8 +90,11 @@ bool blacklisted(const Device &device, const Options &options);
 bool matches(const Device &device, const std::vector<std::string> &identifiers);
 bool is_last_resort(const Device &device, const Options &options);
 std::optional<double> projected_encoder(const Device &device);
-Selection
-select(const std::vector<Device> &snapshot, const Options &options, bool retry = false, bool existing_app = false);
+Selection select(const std::vector<Device> &snapshot,
+                 const Options &options,
+                 bool retry = false,
+                 bool existing_app = false,
+                 bool allow_coordinated_start = false);
 SessionGpu metadata(const Device &device, std::optional<double> projected, unsigned int count);
 
 } // namespace wolf::gpu

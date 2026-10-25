@@ -189,6 +189,47 @@ inline void prepare_gpu_session(const AppState &state, events::StreamSession &se
   session.gpu_route->runtime = state.gpu_runtime;
 }
 
+inline void prepare_dual_session(const AppState &state, events::StreamSession &session) {
+  const auto dual = session.dual_display;
+  if (!dual || !dual->config.dual())
+    return;
+  if (!session.gpu_route || !state.gpu_runtime)
+    throw std::runtime_error("Dual video currently requires automatic GPU selection");
+  auto launch = session.gpu_route->home->launch;
+  if (dual->config.mode == "dual_monitor") {
+    // A shared desktop is captured once and cropped before two independent HW
+    // encoders. CPU-buffer capture makes the crop explicit across GPU vendors.
+    auto cpu_launch = std::make_shared<wolf::gpu::Runtime::Launch>(*launch);
+    cpu_launch->zero_copy = false;
+    launch = cpu_launch;
+  }
+  auto home = gpu_target(state, launch, std::to_string(session.session_id), session.video_context);
+  auto held = state.gpu_runtime->retain("display1:" + std::to_string(session.session_id), *launch);
+  if (!held.launch)
+    throw std::runtime_error(held.error);
+  auto second = gpu_target(state, held.launch, std::to_string(session.session_id), session.video_context);
+  auto app = std::make_shared<events::App>(*session.app);
+  app->video_producer_buffer_caps = home->producer_caps;
+  app->h264_gst_pipeline = home->pipelines[0];
+  app->hevc_gst_pipeline = home->pipelines[1];
+  app->av1_gst_pipeline = home->pipelines[2];
+  session.app = app;
+  session.gpu_route->home = home;
+  session.gpu_route->target.store(home);
+  dual->home = {home, second};
+  auto routing = std::make_shared<events::DisplayRouting>();
+  for (int i = 0; i < 2; ++i)
+    routing->slots[i] = {.producer = std::to_string(session.session_id),
+                         .target = dual->home[i],
+                         .mouse = session.mouse,
+                         .keyboard = session.keyboard,
+                         .touch_screen = session.touch_screen,
+                         .wayland_display = session.wayland_display};
+  routing->active_display = dual->config.primary;
+  dual->input_display.store(dual->config.primary);
+  dual->routing.store(routing);
+}
+
 inline immer::vector<events::StreamSession> remove_session(const immer::vector<events::StreamSession> &sessions,
                                                            const events::StreamSession &session) {
   return sessions                                                                                           //

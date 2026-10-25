@@ -15,6 +15,9 @@ using namespace wolf::core;
 void handle_input(events::StreamSession &session,
                   immer::box<std::shared_ptr<ENetPeer>> connected_client,
                   INPUT_PKT *pkt);
+bool handle_input_packet(events::StreamSession &session,
+                         immer::box<std::shared_ptr<ENetPeer>> connected_client,
+                         std::string_view packet);
 
 void mouse_move_rel(const MOUSE_MOVE_REL_PACKET &pkt, events::StreamSession &session);
 

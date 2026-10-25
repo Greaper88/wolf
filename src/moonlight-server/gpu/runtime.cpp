@@ -94,7 +94,10 @@ Runtime::LaunchResult Runtime::retain(const std::string &app_id, const Launch &p
           false,
           {}};
 }
-std::string Runtime::resume(const Launch &launch, const Launch *replacing) {
+std::string Runtime::resume(const Launch &launch,
+                            const Launch *replacing,
+                            const Launch *replacing_second,
+                            const Launch *coordinated_peer) {
   return launch.reservation->resume(
       options_,
       [&] {
@@ -107,7 +110,9 @@ std::string Runtime::resume(const Launch &launch, const Launch *replacing) {
         }
         return devices;
       },
-      replacing ? replacing->reservation.get() : nullptr);
+      replacing ? replacing->reservation.get() : nullptr,
+      replacing_second ? replacing_second->reservation.get() : nullptr,
+      coordinated_peer ? coordinated_peer->reservation.get() : nullptr);
 }
 bool Runtime::supports(Codec codec) const {
   if (!options_.enabled())

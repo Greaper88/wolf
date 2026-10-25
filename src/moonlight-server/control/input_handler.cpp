@@ -197,7 +197,9 @@ std::shared_ptr<events::JoypadTypes> create_new_joypad(const events::StreamSessi
               controller_number,
               (int)final_type);
 
-    events::PlugDeviceEvent plug_ev{.session_id = std::to_string(session.session_id)};
+    events::PlugDeviceEvent plug_ev{
+        .session_id = session.input_target.value_or(std::to_string(session.session_id)),
+        .direct_to_launcher = session.input_scoped && session.input_target == std::to_string(session.session_id)};
     std::visit(
         [&plug_ev](auto &pad) {
           plug_ev.udev_events = pad.get_udev_events();
@@ -222,10 +224,11 @@ bool create_pen_tablet(events::StreamSession &session) {
     return false;
   }
   auto tablet_ptr = std::make_shared<PenTablet>(std::move(*tablet));
-  session.event_bus->fire_event(immer::box<events::PlugDeviceEvent>(
-      events::PlugDeviceEvent{.session_id = std::to_string(session.session_id),
-                              .udev_events = tablet_ptr->get_udev_events(),
-                              .udev_hw_db_entries = tablet_ptr->get_udev_hw_db_entries()}));
+  session.event_bus->fire_event(immer::box<events::PlugDeviceEvent>(events::PlugDeviceEvent{
+      .session_id = session.input_target.value_or(std::to_string(session.session_id)),
+      .udev_events = tablet_ptr->get_udev_events(),
+      .udev_hw_db_entries = tablet_ptr->get_udev_hw_db_entries(),
+      .direct_to_launcher = session.input_scoped && session.input_target == std::to_string(session.session_id)}));
   if (auto wl = *session.wayland_display->load()) {
     for (const auto node : tablet_ptr->get_nodes()) {
       add_input_device(*wl, node);
@@ -247,10 +250,11 @@ bool create_touch_screen(events::StreamSession &session) {
     return false;
   }
   auto touch_screen = std::make_shared<TouchScreen>(std::move(*touch));
-  session.event_bus->fire_event(immer::box<events::PlugDeviceEvent>(
-      events::PlugDeviceEvent{.session_id = std::to_string(session.session_id),
-                              .udev_events = touch_screen->get_udev_events(),
-                              .udev_hw_db_entries = touch_screen->get_udev_hw_db_entries()}));
+  session.event_bus->fire_event(immer::box<events::PlugDeviceEvent>(events::PlugDeviceEvent{
+      .session_id = session.input_target.value_or(std::to_string(session.session_id)),
+      .udev_events = touch_screen->get_udev_events(),
+      .udev_hw_db_entries = touch_screen->get_udev_hw_db_entries(),
+      .direct_to_launcher = session.input_scoped && session.input_target == std::to_string(session.session_id)}));
   if (auto wl = *session.wayland_display->load()) {
     for (const auto node : touch_screen->get_nodes()) {
       add_input_device(*wl, node);
@@ -287,13 +291,22 @@ void mouse_move_abs(const MOUSE_MOVE_ABS_PACKET &pkt, events::StreamSession &ses
     float window_width = boost::endian::big_to_native(pkt.width);
     float window_height = boost::endian::big_to_native(pkt.height);
 
+    if (window_width <= 0 || window_height <= 0)
+      return;
     auto absolute_x = (x / window_width) * static_cast<float>(session.display_mode.width) * pointer_acceleration;
     auto absolute_y = (y / window_height) * static_cast<float>(session.display_mode.height) * pointer_acceleration;
+    int screen_width = session.display_mode.width;
+    int screen_height = session.display_mode.height;
+    if (session.input_scoped && session.dual_display && session.dual_display->config.mode == "dual_monitor") {
+      const auto &cfg = session.dual_display->config;
+      const auto &d = cfg.displays[session.input_display_id];
+      absolute_x += d.x;
+      absolute_y += d.y;
+      screen_width = cfg.canvas_width();
+      screen_height = cfg.canvas_height();
+    }
 
-    std::visit([absolute_x,
-                absolute_y,
-                screen_width = session.display_mode.width,
-                screen_height = session.display_mode.height](
+    std::visit([absolute_x, absolute_y, screen_width, screen_height](
                    auto &mouse) { mouse.move_abs(absolute_x, absolute_y, screen_width, screen_height); },
                session.mouse->value());
   } else {
@@ -493,6 +506,12 @@ void touch(const TOUCH_PACKET &pkt, events::StreamSession &session) {
     auto finger_id = boost::endian::little_to_native(pkt.pointer_id);
     auto x = netfloat_to_0_1(pkt.x);
     auto y = netfloat_to_0_1(pkt.y);
+    if (session.input_scoped && session.dual_display && session.dual_display->config.mode == "dual_monitor") {
+      const auto &cfg = session.dual_display->config;
+      const auto &d = cfg.displays[session.input_display_id];
+      x = (d.x + x * d.width) / cfg.canvas_width();
+      y = (d.y + y * d.height) / cfg.canvas_height();
+    }
     auto pressure_or_distance = netfloat_to_0_1(pkt.pressure_or_distance);
     std::visit(
         [&pkt, &session, &x, &y, &finger_id, &pressure_or_distance](auto &screen) {
@@ -608,9 +627,18 @@ void pen(const PEN_PACKET &pkt, events::StreamSession &session) {
 
     bool is_touching = pkt.event_type == TOUCH_EVENT_DOWN || pkt.event_type == TOUCH_EVENT_MOVE;
 
+    auto x = netfloat_to_0_1(pkt.x);
+    auto y = netfloat_to_0_1(pkt.y);
+    if (session.input_scoped && session.dual_display && session.dual_display->config.mode == "dual_monitor") {
+      const auto &cfg = session.dual_display->config;
+      const auto &d = cfg.displays[session.input_display_id];
+      x = (d.x + x * d.width) / cfg.canvas_width();
+      y = (d.y + y * d.height) / cfg.canvas_height();
+    }
+
     session.pen_tablet->value().place_tool(tool,
-                                           netfloat_to_0_1(pkt.x),
-                                           netfloat_to_0_1(pkt.y),
+                                           x,
+                                           y,
                                            is_touching ? pressure_or_distance : -1,
                                            is_touching ? -1 : pressure_or_distance,
                                            tilt_x,
@@ -648,7 +676,9 @@ void controller_multi(const CONTROLLER_MULTI_PACKET &pkt,
     if (!(pkt.active_gamepad_mask & (1 << pkt.controller_number))) {
       logs::log(logs::debug, "Removing joypad {}", pkt.controller_number);
       // Send the event downstream, Docker will pick it up and remove the device
-      events::UnplugDeviceEvent unplug_ev{.session_id = std::to_string(session.session_id)};
+      events::UnplugDeviceEvent unplug_ev{
+          .session_id = session.input_target.value_or(std::to_string(session.session_id)),
+          .direct_to_launcher = session.input_scoped && session.input_target == std::to_string(session.session_id)};
       std::visit(
           [&unplug_ev](auto &pad) {
             unplug_ev.udev_events = pad.get_udev_events();
@@ -772,6 +802,102 @@ void controller_battery(const CONTROLLER_BATTERY_PACKET &pkt, events::StreamSess
       }
     }
   }
+}
+
+bool handle_input_packet(events::StreamSession &session,
+                         immer::box<std::shared_ptr<ENetPeer>> connected_client,
+                         std::string_view packet) {
+  if (packet.size() < sizeof(INPUT_PKT))
+    return false;
+  const auto dual = session.dual_display;
+  const bool enabled = dual && dual->config.dual() && dual->negotiated.load();
+  const auto payload = std::span(reinterpret_cast<const std::uint8_t *>(packet.data() + 4), packet.size() - 4);
+  const auto input = moonlight::dual_display::unwrap_input(payload, enabled, enabled ? dual->input_display.load() : 0);
+  if (!input)
+    return false;
+  std::vector<char> inner(4 + input->packet.size());
+  std::copy_n(packet.data(), 4, inner.data());
+  std::copy(input->packet.begin(), input->packet.end(), inner.begin() + 4);
+  auto pkt = reinterpret_cast<INPUT_PKT *>(inner.data());
+  pkt->packet_len = boost::endian::native_to_little(static_cast<std::uint16_t>(inner.size() - 4));
+  std::size_t minimum = sizeof(INPUT_PKT);
+  switch (pkt->type) {
+  case MOUSE_MOVE_REL:
+    minimum = sizeof(MOUSE_MOVE_REL_PACKET);
+    break;
+  case MOUSE_MOVE_ABS:
+    minimum = sizeof(MOUSE_MOVE_ABS_PACKET);
+    break;
+  case MOUSE_BUTTON_PRESS:
+  case MOUSE_BUTTON_RELEASE:
+    minimum = sizeof(MOUSE_BUTTON_PACKET);
+    break;
+  case MOUSE_SCROLL:
+    minimum = sizeof(MOUSE_SCROLL_PACKET);
+    break;
+  case MOUSE_HSCROLL:
+    minimum = sizeof(MOUSE_HSCROLL_PACKET);
+    break;
+  case KEY_PRESS:
+  case KEY_RELEASE:
+    minimum = sizeof(KEYBOARD_PACKET);
+    break;
+  case CONTROLLER_MULTI:
+    minimum = sizeof(CONTROLLER_MULTI_PACKET);
+    break;
+  case CONTROLLER_ARRIVAL:
+    minimum = sizeof(CONTROLLER_ARRIVAL_PACKET);
+    break;
+  case CONTROLLER_TOUCH:
+    minimum = sizeof(CONTROLLER_TOUCH_PACKET);
+    break;
+  case CONTROLLER_MOTION:
+    minimum = sizeof(CONTROLLER_MOTION_PACKET);
+    break;
+  case CONTROLLER_BATTERY:
+    minimum = sizeof(CONTROLLER_BATTERY_PACKET);
+    break;
+  case TOUCH:
+    minimum = sizeof(TOUCH_PACKET);
+    break;
+  case PEN:
+    minimum = sizeof(PEN_PACKET);
+    break;
+  case UTF8_TEXT:
+    if (boost::endian::big_to_native(pkt->data_size) < 4 ||
+        boost::endian::big_to_native(pkt->data_size) - 4 > UTF8_TEXT_MAX_LEN)
+      return false;
+    break;
+  default:
+    break;
+  }
+  if (inner.size() < minimum)
+    return false;
+  if (!enabled) {
+    handle_input(session, connected_client, pkt);
+    return true;
+  }
+  const auto routing = dual->routing.load();
+  if (!routing || input->display > 1)
+    return false;
+  const auto &slot = routing->slots[input->display];
+  const auto &d = dual->config.displays[input->display];
+  auto view = session;
+  view.mouse = slot.mouse;
+  view.keyboard = slot.keyboard;
+  view.touch_screen = slot.touch_screen;
+  view.joypads = slot.joypads;
+  view.held_modifiers = slot.held_modifiers;
+  view.pen_tablet = slot.pen_tablet;
+  view.wayland_display = slot.wayland_display;
+  view.input_target = slot.producer;
+  view.input_display_id = input->display;
+  view.input_scoped = true;
+  view.display_mode.width = d.width;
+  view.display_mode.height = d.height;
+  dual->input_display.store(input->display);
+  handle_input(view, connected_client, pkt);
+  return true;
 }
 
 void handle_input(events::StreamSession &session,

@@ -33,7 +33,10 @@ public:
   };
   LaunchResult prepare(const std::string &session_id, const std::string &device_id = {});
   LaunchResult retain(const std::string &app_id, const Launch &parent);
-  std::string resume(const Launch &launch, const Launch *replacing = nullptr);
+  std::string resume(const Launch &launch,
+                     const Launch *replacing = nullptr,
+                     const Launch *replacing_second = nullptr,
+                     const Launch *coordinated_peer = nullptr);
   bool supports(Codec codec) const;
   std::optional<CapabilityCache::Snapshot> capabilities(const Device &device) const;
   void invalidate(const std::string &device_id);

@@ -21,6 +21,18 @@ void start_runner(std::shared_ptr<events::Runner> runner,
   immer::map_transient<std::string, std::string> full_env;
   full_env.set("XDG_RUNTIME_DIR", args->xdg_runtime_dir);
   full_env.set("WOLF_SESSION_ID", args->session_id);
+  if (args->display_config && args->display_config->mode == "dual_monitor") {
+    const auto &config = *args->display_config;
+    std::string layout;
+    for (const auto &d : config.displays) {
+      if (!layout.empty())
+        layout += ';';
+      layout += fmt::format("{},{},{},{},{}", d.width, d.height, d.fps, d.x, d.y);
+    }
+    full_env.set("WOLF_DISPLAY_MODE", config.mode);
+    full_env.set("WOLF_DISPLAY_LAYOUT", layout);
+    full_env.set("WOLF_PRIMARY_DISPLAY", std::to_string(config.primary));
+  }
 
   auto pulse_sink_name = fmt::format("{}{}", VIRTUAL_SINK_PREFIX, args->session_id);
   auto audio_server_name = args->audio_server ? audio::get_server_name(args->audio_server->server) : "";

@@ -21,6 +21,7 @@
 #include <immer/vector.hpp>
 #include <moonlight/control.hpp>
 #include <moonlight/data-structures.hpp>
+#include <moonlight/dual-display.hpp>
 #include <rfl.hpp>
 #include <rfl/json.hpp>
 #include <state/serialised_config.hpp>
@@ -43,12 +44,14 @@ struct PlugDeviceEvent {
   std::string session_id;
   std::vector<std::map<std::string, std::string>> udev_events;
   std::vector<std::pair<std::string, std::vector<std::string>>> udev_hw_db_entries;
+  rfl::Skip<bool> direct_to_launcher = false;
 };
 
 struct UnplugDeviceEvent {
   std::string session_id;
   std::vector<std::map<std::string, std::string>> udev_events;
   std::vector<std::pair<std::string, std::vector<std::string>>> udev_hw_db_entries;
+  rfl::Skip<bool> direct_to_launcher = false;
 };
 
 using devices_atom_queue = TSQueue<immer::box<events::PlugDeviceEvent>>;
@@ -121,6 +124,7 @@ struct GpuStreamTarget {
   std::shared_ptr<streaming::SharedVideoEncoder> shared_encoder;
 };
 struct VideoSession;
+struct DualDisplayState;
 // Read-only worker telemetry, independent of automatic GPU admission and routing.
 struct StreamVideoStatus {
   std::string codec;
@@ -186,6 +190,7 @@ struct Lobby {
    * A queue of devices that will be plugged into the runner when ready
    */
   std::shared_ptr<events::devices_atom_queue> plugged_devices_queue = std::make_shared<events::devices_atom_queue>();
+  std::optional<moonlight::dual_display::Config> display_config;
 };
 
 struct VideoSettings {
@@ -226,6 +231,7 @@ struct CreateLobbyEvent {
    * A promise to know when the lobby is up and running
    */
   rfl::Skip<std::shared_ptr<std::promise<bool>>> on_setup_over = std::make_shared<std::promise<bool>>();
+  std::optional<moonlight::dual_display::Config> display_config;
 };
 
 struct JoinLobbyEvent {
@@ -237,6 +243,7 @@ struct JoinLobbyEvent {
    * A promise to know if there's been an error message
    */
   rfl::Skip<std::shared_ptr<std::promise<std::string>>> error_message = std::make_shared<std::promise<std::string>>();
+  std::optional<int> display_id;
 };
 
 struct LeaveLobbyEvent {
@@ -326,6 +333,10 @@ struct VideoSession {
 
   std::string client_ip;
   std::array<char, 16> rtp_secret_payload;
+  rfl::Skip<std::shared_ptr<DualDisplayState>> dual_display;
+  unsigned int rtp_ssrc = 0;
+  int display_id = 0;
+  std::uint64_t display_generation = 0;
 };
 
 struct AudioSession {
@@ -471,6 +482,35 @@ using EventsVariant = std::variant<immer::box<PlugDeviceEvent>,
  * This will then be fired up in the event_bus so that the rtsp, command, audio and video threads
  * can start working their magic.
  */
+struct DisplaySlot {
+  std::string producer;
+  std::optional<std::string> lobby_id;
+  std::shared_ptr<const GpuStreamTarget> target;
+  std::shared_ptr<std::optional<MouseTypes>> mouse;
+  std::shared_ptr<std::optional<KeyboardTypes>> keyboard;
+  std::shared_ptr<std::optional<TouchScreenTypes>> touch_screen;
+  std::shared_ptr<immer::atom<virtual_display::wl_state_ptr>> wayland_display;
+  std::shared_ptr<immer::atom<JoypadList>> joypads = std::make_shared<immer::atom<JoypadList>>();
+  std::shared_ptr<immer::atom<char>> held_modifiers = std::make_shared<immer::atom<char>>();
+  std::shared_ptr<std::optional<input::PenTablet>> pen_tablet = std::make_shared<std::optional<input::PenTablet>>();
+};
+
+struct DisplayRouting {
+  std::array<DisplaySlot, 2> slots;
+  int active_display = 0;
+};
+
+struct DualDisplayState {
+  moonlight::dual_display::Config config;
+  std::atomic<std::shared_ptr<const DisplayRouting>> routing;
+  std::array<std::shared_ptr<const GpuStreamTarget>, 2> home;
+  std::atomic<bool> negotiated{false};
+  std::atomic<bool> streaming{false};
+  std::atomic<int> input_display{0};
+  std::atomic<std::uint64_t> generation{0};
+  std::atomic<std::uint64_t> streaming_generation{0};
+};
+
 struct StreamSession {
   moonlight::DisplayMode display_mode;
   int audio_channel_count;
@@ -541,6 +581,10 @@ struct StreamSession {
 
   std::shared_ptr<std::optional<input::PenTablet>> pen_tablet =
       std::make_shared<std::optional<input::PenTablet>>(); /* Optional, will be set on first use */
+  std::shared_ptr<DualDisplayState> dual_display;
+  std::optional<std::string> input_target;
+  int input_display_id = 0;
+  bool input_scoped = false;
 };
 
 } // namespace wolf::core::events

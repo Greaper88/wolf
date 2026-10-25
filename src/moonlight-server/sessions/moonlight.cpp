@@ -117,6 +117,18 @@ setup_moonlight_handlers(const immer::box<state::AppState> &app_state,
         auto stopped = state::get_session_by_id(app_state->running_sessions->load(), ev->session_id);
         if (stopped && stopped->gpu_launch)
           stopped->gpu_launch->reservation->cancel();
+        if (stopped && stopped->dual_display && stopped->dual_display->config.dual()) {
+          auto dual = stopped->dual_display;
+          dual->generation.fetch_add(1);
+          dual->negotiated.store(false);
+          for (const auto &home : dual->home)
+            if (home && home->launch)
+              home->launch->reservation->cancel();
+          if (const auto routing = dual->routing.load())
+            for (const auto &slot : routing->slots)
+              if (slot.target && slot.target->launch)
+                slot.target->launch->reservation->cancel();
+        }
         if (stopped && stopped->gpu_route)
           stopped->gpu_route->target.store(stopped->gpu_route->home);
         // Remove session from app state so that HTTP/S applist gets updated
@@ -133,7 +145,8 @@ setup_moonlight_handlers(const immer::box<state::AppState> &app_state,
         logs::log(logs::debug, "{} received hot-plug device event", hotplug_ev->session_id);
 
         // If we are currently in a lobby we don't want to plug the device to the original wolf-ui session
-        if (!state::get_lobby_by_connected_session(lobbies->load(), hotplug_ev->session_id)) {
+        if (hotplug_ev->direct_to_launcher.get() ||
+            !state::get_lobby_by_connected_session(lobbies->load(), hotplug_ev->session_id)) {
           if (auto session_devices_queue = plugged_devices_queue->load()->find(hotplug_ev->session_id)) {
             session_devices_queue->get()->push(hotplug_ev);
           } else {
@@ -165,15 +178,17 @@ setup_moonlight_handlers(const immer::box<state::AppState> &app_state,
                        gst_context = session->video_context,
                        sessions = app_state->running_sessions]() {
             try {
-              streaming::start_video_producer(std::to_string(session->session_id),
-                                              session->app->video_producer_buffer_caps,
-                                              session->app->render_node,
-                                              {.width = session->display_mode.width,
-                                               .height = session->display_mode.height,
-                                               .refreshRate = session->display_mode.refreshRate},
-                                              gst_context,
-                                              on_ready,
-                                              session->event_bus);
+              streaming::start_video_producer(
+                  std::to_string(session->session_id),
+                  session->app->video_producer_buffer_caps,
+                  session->app->render_node,
+                  {.width = session->display_mode.width,
+                   .height = session->display_mode.height,
+                   .refreshRate = session->display_mode.refreshRate},
+                  gst_context,
+                  on_ready,
+                  session->event_bus,
+                  session->dual_display ? session->dual_display->config : moonlight::dual_display::Config{});
             } catch (const std::exception &error) {
               logs::log(logs::error, "[GPU] Video producer failed: {}", error.what());
             }
@@ -313,7 +328,10 @@ setup_moonlight_handlers(const immer::box<state::AppState> &app_state,
                     .app_local_state_folder = run_session->stream_session->app_local_state_folder,
                     .app_host_state_folder = run_session->stream_session->app_host_state_folder,
                     .xdg_runtime_dir = runtime_dir,
-                    .client_settings = run_session->stream_session->client_settings}});
+                    .client_settings = run_session->stream_session->client_settings,
+                    .display_config = run_session->stream_session->dual_display
+                                          ? std::optional(run_session->stream_session->dual_display->config)
+                                          : std::nullopt}});
           } catch (const std::exception &error) {
             logs::log(logs::error, "Runner startup failed: {}", error.what());
           }

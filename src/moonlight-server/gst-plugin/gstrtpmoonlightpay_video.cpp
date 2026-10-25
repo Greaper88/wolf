@@ -55,6 +55,7 @@ enum {
    * Minimum number of FEC packages required by Moonlight
    */
   PROP_MIN_REQUIRED_FEC_PACKETS = 22,
+  PROP_SSRC = 23,
 };
 
 /* pad templates */
@@ -136,6 +137,10 @@ static void gst_rtp_moonlight_pay_video_class_init(gst_rtp_moonlight_pay_videoCl
                                                    G_PARAM_READWRITE));
 
   gobject_class->dispose = gst_rtp_moonlight_pay_video_dispose;
+  g_object_class_install_property(
+      gobject_class,
+      PROP_SSRC,
+      g_param_spec_uint("ssrc", "SSRC", "Negotiated video track identity", 0, G_MAXUINT, 0, G_PARAM_READWRITE));
   gobject_class->finalize = gst_rtp_moonlight_pay_video_finalize;
 
   base_transform_class->generate_output = GST_DEBUG_FUNCPTR(gst_rtp_moonlight_pay_video_generate_output);
@@ -150,6 +155,7 @@ static void gst_rtp_moonlight_pay_video_init(gst_rtp_moonlight_pay_video *rtpmoo
 
   rtpmoonlightpay_video->cur_seq_number = 0;
   rtpmoonlightpay_video->frame_num = 0;
+  rtpmoonlightpay_video->ssrc = 0;
 }
 
 void gst_rtp_moonlight_pay_video_set_property(GObject *object,
@@ -161,6 +167,9 @@ void gst_rtp_moonlight_pay_video_set_property(GObject *object,
   GST_DEBUG_OBJECT(rtpmoonlightpay_video, "set_property");
 
   switch (property_id) {
+  case PROP_SSRC:
+    rtpmoonlightpay_video->ssrc = g_value_get_uint(value);
+    break;
   case PROP_PAYLOAD_SIZE:
     rtpmoonlightpay_video->payload_size = g_value_get_int(value);
     break;
@@ -185,6 +194,9 @@ void gst_rtp_moonlight_pay_video_get_property(GObject *object, guint property_id
   GST_DEBUG_OBJECT(rtpmoonlightpay_video, "get_property");
 
   switch (property_id) {
+  case PROP_SSRC:
+    g_value_set_uint(value, rtpmoonlightpay_video->ssrc);
+    break;
   case PROP_PAYLOAD_SIZE:
     g_value_set_int(value, rtpmoonlightpay_video->payload_size);
     break;

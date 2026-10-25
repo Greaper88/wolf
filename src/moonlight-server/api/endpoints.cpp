@@ -525,6 +525,24 @@ void UnixSocketServer::endpoint_LobbyCreate(const wolf::api::HTTPRequest &req, s
     auto default_client_settings = state::ClientSettings{};
     auto client_settings = event.value().client_settings.value().value_or(PartialClientSettings{});
     auto lobby_id = state::gen_uuid();
+    auto source_session =
+        event->source_session_id
+            ? state::get_session_by_id(state_->app_state->running_sessions->load(), *event->source_session_id)
+            : std::nullopt;
+    std::optional<moonlight::dual_display::Config> display_config;
+    if (event->display_id) {
+      if (*event->display_id < 0 || *event->display_id > 1 || !source_session || !source_session->dual_display ||
+          source_session->dual_display->config.mode != "dual_app" || !source_session->dual_display->negotiated.load()) {
+        send_http(socket, 400, rfl::json::write(GenericErrorResponse{.error = "Display target is not negotiated"}));
+        return;
+      }
+      const auto &d = source_session->dual_display->config.displays[*event->display_id];
+      event->video_settings.width = d.width;
+      event->video_settings.height = d.height;
+      event->video_settings.refresh_rate = d.fps;
+    }
+    if (source_session && source_session->dual_display && source_session->dual_display->config.mode == "dual_monitor")
+      display_config = source_session->dual_display->config;
     std::shared_ptr<const events::GpuStreamTarget> target;
     if (state_->app_state->gpu_runtime) {
       if (!event->source_session_id) {
@@ -542,6 +560,14 @@ void UnixSocketServer::endpoint_LobbyCreate(const wolf::api::HTTPRequest &req, s
       for (const auto &existing : *state_->app_state->lobbies->load()) {
         if (existing.gpu_target && existing.started_by_profile_id == event->profile_id.get() &&
             existing.runner_state_folder == event->runner_state_folder) {
+          if (existing.display_config.has_value() != display_config.has_value() ||
+              (display_config && rfl::json::write(*existing.display_config) != rfl::json::write(*display_config))) {
+            send_http(socket,
+                      409,
+                      rfl::json::write(
+                          GenericErrorResponse{.error = "Stop this desktop before changing its monitor layout"}));
+            return;
+          }
           if (existing.multi_user != event->multi_user) {
             send_http(socket,
                       409,
@@ -590,7 +616,8 @@ void UnixSocketServer::endpoint_LobbyCreate(const wolf::api::HTTPRequest &req, s
                 .motion_controller_override = client_settings.motion_controller_override.value_or(
                     default_client_settings.motion_controller_override)},
         .runner_state_folder = event.value().runner_state_folder,
-        .runner = state::get_runner(event.value().runner, this->state_->app_state->event_bus)};
+        .runner = state::get_runner(event.value().runner, this->state_->app_state->event_bus),
+        .display_config = display_config};
     // Fire the event
     state_->app_state->event_bus->fire_event(immer::box<events::CreateLobbyEvent>(create_lobby_ev));
 

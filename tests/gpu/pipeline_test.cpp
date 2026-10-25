@@ -293,5 +293,68 @@ int main() {
     check(late->resume({}, sample).empty() && late->begin_encoder(),
           "resume readmits the same pinned app after an expired initial launch");
   }
+  {
+    Admission batch;
+    auto parent = batch.acquire("monitor-app", {}, sample, [] {}).reservation;
+    check(parent != nullptr, "monitor app has a pinned GPU");
+    auto first_track = batch.retain("monitor-track-0", *parent).reservation;
+    auto second_track = batch.retain("monitor-track-1", *parent).reservation;
+    auto unrelated = batch.retain("unrelated-track", *parent).reservation;
+    check(first_track && second_track && unrelated, "monitor tracks retain independent reservations");
+    parent->pause();
+    check(first_track->resume({}, sample).empty(), "first coordinated monitor track passes normal admission");
+    check(!second_track->resume({}, sample).empty(), "ordinary resume rejects a pending first monitor track");
+    check(!second_track->resume({}, sample, nullptr, nullptr, parent.get()).empty(),
+          "retained nonpending peer cannot relax the startup gate");
+    Admission foreign;
+    auto foreign_peer = foreign.acquire("monitor-track-0", {}, sample, [] {}).reservation;
+    check(!second_track->resume({}, sample, nullptr, nullptr, foreign_peer.get()).empty(),
+          "a reservation from another admission state cannot authorize coordinated startup");
+
+    device.encoder_percent = 99;
+    check(second_track->resume({}, sample, nullptr, nullptr, first_track.get()).find("encoder hard limit") !=
+              std::string::npos,
+          "coordinated startup preserves the hardware encoder hard limit");
+    device.encoder_percent = 91;
+    check(second_track->resume({}, sample, nullptr, nullptr, first_track.get()).find("projected encoder saturated") !=
+              std::string::npos,
+          "coordinated startup preserves measured encoder capacity checks");
+    device.encoder_percent.reset();
+    device.vram_percent = 99;
+    check(second_track->resume({}, sample, nullptr, nullptr, first_track.get()).find("VRAM saturated") !=
+              std::string::npos,
+          "coordinated startup preserves encoder buffer memory limits");
+    device.vram_percent.reset();
+    Options strict;
+    strict.encoder_unknown_policy = "reject";
+    check(second_track->resume(strict, sample, nullptr, nullptr, first_track.get()).find("utilization unavailable") !=
+              std::string::npos,
+          "coordinated startup preserves unknown telemetry policy");
+
+    check(unrelated->resume({}, sample, nullptr, nullptr, first_track.get()).empty(),
+          "construct another admitted pending track for the unrelated-pending regression");
+    check(!second_track->resume({}, sample, nullptr, nullptr, first_track.get()).empty(),
+          "a coordinated peer never hides an unrelated pending encoder");
+    unrelated->pause();
+
+    auto active = batch.retain("settled-encoder", *parent).reservation;
+    check(active && active->resume({}, sample, nullptr, nullptr, first_track.get()).empty(),
+          "construct a settled encoder for projected pending demand checks");
+    const auto epoch = active->begin_encoder();
+    check(epoch != 0, "claim the settled encoder");
+    active->encoder_active(epoch);
+    device.encoder_percent = 40;
+    check(second_track->resume({}, sample, nullptr, nullptr, first_track.get()).find("projected encoder saturated") !=
+              std::string::npos,
+          "the coordinated peer remains included in projected encoder demand");
+    active->end_encoder(epoch);
+    device.encoder_percent.reset();
+    check(second_track->resume({}, sample, nullptr, nullptr, first_track.get()).empty(),
+          "the exact sole pending peer allows both monitor tracks to be admitted atomically");
+    second_track->pause();
+    first_track->cancel();
+    check(!second_track->resume({}, sample, nullptr, nullptr, first_track.get()).empty(),
+          "a cancelled coordinated peer cannot authorize startup");
+  }
   std::cout << checks << " pipeline/lifecycle checks passed\n";
 }

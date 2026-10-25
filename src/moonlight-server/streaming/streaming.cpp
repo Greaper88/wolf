@@ -1,5 +1,6 @@
 #include "platforms/hw.hpp"
 
+#include <cctype>
 #include <chrono>
 #include <control/control.hpp>
 #include <core/batched_send.hpp>
@@ -99,16 +100,32 @@ void start_video_producer(const std::string &session_id,
                           const wolf::core::virtual_display::DisplayMode &display_mode,
                           std::shared_ptr<immer::atom<gst_video_context::gst_context_ptr>> video_context,
                           std::shared_ptr<boost::promise<WaylandDisplayReady>> on_ready,
-                          std::shared_ptr<events::EventBusType> event_bus) {
+                          std::shared_ptr<events::EventBusType> event_bus,
+                          const moonlight::dual_display::Config &display_config) {
+  auto mode = display_mode;
+  std::string output_properties;
+  if (display_config.mode == "dual_monitor") {
+    mode.width = display_config.canvas_width();
+    mode.height = display_config.canvas_height();
+    mode.refreshRate = std::max(display_config.displays[0].fps, display_config.displays[1].fps);
+    std::string layout;
+    for (const auto &d : display_config.displays) {
+      if (!layout.empty())
+        layout += ';';
+      layout += fmt::format("{},{},{},{},{}", d.width, d.height, d.fps, d.x, d.y);
+    }
+    output_properties = fmt::format("display-layout=\"{}\" primary-display={} ", layout, display_config.primary);
+  }
   auto pipeline = fmt::format("waylanddisplaysrc name=wolf_wayland_source render_node={render_node} ! "
                               "{buffer_format}, width={width}, height={height}, framerate={fps}/1 ! \n"    //
                               "interpipesink sync=true async=false name={session_id}_video max-buffers=1", //
                               fmt::arg("buffer_format", buffer_format),
                               fmt::arg("render_node", render_node),
                               fmt::arg("session_id", session_id),
-                              fmt::arg("width", display_mode.width),
-                              fmt::arg("height", display_mode.height),
-                              fmt::arg("fps", display_mode.refreshRate));
+                              fmt::arg("width", mode.width),
+                              fmt::arg("height", mode.height),
+                              fmt::arg("fps", mode.refreshRate));
+  pipeline.insert(pipeline.find('!'), output_properties);
   logs::log(logs::debug, "[GSTREAMER] Starting video producer: {}", pipeline);
   auto bus_data_ptr =
       std::make_shared<GstBusData>(GstBusData{.on_ready = std::move(on_ready), .wayland_plugin = nullptr});
@@ -426,6 +443,29 @@ std::string format_video_pipeline(immer::box<events::VideoSession> video_session
     if (auto pos = pipeline.find(source); pos != std::string::npos)
       pipeline.replace(pos, source.size(), "listen-to=" + producer + "_video");
   }
+  if (video_session->dual_display.get() && video_session->dual_display.get()->config.mode == "dual_monitor") {
+    const auto &cfg = video_session->dual_display.get()->config;
+    const auto &display = cfg.displays.at(video_session->display_id);
+    // Crop the shared raw desktop before separate conversion/encoding paths.
+    // Both streams retain their own bitstream, sequence numbers and FEC.
+    const auto first_link = pipeline.find('!');
+    if (first_link == std::string::npos)
+      throw std::runtime_error("Dual-monitor pipeline is missing its capture source boundary");
+    pipeline.insert(first_link + 1,
+                    fmt::format(" videocrop left={} top={} right={} bottom={} ! ",
+                                display.x,
+                                display.y,
+                                cfg.canvas_width() - display.x - display.width,
+                                cfg.canvas_height() - display.y - display.height));
+  }
+  if (video_session->rtp_ssrc) {
+    const auto first_link = pipeline.find('!');
+    if (first_link == std::string::npos)
+      throw std::runtime_error("Dual-video pipeline is missing a capture source boundary");
+    pipeline.insert(first_link + 1,
+                    fmt::format(" videorate drop-only=true ! video/x-raw(ANY),framerate={}/1 ! ",
+                                video_session->display_mode.refreshRate));
+  }
   return pipeline;
 }
 
@@ -651,6 +691,34 @@ static void stream_video_once(immer::box<events::VideoSession> video_session,
           expected_end->store(true);
       });
   auto pipeline = format_video_pipeline(video_session, client_ip, client_port, producer);
+  if (video_session->rtp_ssrc) {
+    // Interpipe keys listeners by name across the entire process, rather than
+    // by GstBin. Both tracks and later reconnects need fresh listener names.
+    const auto source_start = pipeline.find_first_not_of(" \n\t");
+    const auto source_end = pipeline.find('!');
+    if (source_start != std::string::npos && pipeline.compare(source_start, 12, "interpipesrc") == 0 &&
+        source_end != std::string::npos) {
+      const auto unique_name = fmt::format("interpipesrc_{}_display{}_{}_video",
+                                           video_session->session_id,
+                                           video_session->display_id,
+                                           state::gen_uuid());
+      auto name = pipeline.find("name=", source_start);
+      while (name != std::string::npos && name < source_end && name > 0 &&
+             !std::isspace(static_cast<unsigned char>(pipeline[name - 1])))
+        name = pipeline.find("name=", name + 5);
+      if (name != std::string::npos && name < source_end) {
+        const auto begin = name + 5;
+        const auto quote = pipeline[begin];
+        const auto end = quote == '\'' || quote == '"' ? pipeline.find(quote, begin + 1) + 1
+                                                       : pipeline.find_first_of(" \n\t!", begin);
+        if (end == std::string::npos || end <= begin || end > source_end)
+          throw std::runtime_error("Invalid dual-video Interpipe listener name");
+        pipeline.replace(begin, end - begin, unique_name);
+      } else {
+        pipeline.insert(source_end, " name=" + unique_name + " ");
+      }
+    }
+  }
   if (shared) {
     // Preserve this viewer's transport settings. Only the encoder half was canonicalized for matching.
     auto boundary = pipeline.rfind('!', pipeline.find("rtpmoonlightpay_video"));
@@ -676,6 +744,12 @@ static void stream_video_once(immer::box<events::VideoSession> video_session,
   run_pipeline(
       pipeline,
       [video_session, event_bus, udp_sink, ctx_data_ptr, activity, shared, &feed, &sequence](auto pipeline) {
+        if (auto pay = gst_bin_get_by_name(GST_BIN(pipeline.get()), "moonlight_pay")) {
+          g_object_set(pay, "ssrc", video_session->rtp_ssrc, nullptr);
+          gst_object_unref(pay);
+        } else if (video_session->rtp_ssrc) {
+          throw std::runtime_error("Dual-video pipeline requires the named Moonlight packetizer");
+        }
         if (activity || shared) {
           auto pay = gst_bin_get_by_name(GST_BIN(pipeline.get()), "moonlight_pay");
           if (!pay)
@@ -773,8 +847,9 @@ static void stream_video_once(immer::box<events::VideoSession> video_session,
             });
 
         auto switch_producer_handler = event_bus->register_handler<immer::box<events::SwitchStreamProducerEvents>>(
-            [sess_id = video_session->session_id, automatic = video_session->gpu_route.get() != nullptr, pipeline](
-                const immer::box<events::SwitchStreamProducerEvents> &switch_ev) {
+            [sess_id = video_session->session_id,
+             automatic = video_session->gpu_route.get() != nullptr || video_session->rtp_ssrc != 0,
+             pipeline](const immer::box<events::SwitchStreamProducerEvents> &switch_ev) {
               if (switch_ev->session_id == sess_id) {
                 if (automatic)
                   return; // The route interrupt rebuilds only this viewer's encoder.
@@ -840,12 +915,121 @@ static void stream_video_once(immer::box<events::VideoSession> video_session,
   }
 }
 
+static void start_dual_video(immer::box<events::VideoSession> initial,
+                             const std::shared_ptr<events::EventBusType> &event_bus,
+                             const std::string &client_ip,
+                             unsigned short client_port,
+                             const std::shared_ptr<udp::socket> &socket) {
+  const auto dual = initial->dual_display.get();
+  if (!dual->negotiated.load() || dual->generation.load() != initial->display_generation)
+    return;
+  bool acquired = false;
+  for (int attempt = 0; attempt < 300; ++attempt) {
+    bool expected = false;
+    if (dual->streaming.compare_exchange_strong(expected, true)) {
+      acquired = true;
+      break;
+    }
+    if (dual->streaming_generation.load() == initial->display_generation ||
+        dual->generation.load() != initial->display_generation)
+      return;
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  if (!acquired)
+    throw std::runtime_error("The previous dual-video connection is still retiring; retry reconnecting");
+  dual->streaming_generation.store(initial->display_generation);
+  auto stopped = std::make_shared<std::atomic<bool>>(false);
+  auto pause = event_bus->register_handler<immer::box<events::PauseStreamEvent>>(
+      [stopped, id = initial->session_id](const immer::box<events::PauseStreamEvent> &ev) {
+        if (ev->session_id == id)
+          stopped->store(true);
+      });
+  auto stop = event_bus->register_handler<immer::box<events::StopStreamEvent>>(
+      [stopped, id = initial->session_id](const immer::box<events::StopStreamEvent> &ev) {
+        if (ev->session_id == id)
+          stopped->store(true);
+      });
+  std::array<std::jthread, 2> workers;
+  for (int index = 0; index < 2; ++index) {
+    workers[index] = std::jthread([=] {
+      std::array<std::uint32_t, 2> sequence{};
+      try {
+        while (!stopped->load() && dual->generation.load() == initial->display_generation) {
+          const auto slot = dual->routing.load()->slots[index];
+          if (!slot.target)
+            throw std::runtime_error("Dual-video route is not initialized");
+          const auto target = slot.target;
+          auto route = initial->gpu_route.get();
+          auto interrupted =
+              [dual, target, producer = slot.producer, index, stopped, generation = initial->display_generation] {
+                const auto current = dual->routing.load();
+                return stopped->load() || current->slots[index].target != target ||
+                       current->slots[index].producer != producer || dual->generation.load() != generation;
+              };
+          // Admission conservatively rejects another encoder while the first
+          // one is pending its initial frame. Let that startup settle without
+          // bypassing GPU capacity checks or retaining a superseded route.
+          std::string error;
+          for (int attempt = 0; attempt < 300 && !interrupted(); ++attempt) {
+            error = route->runtime->resume(*target->launch);
+            if (error.empty() || !target->launch->reservation->valid())
+              break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+          }
+          if (interrupted()) {
+            target->launch->reservation->pause();
+            continue;
+          }
+          if (!error.empty())
+            throw std::runtime_error(error);
+          auto video = *initial;
+          const auto &d = dual->config.displays[index];
+          video.display_mode = {d.width, d.height, d.fps};
+          video.display_id = index;
+          video.rtp_ssrc = moonlight::dual_display::ssrc(index);
+          video.bitrate_kbps = std::max(1000L, initial->bitrate_kbps / 2);
+          video.gst_pipeline = target->pipelines[route->codec.load()];
+          video.render_node = target->launch->device.render_node;
+          video.gpu_launch = target->launch;
+          video.gpu_route = nullptr; // Each worker owns its distinct encoder admission.
+          video.video_context = target->context;
+          stream_video_once(immer::box<events::VideoSession>(video),
+                            event_bus,
+                            client_ip,
+                            client_port,
+                            target->context,
+                            socket,
+                            sequence,
+                            slot.producer,
+                            interrupted);
+          target->launch->reservation->pause();
+          if (!interrupted())
+            throw std::runtime_error("A dual-video encoder stopped unexpectedly");
+        }
+      } catch (const std::exception &error) {
+        logs::log(logs::error, "[DUAL DISPLAY] Track {} failed: {}", index, error.what());
+        stopped->store(true);
+        event_bus->fire_event(immer::box<events::PauseStreamEvent>{events::PauseStreamEvent{initial->session_id}});
+      }
+    });
+  }
+  for (auto &worker : workers)
+    worker.join();
+  dual->streaming.store(false);
+  pause.unregister();
+  stop.unregister();
+}
+
 void start_streaming_video(immer::box<events::VideoSession> initial,
                            const std::shared_ptr<events::EventBusType> &event_bus,
                            std::string client_ip,
                            unsigned short client_port,
                            std::shared_ptr<immer::atom<gst_video_context::gst_context_ptr>> context,
                            std::shared_ptr<udp::socket> socket) {
+  if (initial->dual_display.get() && initial->dual_display.get()->config.dual()) {
+    start_dual_video(initial, event_bus, client_ip, client_port, socket);
+    return;
+  }
   std::array<uint32_t, 2> sequence{};
   auto route = initial->gpu_route.get();
   if (!route) {
