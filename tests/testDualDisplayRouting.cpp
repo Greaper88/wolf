@@ -1,3 +1,4 @@
+#include <catch2/catch_approx.hpp>
 #include <catch2/catch_test_macros.hpp>
 #include <control/input_handler.hpp>
 #include <map>
@@ -10,6 +11,68 @@ using namespace wolf::core;
 using namespace std::chrono_literals;
 
 namespace {
+// A real GStreamer source pad supplies negotiated producer geometry. Its event
+// endpoint records exactly what the production WaylandMouse sends, without a
+// compositor, GPU, or virtual input device.
+struct PointerCanvas {
+  std::vector<std::pair<double, double>> points;
+  gstreamer::gst_element_ptr source;
+  virtual_display::wl_state_ptr wayland;
+
+  PointerCanvas(int width = 0, int height = 0) {
+    static const auto source_type = [] {
+      GTypeInfo info{};
+      info.class_size = sizeof(GstElementClass);
+      info.instance_size = sizeof(GstElement);
+      info.class_init = [](gpointer klass, gpointer) {
+        GST_ELEMENT_CLASS(klass)->send_event = [](GstElement *element, GstEvent *event) -> gboolean {
+          const auto structure = gst_event_get_structure(event);
+          if (structure && gst_structure_has_name(structure, "MouseMoveAbsolute")) {
+            double x = 0, y = 0;
+            if (gst_structure_get_double(structure, "pointer_x", &x) &&
+                gst_structure_get_double(structure, "pointer_y", &y)) {
+              auto points = static_cast<std::vector<std::pair<double, double>> *>(
+                  g_object_get_data(G_OBJECT(element), "pointer-points"));
+              points->emplace_back(x, y);
+            }
+          }
+          gst_event_unref(event);
+          return true;
+        };
+      };
+      return g_type_register_static(GST_TYPE_ELEMENT, "WolfPointerCoordinateSource", &info, GTypeFlags(0));
+    }();
+    source = {GST_ELEMENT(g_object_new(source_type, nullptr)), gst_object_unref};
+    g_object_set_data(G_OBJECT(source.get()), "pointer-points", &points);
+    auto pad = gst_pad_new("src", GST_PAD_SRC);
+    REQUIRE(gst_element_add_pad(source.get(), pad));
+    REQUIRE(gst_pad_set_active(pad, true));
+    if (width > 0 && height > 0) {
+      auto caps = gst_caps_new_simple("video/x-raw",
+                                      "width",
+                                      G_TYPE_INT,
+                                      width,
+                                      "height",
+                                      G_TYPE_INT,
+                                      height,
+                                      "format",
+                                      G_TYPE_STRING,
+                                      "RGBx",
+                                      nullptr);
+      auto event = gst_event_new_caps(caps);
+      REQUIRE(gst_pad_store_sticky_event(pad, event) == GST_FLOW_OK);
+      gst_event_unref(event);
+      gst_caps_unref(caps);
+    }
+    wayland = virtual_display::create_wayland_display(source, "pointer-test");
+  }
+
+  ~PointerCanvas() {
+    auto pad = std::shared_ptr<GstPad>(gst_element_get_static_pad(source.get(), "src"), gst_object_unref);
+    gst_pad_set_active(pad.get(), false);
+  }
+};
+
 bool wait_ready(const std::function<bool()> &ready) {
   const auto deadline = std::chrono::steady_clock::now() + 3s;
   while (!ready()) {
@@ -18,6 +81,84 @@ bool wait_ready(const std::function<bool()> &ready) {
     std::this_thread::sleep_for(2ms);
   }
   return true;
+}
+
+TEST_CASE("Wayland absolute input follows producer geometry instead of encoded display size", "[dual-display][input]") {
+  SECTION("smaller secondary stream reaches the complete shared launcher") {
+    PointerCanvas canvas(1920, 1080);
+    virtual_display::WaylandMouse mouse(canvas.wayland);
+    mouse.move_abs(640, 360, 1280, 720);
+    REQUIRE(canvas.points.size() == 1);
+    CHECK(canvas.points.back().first == Catch::Approx(960));
+    CHECK(canvas.points.back().second == Catch::Approx(540));
+  }
+  SECTION("a reassigned app uses its own producer geometry") {
+    PointerCanvas launcher(1920, 1080), app(640, 360);
+    auto mouse = std::make_shared<std::optional<events::MouseTypes>>();
+    mouse->emplace(virtual_display::WaylandMouse(launcher.wayland));
+    std::visit([](auto &m) { m.move_abs(640, 360, 1280, 720); }, **mouse);
+    mouse->emplace(virtual_display::WaylandMouse(app.wayland));
+    std::visit([](auto &m) { m.move_abs(640, 360, 1280, 720); }, **mouse);
+    REQUIRE(launcher.points.size() == 1);
+    REQUIRE(app.points.size() == 1);
+    CHECK(launcher.points.back().first == Catch::Approx(960));
+    CHECK(launcher.points.back().second == Catch::Approx(540));
+    CHECK(app.points.back().first == Catch::Approx(320));
+    CHECK(app.points.back().second == Catch::Approx(180));
+  }
+  SECTION("ordinary one-to-one positions remain unchanged") {
+    PointerCanvas canvas(1920, 1080);
+    virtual_display::WaylandMouse mouse(canvas.wayland);
+    mouse.move_abs(1234, 789, 1920, 1080);
+    REQUIRE(canvas.points.size() == 1);
+    CHECK(canvas.points.back().first == Catch::Approx(1234));
+    CHECK(canvas.points.back().second == Catch::Approx(789));
+  }
+  SECTION("no negotiated caps or invalid reference sizes preserve fallback pixels") {
+    PointerCanvas unnegotiated, ready(1920, 1080);
+    virtual_display::WaylandMouse first(unnegotiated.wayland), second(ready.wayland);
+    first.move_abs(321, 123, 1280, 720);
+    second.move_abs(321, 123, 0, 0);
+    REQUIRE(unnegotiated.points.size() == 1);
+    REQUIRE(ready.points.size() == 1);
+    CHECK(unnegotiated.points.back().first == Catch::Approx(321));
+    CHECK(unnegotiated.points.back().second == Catch::Approx(123));
+    CHECK(ready.points.back().first == Catch::Approx(321));
+    CHECK(ready.points.back().second == Catch::Approx(123));
+  }
+}
+
+TEST_CASE("Dual monitor absolute input retains its canvas offset", "[dual-display][input]") {
+  for (const auto layout : {"horizontal", "vertical"}) {
+    CAPTURE(layout);
+    auto dual = std::make_shared<events::DualDisplayState>();
+    dual->config = moonlight::dual_display::parse({{"gd_version", "1"},
+                                                   {"gd_mode", "dual_monitor"},
+                                                   {"gd_layout", layout},
+                                                   {"gd_width2", "1280"},
+                                                   {"gd_height2", "720"},
+                                                   {"gd_fps2", "30"}},
+                                                  1920,
+                                                  1080,
+                                                  60);
+    const auto &display = dual->config.displays[1];
+    PointerCanvas canvas(dual->config.canvas_width(), dual->config.canvas_height());
+    events::StreamSession view{};
+    view.display_mode = {.width = 1280, .height = 720};
+    view.dual_display = dual;
+    view.input_scoped = true;
+    view.input_display_id = 1;
+    view.mouse->emplace(virtual_display::WaylandMouse(canvas.wayland));
+    control::MOUSE_MOVE_ABS_PACKET packet{};
+    packet.x = boost::endian::native_to_big<short>(640);
+    packet.y = boost::endian::native_to_big<short>(360);
+    packet.width = boost::endian::native_to_big<short>(1280);
+    packet.height = boost::endian::native_to_big<short>(720);
+    control::mouse_move_abs(packet, view);
+    REQUIRE(canvas.points.size() == 1);
+    CHECK(canvas.points.back().first == Catch::Approx(display.x + 640));
+    CHECK(canvas.points.back().second == Catch::Approx(display.y + 360));
+  }
 }
 
 // No GPU, compositor, input device, network listener, or container is created.

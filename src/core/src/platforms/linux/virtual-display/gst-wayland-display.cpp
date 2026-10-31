@@ -53,10 +53,33 @@ void WaylandMouse::move(int delta_x, int delta_y) {
 }
 
 void WaylandMouse::move_abs(int x, int y, int screen_width, int screen_height) {
+  if (!w_state)
+    return;
+  double pointer_x = x;
+  double pointer_y = y;
+  if (w_state->wayland_plugin && screen_width > 0 && screen_height > 0) {
+    auto pad = std::unique_ptr<GstPad, decltype(&gst_object_unref)>(
+        gst_element_get_static_pad(w_state->wayland_plugin.get(), "src"),
+        gst_object_unref);
+    auto caps = std::unique_ptr<GstCaps, decltype(&gst_caps_unref)>(pad ? gst_pad_get_current_caps(pad.get()) : nullptr,
+                                                                    gst_caps_unref);
+    if (caps && !gst_caps_is_empty(caps.get()) && !gst_caps_is_any(caps.get())) {
+      const auto structure = gst_caps_get_structure(caps.get(), 0);
+      int width = 0, height = 0;
+      if (gst_structure_get_int(structure, "width", &width) && gst_structure_get_int(structure, "height", &height) &&
+          width > 0 && height > 0) {
+        // A producer can be shown in differently sized encoded streams. Scale
+        // the stream-local position into its negotiated compositor canvas.
+        // The compositor retains responsibility for clamping the absolute point.
+        pointer_x *= static_cast<double>(width) / screen_width;
+        pointer_y *= static_cast<double>(height) / screen_height;
+      }
+    }
+  }
   auto msg = /* clang-format off */
                           gst_structure_new("MouseMoveAbsolute",
-                            "pointer_x", G_TYPE_DOUBLE, static_cast<double>(x),
-                            "pointer_y", G_TYPE_DOUBLE, static_cast<double>(y),
+                            "pointer_x", G_TYPE_DOUBLE, pointer_x,
+                            "pointer_y", G_TYPE_DOUBLE, pointer_y,
                             NULL);
   /* clang-format on */
   gstreamer::send_message(w_state->wayland_plugin.get(), msg);
