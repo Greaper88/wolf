@@ -105,7 +105,7 @@ std::optional<RTSP_PACKET> parse(std::string_view msg) {
     #####
     PAYLOAD <- PAYLOADKEY '=' PAYLOADVAL ENDLINE?
     PAYLOADKEY <- < [a-zA-Z0-9-_]+ >
-    PAYLOADVAL <- < [a-zA-Z0-9-_./[\]\\:  =]+ > / ''
+    PAYLOADVAL <- < [a-zA-Z0-9-_./[\]\\: \t=]+ > / ''
 
     #####
     CR <- '\r'

@@ -178,7 +178,8 @@ announce(const RTSP_PACKET &req, const events::StreamSession &session) {
 
   auto args = req.payloads //
               | views::filter([](const std::pair<std::string, std::string> &line) {
-                  return line.first == "a";                    // all args start with a=
+                  // Display agreement values are validated separately as text.
+                  return line.first == "a" && !line.second.starts_with("x-gd-");
                 })                                             //
               | views::transform(parse_arg_line)               // turns an arg line into a pair
               | to<std::map<std::string, std::optional<int>>>; // to map
@@ -240,10 +241,16 @@ announce(const RTSP_PACKET &req, const events::StreamSession &session) {
   if (session.dual_display && session.dual_display->config.dual()) {
     std::map<std::string, std::string> attributes;
     for (const auto &[kind, line] : req.payloads) {
+      if (kind != "a" || !line.starts_with("x-gd-"))
+        continue;
       const auto colon = line.find(':');
       if (colon == std::string::npos)
         continue;
       auto value = line.substr(colon + 1);
+      // Moonlight's SDP serializer terminates every attribute with SP + CRLF.
+      // The parser removes CRLF but preserves that optional horizontal space.
+      const auto last = value.find_last_not_of(" \t");
+      value.erase(last == std::string::npos ? 0 : last + 1);
       value.erase(0, value.find_first_not_of(" \t"));
       if (!attributes.emplace(line.substr(0, colon), value).second && line.starts_with("x-gd-"))
         return error_msg(400, "Duplicate display agreement", req.seq_number);

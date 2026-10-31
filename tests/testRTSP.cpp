@@ -3,6 +3,7 @@
 
 using Catch::Matchers::Equals;
 
+#include <algorithm>
 #include <boost/beast/_experimental/test/stream.hpp>
 #include <crypto/crypto.hpp>
 #include <rtsp/net.hpp>
@@ -266,6 +267,146 @@ state::SessionsAtoms test_init_state() {
       .control_stream_port = 1236};
   return std::make_shared<immer::atom<immer::vector<events::StreamSession>>>(
       immer::vector<events::StreamSession>{session});
+}
+
+namespace {
+struct DualAnnounceFixture {
+  events::StreamSession session = test_init_state()->load()->front();
+  std::vector<std::pair<std::string, std::string>> attributes;
+
+  explicit DualAnnounceFixture(const std::string &mode) {
+    session.dual_display = std::make_shared<events::DualDisplayState>();
+    session.dual_display->config = moonlight::dual_display::parse({{"gd_version", "1"},
+                                                                   {"gd_mode", mode},
+                                                                   {"gd_layout", "vertical"},
+                                                                   {"gd_primary", "1"},
+                                                                   {"gd_width2", "1280"},
+                                                                   {"gd_height2", "720"},
+                                                                   {"gd_fps2", "30"}},
+                                                                  1920,
+                                                                  1080,
+                                                                  60);
+    attributes = {{"x-nv-video[0].clientViewportWd", "1920"},
+                  {"x-nv-video[0].clientViewportHt", "1080"},
+                  {"x-nv-video[0].maxFPS", "60"},
+                  {"x-nv-video[0].packetSize", "1024"},
+                  {"x-nv-vqos[0].bitStreamFormat", "0"},
+                  {"x-gd-version", "1"},
+                  {"x-gd-transport", "rtp-ssrc-v1"},
+                  {"x-gd-mode", mode},
+                  {"x-gd-layout", "vertical"},
+                  {"x-gd-primary", "1"}};
+    for (const auto &display : session.dual_display->config.displays) {
+      const auto prefix = fmt::format("x-gd-video[{}].", display.id);
+      attributes.emplace_back(prefix + "width", std::to_string(display.width));
+      attributes.emplace_back(prefix + "height", std::to_string(display.height));
+      attributes.emplace_back(prefix + "fps", std::to_string(display.fps));
+      attributes.emplace_back(prefix + "ssrc", std::to_string(moonlight::dual_display::ssrc(display.id)));
+    }
+  }
+
+  void replace(const std::string &name, const std::string &value) {
+    auto entry =
+        std::find_if(attributes.begin(), attributes.end(), [&](const auto &entry) { return entry.first == name; });
+    REQUIRE(entry != attributes.end());
+    entry->second = value;
+  }
+
+  std::string wire(const std::string &leading = "", const std::string &trailing = " ") const {
+    // moonlight-common-c's fillSerializedAttributeList() deliberately emits
+    // "a=name:value \r\n", including its final space, for every SDP option.
+    std::string payload = "v=0\r\no=android 0 14 IN IPv4 0.0.0.0\r\ns=NVIDIA Streaming Client\r\n";
+    for (const auto &[name, value] : attributes)
+      payload += "a=" + name + ":" + leading + value + trailing + "\r\n";
+    return "ANNOUNCE streamid=control/13/0 RTSP/1.0\r\nCSeq: 6\r\nContent-type: application/sdp\r\n"
+           "Content-length: " +
+           std::to_string(payload.size()) + "\r\n\r\n" + payload;
+  }
+};
+} // namespace
+
+TEST_CASE("Dual display ANNOUNCE accepts native client SDP whitespace on the wire", "[RTSP][dual-display]") {
+  for (const auto *mode : {"dual_monitor", "dual_app"}) {
+    for (const auto &padding :
+         std::vector<std::pair<std::string, std::string>>{{"", " "}, {" ", "  "}, {"\t ", " \t"}}) {
+      CAPTURE(mode, padding.first, padding.second);
+      DualAnnounceFixture fixture(mode);
+      const auto request = rtsp::parse(fixture.wire(padding.first, padding.second));
+      REQUIRE(request);
+      REQUIRE(request->payloads.size() == fixture.attributes.size() + 3);
+      int videos = 0, audios = 0;
+      auto video_observer = fixture.session.event_bus->register_handler<immer::box<events::VideoSession>>(
+          [&](const immer::box<events::VideoSession> &video) {
+            ++videos;
+            CHECK(video->display_mode.width == 1920);
+            CHECK(video->display_mode.height == 1080);
+            CHECK(video->display_mode.refreshRate == 60);
+            CHECK(video->dual_display.get() == fixture.session.dual_display);
+            CHECK(fixture.session.dual_display->negotiated.load());
+          });
+      auto audio_observer = fixture.session.event_bus->register_handler<immer::box<events::AudioSession>>(
+          [&](const immer::box<events::AudioSession> &) { ++audios; });
+      const auto response = rtsp::commands::announce(*request, fixture.session);
+      REQUIRE(response.response.status_code == 200);
+      REQUIRE(response.seq_number == 6);
+      REQUIRE(fixture.session.dual_display->negotiated.load());
+      REQUIRE(fixture.session.dual_display->config.primary == 1);
+      REQUIRE(fixture.session.dual_display->config.displays[1].width == 1280);
+      REQUIRE(fixture.session.dual_display->config.displays[1].height == 720);
+      REQUIRE(fixture.session.dual_display->config.displays[1].fps == 30);
+      REQUIRE(videos == 1);
+      REQUIRE(audios == 1);
+      video_observer.unregister();
+      audio_observer.unregister();
+    }
+  }
+}
+
+TEST_CASE("Dual display ANNOUNCE rejects inconsistent agreements before starting media", "[RTSP][dual-display]") {
+  const std::vector<std::pair<std::string, std::string>> invalid{{"x-gd-version", "2"},
+                                                                 {"x-gd-transport", "other-transport"},
+                                                                 {"x-gd-mode", "controls"},
+                                                                 {"x-gd-layout", "horizontal"},
+                                                                 {"x-gd-primary", "0"},
+                                                                 {"x-gd-video[0].width", "1280"},
+                                                                 {"x-gd-video[1].width", "1920"},
+                                                                 {"x-gd-video[1].height", "1080"},
+                                                                 {"x-gd-video[1].fps", "60"},
+                                                                 {"x-gd-video[0].ssrc", "0"},
+                                                                 {"x-gd-video[1].ssrc", "1195638784"},
+                                                                 {"x-gd-transport", "rtp-ssrc-v1 extra"},
+                                                                 {"missing", ""},
+                                                                 {"duplicate", ""}};
+  for (const auto *mode : {"dual_monitor", "dual_app"}) {
+    for (const auto &[name, value] : invalid) {
+      CAPTURE(mode, name, value);
+      DualAnnounceFixture fixture(mode);
+      if (name == "missing") {
+        fixture.attributes.erase(std::remove_if(fixture.attributes.begin(),
+                                                fixture.attributes.end(),
+                                                [](const auto &entry) { return entry.first == "x-gd-layout"; }),
+                                 fixture.attributes.end());
+      } else if (name == "duplicate") {
+        fixture.attributes.emplace_back("x-gd-mode", mode);
+      } else {
+        fixture.replace(name, value);
+      }
+      const auto request = rtsp::parse(fixture.wire());
+      REQUIRE(request);
+      int videos = 0, audios = 0;
+      auto video_observer = fixture.session.event_bus->register_handler<immer::box<events::VideoSession>>(
+          [&](const immer::box<events::VideoSession> &) { ++videos; });
+      auto audio_observer = fixture.session.event_bus->register_handler<immer::box<events::AudioSession>>(
+          [&](const immer::box<events::AudioSession> &) { ++audios; });
+      const auto response = rtsp::commands::announce(*request, fixture.session);
+      REQUIRE(response.response.status_code == 400);
+      REQUIRE_FALSE(fixture.session.dual_display->negotiated.load());
+      REQUIRE(videos == 0);
+      REQUIRE(audios == 0);
+      video_observer.unregister();
+      audio_observer.unregister();
+    }
+  }
 }
 
 #ifdef __linux__
