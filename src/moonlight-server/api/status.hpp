@@ -1,5 +1,9 @@
 #pragma once
 
+#include <gpu/container_memory.hpp>
+#include <gpu/cpu_topology.hpp>
+#include <gpu/cpu_usage.hpp>
+#include <gpu/numa_memory.hpp>
 #include <state/data-structures.hpp>
 
 namespace wolf::api {
@@ -16,6 +20,16 @@ struct StatusGpu {
   std::optional<double> encoder_percent;
   std::string capability_status = "unknown";
   std::vector<std::string> codecs;
+  std::vector<int> cpu_ids;
+  std::optional<int> numa_node;
+  std::vector<unsigned> local_cpus;
+};
+// Eligible OS CPU IDs captured from an applied worker affinity or accepted container cpuset.
+// A missing placement is unknown/unrestricted, rather than an inference from the selected GPU.
+struct StatusPlacement {
+  std::vector<unsigned> cpus;
+  std::vector<int> cpu_ids;
+  std::optional<int> numa_node;
 };
 struct StatusSession {
   std::string id;
@@ -29,6 +43,7 @@ struct StatusSession {
   std::optional<int> width;
   std::optional<int> height;
   std::optional<int> fps;
+  std::optional<StatusPlacement> placement;
 };
 struct StatusContainer {
   std::string id;
@@ -39,10 +54,19 @@ struct StatusContainer {
   std::optional<std::string> session_id;
   std::optional<std::string> gpu_id;
   std::string render_node;
+  std::optional<StatusPlacement> placement;
+  std::optional<wolf::numa::ContainerMemory> memory;
 };
 struct StatusProfile {
   std::string id;
   std::string name;
+};
+struct StatusCpu {
+  int id;
+  std::string name;
+  std::vector<unsigned> cpus;
+  std::vector<unsigned> numa_nodes;
+  std::optional<double> usage_percent;
 };
 struct StatusResponse {
   bool success = true;
@@ -51,8 +75,23 @@ struct StatusResponse {
   std::vector<StatusSession> sessions;
   std::vector<StatusContainer> containers;
   std::vector<StatusProfile> profiles;
+  std::vector<StatusCpu> cpus;
+  std::vector<wolf::numa::MemoryNode> memory_nodes;
 };
 
+// Static topology is independent of NUMA mode and does not sample CPU load.
+struct StatusTopology {
+  wolf::numa::Topology host;
+  std::map<std::string, wolf::numa::GpuLocality> gpus;
+};
+StatusTopology discover_status_topology(const std::vector<wolf::gpu::Device> &devices,
+                                        const wolf::numa::TopologyPaths &paths = {});
 StatusResponse make_status(const state::AppState &state, const std::vector<wolf::gpu::Device> &devices);
+StatusResponse make_status(const state::AppState &state,
+                           const std::vector<wolf::gpu::Device> &devices,
+                           const StatusTopology &topology,
+                           const wolf::cpu::Usage &cpu_usage = {},
+                           const std::vector<wolf::numa::MemoryNode> &memory_nodes = {},
+                           const wolf::numa::ContainerMemories &container_memory = {});
 
 } // namespace wolf::api

@@ -85,9 +85,11 @@ RUN --mount=type=cache,target=/cache/ccache \
     ninja -C $CMAKE_BUILD_DIR -t clean && \
     ninja -C $CMAKE_BUILD_DIR -j "$WOLF_BUILD_JOBS" wolf && \
     ninja -C $CMAKE_BUILD_DIR -j "$WOLF_BUILD_JOBS" fake-udev && \
+    ninja -C $CMAKE_BUILD_DIR -j "$WOLF_BUILD_JOBS" wolf-numa-run && \
     # We have to copy out the built executables because this will only be available inside the buildkit cache
     cp $CMAKE_BUILD_DIR/src/moonlight-server/wolf /wolf/wolf && \
-    cp $CMAKE_BUILD_DIR/src/fake-udev/fake-udev /wolf/fake-udev
+    cp $CMAKE_BUILD_DIR/src/fake-udev/fake-udev /wolf/fake-udev && \
+    cp $CMAKE_BUILD_DIR/wolf-numa-run /wolf/wolf-numa-run
 
 ########################################################
 FROM $BASE_IMAGE AS runner
@@ -147,6 +149,7 @@ ENV WOLF_CFG_FOLDER=/etc/wolf/cfg
 
 COPY --from=wolf-builder /wolf/wolf /wolf/wolf
 COPY --from=wolf-builder /wolf/fake-udev /wolf/fake-udev
+COPY --from=wolf-builder /wolf/wolf-numa-run /wolf/wolf-numa-run
 COPY docker/nvidia-driver-volume.py docker/nvidia-driver.Dockerfile /wolf/
 COPY src/moonlight-server/gpu/ray-tracing-probe.py /wolf/
 

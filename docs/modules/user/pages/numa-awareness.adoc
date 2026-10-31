@@ -1,0 +1,195 @@
+= GPU-local CPU and memory placement
+
+Wolf follows the selected GPU's Linux DRM/PCI NUMA topology for automatic and
+manually selected GPUs. Socket numbers, CPU IDs, and motherboard layouts are
+not hardcoded.
+
+== Configuration
+
+`WOLF_NUMA_MODE` is the only NUMA setting:
+
+[cols="1,4",options="header"]
+|===
+|Value |Behavior
+|auto (default)
+|Enable placement when the host has more than one physical memory node and the
+selected GPU has usable, compatible locality information. Otherwise retain
+ordinary scheduling and memory allocation.
+|on
+|Keep session CPU threads on the GPU-local CPUs and prefer local RAM. Unknown
+topology produces a warning and ordinary scheduling; known locality that
+conflicts with operator resource limits rejects the launch.
+|off
+|Use ordinary CPU scheduling and memory allocation.
+|===
+
+When placement is active, CPU affinity remains local for the worker or app's
+lifetime. Remote CPU cores are not eligible, and there is no adaptive CPU
+spillover policy. RAM uses `MPOL_PREFERRED`: allocate locally when possible,
+with fallback to other permitted memory nodes. Wolf does not bind RAM to one
+node or reserve exclusive CPU cores. Explicit operator CPU/memory restrictions
+remain authoritative.
+
+[source,yaml]
+----
+services:
+  wolf:
+    cap_add:
+      - SYS_NICE
+    environment:
+      WOLF_NUMA_MODE: "auto" # auto, on, or off
+----
+
+Merge these settings into the saved Compose service, then recreate Wolf through
+Compose. Values are case insensitive; other values are configuration errors.
+Existing apps must be stopped and relaunched to receive changed placement.
+
+== NUMA load and automatic GPU selection
+
+For fresh automatic GPU assignments, Wolf can prefer a GPU whose local CPUs are
+less busy. This applies to usable multi-node GPU topology on hosts with one or
+several CPU sockets. The load estimate covers only CPUs local to that GPU and
+permitted by Wolf's operator CPU limits; it is not the host-wide CPU average.
+
+This comparison is active only when `WOLF_NUMA_MODE` is `auto` or `on` and usable
+multi-node GPU locality is detected. Uniform-memory hosts do not sample CPU
+counters for this ranking, and `off` disables it. No additional setting is needed.
+
+CPU load breaks otherwise comparable choices after the existing device
+eligibility checks, preferred/fallback pools, session counts, encoder-load band,
+and GPU-load band, and before VRAM usage. It cannot promote an ineligible GPU or
+bypass those earlier preferences. Unknown, invalid, or stale CPU samples do not
+exclude a GPU; Wolf skips this optional comparison when usable samples are
+incomplete and continues with the existing ranking.
+
+Running apps, retained apps, reconnects, and manually selected or pinned GPUs
+keep their existing assignment. This ranking neither migrates apps nor moves
+threads or memory between nodes after launch.
+
+== App containers and workers
+
+Docker guests receive GPU-local `HostConfig.CpusetCpus`, intersected with
+app-specific limits. Their memory cpuset permits all memory nodes allowed by
+the operator. An app-specific memory cpuset may exclude the GPU-local RAM node:
+CPU placement still applies, and the launcher reports that local RAM preference
+is unavailable while retaining the permitted memory nodes.
+A small static launcher applies the preferred local memory policy
+before executing the app's original entrypoint and command. It preserves
+argument boundaries, environment, user, working directory, PID, signals, and
+exit status; app images need no `numactl` package or shell. Wolf copies the
+launcher into its shared state folder and mounts it read-only. Manual builds
+must also build `wolf-numa-run` and install it as an executable at
+`HOST_APPS_STATE_FOLDER/wolf-numa-run`.
+
+`SYS_NICE` permits memory-policy syscalls under Docker's default seccomp profile.
+Wolf needs it for its own workers; app containers need it for the launcher.
+Explicit capability drops and custom security profiles remain authoritative.
+If memory policy is blocked, Wolf reports the failure; CPU affinity remains
+local, but explicit local RAM preference is unavailable.
+
+The policy covers compositor creation, video producers, routed/shared encoders,
+host-process runners, and GStreamer's reusable task threads. Previous thread
+settings are restored when a worker leaves a pipeline. Shared lobby apps retain
+their original GPU; a viewer's video pipeline follows its current encoder GPU
+across lobby transitions. Manual split render/encode configurations follow each
+part's respective GPU. Audio workers receive placement at startup and retain
+that placement when an existing audio pipeline changes producer.
+
+Existing shared pages, file caches, global driver workers, VRAM, and allocations
+made before placement are not moved by this policy.
+
+== Discovery and diagnostics
+
+A nonnegative PCI `numa_node` is authoritative. Wolf checks PCI ancestors when
+an endpoint's locality is unknown. Automatic detection counts the host's physical
+memory nodes before applying operator restrictions; a restricted process view
+does not turn a multi-node machine into a single-node host.
+
+`[NUMA]` logs identify the selected setting, GPU, local node, resource masks, and
+failures. Check `HostConfig.CpusetCpus`, `HostConfig.CpusetMems`, and
+`/proc/self/status` inside an app for permitted resources. New anonymous mappings
+show `prefer=static:N` in `/proc/<pid>/numa_maps` when local memory preference is
+active. Shared/file-backed mappings may reflect another process's allocations.
+
+The safe `/api/v1/status` dashboard response also reports detected physical CPU
+packages, their logical CPU IDs and NUMA nodes, and each GPU's physical locality.
+This topology is cached when first requested and is independent of the placement
+setting. A CPU package can contain several NUMA nodes; the IDs are not interchangeable.
+
+Each package's optional `usage_percent` is the device-wide busy percentage across
+its logical CPUs, including work outside Wolf. It works with a single CPU and with
+NUMA placement disabled. Wolf reads `/proc/stat` only when status is requested;
+concurrent requests share a short cache, and no background sampler runs. Two
+recent samples are required, so the first request and the first request after
+more than 30 seconds without sampling report utilization as unavailable. Missing,
+malformed or reset counters also remain unavailable rather than appearing idle.
+Idle and I/O wait are excluded from busy time; guest time is not counted twice.
+
+The additive `memory_nodes` list reports OS-usable RAM totals and used bytes for
+each NUMA node, with physical CPU owners in `cpu_ids`. A CPU can own several nodes;
+nodes shared by CPUs or without a detected CPU owner remain identifiable rather
+than being counted twice. These are Linux memory totals rather than installed
+DIMM capacities. Used RAM is `MemTotal - MemFree` from each node's `meminfo`, so it
+includes cache and reclaimable memory; it does not describe RAM allocated to a
+particular app or container. Memory counters use a request-only short cache,
+without warmup. Missing or inconsistent counters are unavailable rather than zero.
+
+Session `placement` reports the active video worker's kernel-confirmed CPU mask. Container
+`placement` reports the final accepted Docker CPU mask, including app restrictions
+and automatic fallback. These masks describe eligible CPUs, not the core executing
+at an instant. Missing placement remains unknown rather than being inferred from
+the GPU. Masks are captured when each worker or container starts; later external
+affinity changes, Docker updates and CPU hotplug are not sampled. Restart Wolf to
+refresh cached hardware topology. Existing containers receive telemetry when
+relaunched with this Wolf version.
+
+Each active container may also report optional `memory` residency with
+`local_nodes`, `anon` and `file`. Each category contains `local_bytes` and
+`remote_bytes` charged to the container cgroup, including its descendant cgroups.
+Local means a RAM node containing one of the container's accepted logical CPUs;
+it is not an inferred GPU location or proof of a preferred memory policy. A mask
+covering several nodes treats all those nodes as local. Empty, incomplete or
+ambiguous CPU-to-node mappings leave the measurement unavailable.
+
+The source is cgroup v2 `memory.numa_stat`, whose counters are already bytes.
+Anonymous memory and file/cache memory remain separate. File accounting includes
+shared memory and tmpfs; `shmem` and other overlapping kernel categories are not
+added again. Shared pages are charged to their owning cgroup, rather than counted
+for every container accessing them. These counters describe RAM residency, not
+VRAM, swap, container limits or exclusive physical memory. They can differ from
+host node totals and from process RSS.
+
+Wolf's private cgroup namespace normally hides sibling app containers. To expose
+this optional telemetry, merge this read-only host hierarchy bind into Compose:
+
+[source,yaml]
+----
+services:
+  wolf:
+    environment:
+      WOLF_HOST_CGROUP_ROOT: /host/sys/fs/cgroup
+    volumes:
+      - /sys/fs/cgroup:/host/sys/fs/cgroup:ro
+----
+
+The default root is `/host/sys/fs/cgroup`. Wolf only reads that hierarchy; this
+mount does not require host PID mode or change affinity/memory policy. Exact full
+Docker container IDs are resolved in cgroupfs- and systemd-driver layouts,
+including custom parent groups. Unsupported layouts (including Podman-specific
+names), cgroup v1, missing permissions, ambiguous paths or malformed counters
+remain unavailable, rather than reporting zero. Genuine zero byte counts remain
+valid. Directory traversal is bounded and does not follow symlinks. Resolved
+paths and concurrent samples are cached; missing paths are retried at most every
+five seconds. All work occurs only when status is requested, with a 250 ms sample
+cache and no background sampler. No monitoring work runs when no dashboard polls.
+
+Locality can reduce cross-socket traffic, but it does not establish the cause of
+stutter or guarantee better frame times. Wolf's negotiated FPS describes the
+requested stream rate, rather than measured rendered FPS or dropped frames.
+Compare frame times under the same workload when assessing the effect of
+placement; encoder, network, storage, and game behavior can also affect pacing.
+
+References: https://www.kernel.org/doc/html/latest/admin-guide/cgroup-v2.html[Linux cpusets],
+https://www.kernel.org/doc/html/latest/admin-guide/mm/numa_memory_policy.html[NUMA memory policies],
+https://docs.docker.com/engine/security/seccomp/[Docker seccomp], and
+https://gstreamer.freedesktop.org/documentation/application-development/advanced/threads.html[GStreamer task threads].

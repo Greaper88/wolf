@@ -4,7 +4,7 @@ cmake_minimum_required(VERSION 3.13...3.24)
 project(wolf
         VERSION 0.1
         DESCRIPTION "Howling under the Moonlight"
-        LANGUAGES CXX)
+        LANGUAGES CXX C)
 
 # Only do these if this is the main project, and not if it is included through add_subdirectory
 if (CMAKE_PROJECT_NAME STREQUAL PROJECT_NAME)
@@ -72,6 +72,10 @@ add_subdirectory(src/gst-video-context)
 
 if (UNIX AND NOT APPLE)
     add_subdirectory(src/fake-udev)
+    # Runs before an app's original entrypoint; static linking supports minimal guest images.
+    add_executable(wolf-numa-run tools/numa-run.c)
+    target_compile_options(wolf-numa-run PRIVATE -Wall -Wextra -Wpedantic)
+    target_link_options(wolf-numa-run PRIVATE -static -no-pie)
 endif ()
 
 option(BUILD_MOONLIGHT "Build Moonlight server" ON)

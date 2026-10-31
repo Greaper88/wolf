@@ -224,6 +224,146 @@ void policy_tests() {
   check(status.render_node == status.encoder_node && status.session_count_on_gpu == 3, "zero-copy metadata and count");
   check(select({}, o).error().find("/dev/dri") != std::string::npos, "actionable empty discovery failure");
 }
+void local_cpu_tests() {
+  auto a = device("a"), b = device("b");
+  b.render_node = "/dev/dri/renderD129";
+  a.local_cpu_percent = 70;
+  b.local_cpu_percent = 10;
+  a.vram_percent = 10;
+  b.vram_percent = 10.1;
+  check(select({a, b}, options()).device->id == b.id,
+        "meaningfully lower local CPU load precedes a minor VRAM difference");
+
+  a.local_cpu_percent = 10;
+  b.local_cpu_percent = 15;
+  a.vram_percent = 20;
+  b.vram_percent = 19;
+  check(select({a, b}, options()).device->id == b.id, "CPU loads within five points delegate to VRAM");
+  b.local_cpu_percent = 15.01;
+  check(select({a, b}, options()).device->id == a.id, "CPU loads outside five points prefer lower local load");
+  a.local_cpu_percent = 100;
+  b.local_cpu_percent = 0;
+  check(select({a, b}, options()).device->id == b.id, "CPU percentage endpoints are valid optional telemetry");
+
+  a = device("a");
+  b = device("b");
+  a.local_cpu_percent = 80;
+  a.vram_percent = 10;
+  b.vram_percent = 10.1;
+  for (const auto value : {std::optional<double>{},
+                           std::optional<double>{std::numeric_limits<double>::quiet_NaN()},
+                           std::optional<double>{std::numeric_limits<double>::infinity()},
+                           std::optional<double>{-std::numeric_limits<double>::infinity()},
+                           std::optional<double>{-0.1},
+                           std::optional<double>{100.1}}) {
+    b.local_cpu_percent = value;
+    auto selected = select({a, b}, options());
+    check(selected.device && selected.device->id == a.id && selected.rejected.empty(),
+          "missing or invalid local CPU telemetry skips its band without rejecting a GPU");
+  }
+  a.local_cpu_percent.reset();
+  b.local_cpu_percent.reset();
+  b.vram_percent = 9;
+  check(select({a, b}, options()).device->id == b.id, "absent CPU telemetry preserves existing VRAM ranking");
+
+  // Ineligible devices cannot make telemetry incomplete for the surviving pool.
+  a.local_cpu_percent = 80;
+  b.local_cpu_percent = 10;
+  b.vram_percent = 10.1;
+  auto excluded = device("excluded");
+  excluded.accessible = false;
+  check(select({a, b, excluded}, options()).device->id == b.id,
+        "missing CPU telemetry on a rejected GPU does not disable the band");
+  excluded.accessible = true;
+  excluded.retained_sessions = 1;
+  check(select({a, b, excluded}, options()).device->id == b.id,
+        "missing CPU telemetry outside the reservation group does not disable the band");
+
+  using Gate = std::function<void(Device &, Options &)>;
+  const std::vector<Gate> gates = {[](auto &d, auto &o) { o.blacklist = {d.id}; },
+                                   [](auto &d, auto &) { d.driver = "virtio_gpu"; },
+                                   [](auto &d, auto &) { d.accessible = false; },
+                                   [](auto &d, auto &) { d.hardware_encoder = false; },
+                                   [](auto &d, auto &o) {
+                                     d.last_resort = true;
+                                     o.allow_last_resort = false;
+                                   },
+                                   [](auto &d, auto &) { d.gpu_percent = 90; },
+                                   [](auto &d, auto &) { d.vram_percent = 85; },
+                                   [](auto &d, auto &) { d.encoder_percent = 98; },
+                                   [](auto &d, auto &) {
+                                     d.active_sessions = 1;
+                                     d.encoder_percent = 51;
+                                   },
+                                   [](auto &d, auto &o) {
+                                     d.encoder_percent.reset();
+                                     o.encoder_unknown_policy = "reject";
+                                   },
+                                   [](auto &d, auto &) { d.pending_sessions = 1; }};
+  for (const auto &gate : gates) {
+    a = device("a");
+    b = device("b");
+    a.local_cpu_percent = 0;
+    b.local_cpu_percent = 100;
+    a.vram_percent = 1;
+    auto o = options();
+    gate(a, o);
+    const auto selected = select({a, b}, o);
+    check(selected.device && selected.device->id == b.id && selected.rejected.size() == 1,
+          "low CPU load cannot bypass a hard GPU admission gate");
+  }
+
+  for (const auto reservation : {0, 1, 2}) {
+    a = device("a");
+    b = device("b");
+    a.local_cpu_percent = 0;
+    b.local_cpu_percent = 100;
+    if (reservation == 0)
+      a.active_sessions = 1;
+    else if (reservation == 1) {
+      a.active_sessions = b.active_sessions = 1;
+      a.pending_sessions = 1;
+    } else
+      a.retained_sessions = 1;
+    check(select({a, b}, options()).device->id == b.id,
+          "active, pending and retained reservations precede local CPU load");
+  }
+
+  a = device("a");
+  b = device("b");
+  a.local_cpu_percent = 100;
+  b.local_cpu_percent = 0;
+  b.last_resort = true;
+  check(select({a, b}, options()).device->id == a.id, "preferred pool precedes local CPU load");
+  b.last_resort = false;
+  a.hardware_ray_tracing = true;
+  auto rt = options();
+  rt.prefer_ray_tracing = true;
+  check(select({a, b}, rt).device->id == a.id, "ray-tracing pool precedes local CPU load");
+  b.encoder_percent = 6;
+  check(select({a, b}, options()).device->id == a.id, "encoder band precedes local CPU load");
+  b.encoder_percent = 0;
+  a.gpu_percent = 20;
+  b.gpu_percent = 26;
+  check(select({a, b}, options()).device->id == a.id, "GPU band precedes local CPU load");
+
+  std::vector<Device> chain{device("a"), device("b"), device("c")};
+  chain[0].local_cpu_percent = 10;
+  chain[0].vram_percent = 30;
+  chain[1].local_cpu_percent = 14;
+  chain[1].vram_percent = 20;
+  chain[2].local_cpu_percent = 18;
+  chain[2].vram_percent = 10;
+  do {
+    check(select(chain, options()).device->id == "b", "CPU band ranking is invariant under all permutations");
+  } while (std::next_permutation(chain.begin(), chain.end(), [](const auto &x, const auto &y) { return x.id < y.id; }));
+  for (auto &d : chain) {
+    d.local_cpu_percent = 20;
+    d.vram_percent = 20;
+  }
+  check(select({chain[2], chain[1], chain[0]}, options()).device->id == "a",
+        "equal CPU and VRAM load retains the deterministic identifier tie break");
+}
 void ray_policy_tests() {
   auto normal = device("normal"), rt = device("rt"), integrated = device("integrated");
   rt.render_node = "/dev/dri/renderD129";
@@ -424,6 +564,7 @@ int main() {
   try {
     config_tests();
     policy_tests();
+    local_cpu_tests();
     ray_policy_tests();
     admission_tests();
     discovery_tests();

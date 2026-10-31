@@ -1,0 +1,101 @@
+= GPU-local session resource placement
+
+AI-Agent: ChatGPT Codex +
+AI-Model-Version: GPT-6 family; exact serving version and reasoning setting unavailable +
+AI-Inference-Date: 2026-10-19
+
+== Scope
+
+The maintainer requested a separate NUMA-aware branch based on the multi-GPU
+development branch. The implementation starts from `dev-gpu-selection` commit
+`257ae696a6dd602ef42f3daafe10f3db3c00534d`; existing worktrees and their uncommitted
+changes remain separate.
+
+The current configuration uses one setting, `WOLF_NUMA_MODE=auto|on|off`, with
+`auto` as the default. Automatic mode enables placement on physical multi-node
+hosts when compatible GPU locality is available. Active placement keeps CPU
+threads on the GPU-local node for their lifetime and uses `MPOL_PREFERRED` for
+RAM fallback. Off mode retains ordinary scheduling. Unknown topology falls back
+to ordinary scheduling; explicit on mode rejects known resource conflicts.
+No adaptive CPU spillover controller or exclusive resource reservation is added.
+
+DRM/PCI discovery follows the GPU selected for each app or encoder. Docker
+CPU cpusets enforce locality while retaining permitted remote RAM. A static,
+read-only launcher sets preferred RAM before executing the original image/app
+command. Argument boundaries and explicit operator/security restrictions are
+preserved. Host workers use scoped policy and affinity; GStreamer task
+ENTER/LEAVE callbacks apply placement to reusable threads and restore previous
+settings when they leave a pipeline.
+
+Session/lobby render workers, routed and shared encoders, host-process runners,
+and audio startup receive placement. Manual split encoders honor
+`WOLF_ENCODER_NODE`. Existing audio pipelines retain startup locality across
+later producer switches. Existing/shared allocations and global driver threads
+are outside the scoped allocation policy.
+
+Fresh automatic GPU assignments also have an optional GPU-local CPU-load band.
+It activates only with NUMA enabled and usable multi-node GPU topology, on either
+single- or multi-socket hosts. Uniform-memory hosts do not sample CPU counters
+for it. The metric uses the selected GPU node's CPUs intersected with Wolf's
+allowed CPU mask, rather than a global CPU-load estimate. Existing eligibility,
+pool, session-count, encoder-load, and GPU-load decisions precede this band;
+VRAM ranking follows it. Unknown, invalid, or stale CPU telemetry skips the
+optional comparison without disqualifying a device. There is no added setting,
+CPU spillover controller, or migration of existing, retained, manual, or pinned
+assignments.
+
+== Validation and limits
+
+Regression coverage includes topology and operator limits, automatic detection,
+configuration parsing, Docker startup arguments, guest process inheritance,
+reusable GStreamer worker placement/restoration, memory preference when syscalls
+are available, and failure propagation. Memory-policy checks explicitly account
+for Docker seccomp restrictions. The static launcher tests also check literal
+arguments, PID, environment, working directory, signals, and exit status.
+
+The combined Wolf/server, test executable, and static launcher build passed.
+The offline per-case CTest run passed all 76 selected tests; the physical VA
+test and unrelated network icon-API case were excluded. With `SYS_NICE`, the
+NUMA suite passed 142 assertions across 11 cases. The CPU-load extension passed
+165 selector/NVML checks, 114 runtime/process checks, and 48 sampler checks on
+Linux plus six sampler checks with a simulated non-Linux platform.
+
+A read-only probe on the actual four-GPU host measured each GPU against its
+correct permitted NUMA CPU set. GPUs sharing a node received identical load
+values; the first sample stayed unknown, off mode performed zero counter reads,
+and the probe left CPU affinity unchanged. The current build and CPU-load
+evidence are in the sibling `wolf-numa-load-validation` directory.
+
+Additional placement-baseline checks passed all eight launcher tests as both
+root and user 1000, plus 85 dependency-free Linux checks and 17 with a simulated
+non-Linux platform.
+
+Disposable-container checks covered all four GPUs in auto/on/off. Auto and on
+kept CPU affinity local for each scope, placed each fresh 32 MiB anonymous
+mapping wholly on the GPU-local memory node, kept both memory nodes permitted,
+and restored prior policies exactly. Off left policy unchanged. Evidence is in
+the sibling `wolf-numa-auto-validation` directory. These checks did not modify
+the running game or establish deployment of the revised image.
+
+Read-only inspection of a running game found remote CPU execution despite local
+RAM allocation under the earlier policy. The sampled logs and resource counters
+did not establish a stutter cause. Persistent local CPU affinity removes that
+placement mismatch; its effect on frame pacing still requires comparison under
+the same workload. This document does not claim a proven stutter fix.
+
+== Preserve the deployed reconnect repair
+
+The branch preserves the already deployed handshake repair copied from the
+original development worktree without modifying that worktree. Unclaimed GPU
+admissions keep a 30-second monotonic deadline while retaining the app's GPU pin;
+active encoders and cancelled teardown retain their capacity protection. RTP
+timeouts check current connection credentials under the HTTPS resume transition
+lock so an old waiter cannot pause a newer connection or active worker. The
+clock-injected admission and stale-handshake regressions remain included.
+GPU admission thresholds and isolation rules are unchanged by NUMA placement.
+
+== Tools
+
+Codex terminal execution and patching, parallel implementation/review agents,
+Git, ripgrep, primary Linux/Docker/GStreamer documentation, Docker Engine,
+the cached CMake/Ninja/GCC build environment, Catch2, Python 3, and clang-format 18.

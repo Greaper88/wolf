@@ -57,6 +57,7 @@ struct Device {
   unsigned int retained_sessions = 0;       // Apps still resident; no encoder demand while disconnected.
   std::optional<std::string> nvidia_uuid;   // NVML identity used for one physical CDI device.
   std::optional<bool> hardware_ray_tracing; // Cached hardware + Vulkan verification; unknown is not support.
+  std::optional<double> local_cpu_percent;  // Optional GPU-local CPU load; unknown never excludes a device.
 };
 
 // Additive /sessions response field. Null telemetry means unavailable, never zero.

@@ -265,6 +265,10 @@ announce(const RTSP_PACKET &req, const events::StreamSession &session) {
   }
 
   // Video session
+  auto encoder_node = session.app->render_node;
+  if (!session.gpu_launch)
+    if (const auto configured = utils::get_env("WOLF_ENCODER_NODE"))
+      encoder_node = configured;
   events::VideoSession video = {
       .monitoring = session.monitoring,
       .monitoring_codec = std::string(video_format_av1    ? "AV1"
@@ -275,7 +279,7 @@ announce(const RTSP_PACKET &req, const events::StreamSession &session) {
       .video_context = session.video_context,
       .display_mode = {.width = display.width, .height = display.height, .refreshRate = display.refreshRate},
       .gst_pipeline = gst_pipeline,
-      .render_node = session.app->render_node,
+      .render_node = encoder_node,
 
       .session_id = session.session_id,
 
