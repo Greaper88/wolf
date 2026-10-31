@@ -149,21 +149,22 @@ void leave_lobby(const std::shared_ptr<events::EventBusType> &ev_bus,
       slot.held_modifiers = std::make_shared<immer::atom<char>>();
       slot.pen_tablet = std::make_shared<std::optional<input::PenTablet>>();
       next->active_display = i;
-      if (!disconnected) {
-        for (const auto &[number, pad] : *slot.joypads->load()) {
-          events::PlugDeviceEvent plug{.session_id = slot.producer, .direct_to_launcher = true};
-          std::visit(
-              [&](const auto &device) {
-                plug.udev_events = device.get_udev_events();
-                plug.udev_hw_db_entries = device.get_udev_hw_db_entries();
-              },
-              *pad);
-          ev_bus->fire_event(immer::box<events::UnplugDeviceEvent>{
-              events::UnplugDeviceEvent{.session_id = lobby.id,
-                                        .udev_events = plug.udev_events,
-                                        .udev_hw_db_entries = plug.udev_hw_db_entries}});
-          ev_bus->fire_event(immer::box<events::PlugDeviceEvent>(plug));
-        }
+      // Reconnect retains these device objects. Return their nodes to the
+      // launcher even on disconnect; a later controller-arrival packet sees
+      // the existing pad and does not emit another PlugDeviceEvent.
+      for (const auto &[number, pad] : *slot.joypads->load()) {
+        events::PlugDeviceEvent plug{.session_id = slot.producer, .direct_to_launcher = true};
+        std::visit(
+            [&](const auto &device) {
+              plug.udev_events = device.get_udev_events();
+              plug.udev_hw_db_entries = device.get_udev_hw_db_entries();
+            },
+            *pad);
+        ev_bus->fire_event(immer::box<events::UnplugDeviceEvent>{
+            events::UnplugDeviceEvent{.session_id = lobby.id,
+                                      .udev_events = plug.udev_events,
+                                      .udev_hw_db_entries = plug.udev_hw_db_entries}});
+        ev_bus->fire_event(immer::box<events::PlugDeviceEvent>(plug));
       }
     }
     dual->routing.store(next);
