@@ -77,7 +77,7 @@ struct DualStreamingFixture {
 
     const std::string pipeline =
         "interpipesrc name=interpipesrc_{session_id}_video listen-to={session_id}_video "
-        "is-live=true stream-sync=restart-ts ! videoconvertscale ! "
+        "is-live=true stream-sync=restart-ts ! video/x-raw,format=I420 ! videoconvertscale ! "
         "video/x-raw,width={width},height={height},format=I420 ! "
         "x264enc tune=zerolatency speed-preset=ultrafast bitrate={bitrate} key-int-max=30 ! "
         "h264parse ! video/x-h264,stream-format=byte-stream,alignment=au ! queue ! "
@@ -91,7 +91,7 @@ struct DualStreamingFixture {
       targets[index]->producer = index == 0 ? "dual_real_primary" : "dual_real_secondary";
       GError *parse_error = nullptr;
       producers[index] = {gst_parse_launch(fmt::format("videotestsrc is-live=true pattern={} ! "
-                                                       "video/x-raw,width=320,height=240,framerate=30/1 ! "
+                                                       "video/x-raw,width=320,height=240,framerate=30/1,format=I420 ! "
                                                        "interpipesink name={}_video sync=false async=false",
                                                        index == 0 ? "black" : "ball",
                                                        targets[index]->producer)

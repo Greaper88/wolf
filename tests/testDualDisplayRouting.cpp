@@ -301,3 +301,66 @@ TEST_CASE("Dual monitor crops raw canvas before conversion and encoding", "[dual
   REQUIRE(convert < encode);
   REQUIRE(pipeline.find("framerate=30/1") < encode);
 }
+
+TEST_CASE("Dual video rate filtering parses capture caps and preserves memory features", "[dual-display][routing]") {
+  // Parsing needs no buffers or GPU. A hardware capture source can put a bare
+  // caps expression immediately after appsrc/interpipesrc, before conversion.
+  for (const auto &capture_caps :
+       {"video/x-raw,format=RGBx,width=640,height=480,framerate=60/1",
+        "video/x-raw(memory:DMABuf),format=DMA_DRM,drm-format=XR24,width=640,height=480,framerate=60/1",
+        "video/x-raw(memory:CUDAMemory),format=RGBA,width=640,height=480,framerate=60/1"}) {
+    for (const bool dual : {false, true}) {
+      CAPTURE(capture_caps, dual);
+      events::VideoSession video{};
+      video.session_id = 7;
+      video.display_mode = {.width = 640, .height = 480, .refreshRate = 60};
+      video.bitrate_kbps = 2000;
+      video.rtp_ssrc = dual ? moonlight::dual_display::ssrc(1) : 0;
+      video.gst_pipeline = "appsrc name=capture ! " + std::string(capture_caps) + " ! fakesink";
+      const auto description =
+          streaming::format_video_pipeline(immer::box<events::VideoSession>(video), "127.0.0.1", 5000, "desktop");
+      if (!dual)
+        REQUIRE(description == video.gst_pipeline);
+      INFO(description);
+      GError *error = nullptr;
+      auto pipeline = gstreamer::gst_element_ptr(gst_parse_launch(description.c_str(), &error), gst_object_unref);
+      const auto message = error ? std::string(error->message) : std::string{};
+      if (error)
+        g_error_free(error);
+      INFO(message);
+      REQUIRE(message.empty());
+      REQUIRE(pipeline);
+
+      auto expected_capture = std::shared_ptr<GstCaps>(gst_caps_from_string(capture_caps), gst_caps_unref);
+      auto expected_rate =
+          std::shared_ptr<GstCaps>(gst_caps_from_string("video/x-raw(ANY),framerate=60/1"), gst_caps_unref);
+      REQUIRE(expected_capture);
+      REQUIRE(expected_rate);
+      unsigned capture_filters = 0, rate_filters = 0;
+      auto iterator = gst_bin_iterate_recurse(GST_BIN(pipeline.get()));
+      GValue value = G_VALUE_INIT;
+      while (gst_iterator_next(iterator, &value) == GST_ITERATOR_OK) {
+        auto element = GST_ELEMENT(g_value_get_object(&value));
+        auto factory = gst_element_get_factory(element);
+        if (factory && std::string(gst_plugin_feature_get_name(GST_PLUGIN_FEATURE(factory))) == "capsfilter") {
+          GstCaps *raw_caps = nullptr;
+          g_object_get(element, "caps", &raw_caps, nullptr);
+          auto caps = std::shared_ptr<GstCaps>(raw_caps, gst_caps_unref);
+          if (caps && gst_caps_is_equal(caps.get(), expected_capture.get()))
+            ++capture_filters;
+          if (caps && gst_caps_is_equal(caps.get(), expected_rate.get())) {
+            ++rate_filters;
+            // Rate conversion must permit the original DMA-BUF/CUDA features,
+            // instead of forcing a CPU-memory download during negotiation.
+            CHECK(gst_caps_features_is_any(gst_caps_get_features(caps.get(), 0)));
+          }
+        }
+        g_value_reset(&value);
+      }
+      g_value_unset(&value);
+      gst_iterator_free(iterator);
+      REQUIRE(capture_filters == 1);
+      REQUIRE(rate_filters == (dual ? 1 : 0));
+    }
+  }
+}

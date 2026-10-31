@@ -604,8 +604,11 @@ std::string format_video_pipeline(immer::box<events::VideoSession> video_session
     const auto first_link = pipeline.find('!');
     if (first_link == std::string::npos)
       throw std::runtime_error("Dual-video pipeline is missing a capture source boundary");
+    // Hardware sources can already begin with a bare caps constraint. Use an
+    // explicit element here so those templates do not form two adjacent caps
+    // expressions, which GStreamer's pipeline parser cannot link.
     pipeline.insert(first_link + 1,
-                    fmt::format(" videorate drop-only=true ! video/x-raw(ANY),framerate={}/1 ! ",
+                    fmt::format(" videorate drop-only=true ! capsfilter caps=\"video/x-raw(ANY),framerate={}/1\" ! ",
                                 video_session->display_mode.refreshRate));
   }
   return pipeline;
