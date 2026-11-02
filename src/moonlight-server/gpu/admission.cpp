@@ -34,6 +34,10 @@ bool Admission::Reservation::valid() const {
   std::lock_guard lock(state_->mutex);
   return armed_ && !cancelled_;
 }
+bool Admission::Reservation::encoding() const {
+  std::lock_guard lock(state_->mutex);
+  return armed_ && encoding_;
+}
 std::uint64_t Admission::Reservation::begin_encoder() {
   std::lock_guard lock(state_->mutex);
   if (!armed_ || cancelled_ || encoding_ || state_->assignments.at(session_).retained)
@@ -49,8 +53,10 @@ void Admission::Reservation::encoder_active(std::uint64_t epoch) {
 }
 void Admission::Reservation::end_encoder(std::uint64_t epoch, bool handoff) {
   std::lock_guard lock(state_->mutex);
-  if (armed_ && !cancelled_ && epoch && epoch == epoch_) {
+  if (armed_ && epoch && epoch == epoch_) {
     encoding_ = false;
+    if (cancelled_)
+      return;
     auto &assignment = state_->assignments.at(session_);
     assignment.active = false;
     assignment.retained = !handoff;
@@ -72,7 +78,9 @@ std::string Admission::Reservation::error() const {
   std::lock_guard lock(state_->mutex);
   return error_;
 }
-std::string Admission::Reservation::resume(const Options &options, const std::function<std::vector<Device>()> &sample) {
+std::string Admission::Reservation::resume(const Options &options,
+                                           const std::function<std::vector<Device>()> &sample,
+                                           const Reservation *replacing) {
   std::lock_guard lock(state_->mutex);
   if (!armed_ || cancelled_)
     return "Session is closing; wait for teardown to finish";
@@ -89,6 +97,9 @@ std::string Admission::Reservation::resume(const Options &options, const std::fu
     device.active_sessions = device.pending_sessions = device.retained_sessions = 0;
     for (const auto &[session, assignment] : state_->assignments) {
       if (session == session_ || assignment.device_id != device.id)
+        continue;
+      if (replacing && replacing->state_ == state_ && replacing->armed_ && !replacing->cancelled_ &&
+          session == replacing->session_)
         continue;
       if (assignment.retained)
         ++device.retained_sessions;

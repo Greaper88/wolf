@@ -1,5 +1,20 @@
 = Wolf helper scripts
 
+== setup.sh / setup_wolf.py
+
+Interactive installer for a new host: Stable/Testing channel selection, official
+Docker CE repositories, GPU configuration, custom storage and mdadm arrays,
+shared libraries, and automatic server startup.
+
+[source,bash]
+----
+bash scripts/setup.sh --dry-run
+sudo bash scripts/setup.sh
+----
+
+See link:../docs/modules/user/pages/setup-installer.adoc[the setup guide] for
+supported hosts, NVIDIA limitations, storage confirmation, and recovery.
+
 == wolf-input-diag.sh
 
 Host-side diagnostic that validates controller/input passthrough for Wolf. It

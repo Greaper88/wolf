@@ -20,6 +20,7 @@ set(SRC_LIST
         testDockerHotplug.cpp
         testCrypto.cpp
         testGSTPlugin.cpp
+        testSharedVideo.cpp
         testMoonlight.cpp
         testRTSP.cpp
         testWolfAPI.cpp

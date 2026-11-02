@@ -1,0 +1,267 @@
+= Guided host setup
+
+The interactive installer provisions a new Wolf server on a Linux systemd host.
+It detects the OS release, installs Docker CE, Buildx and Compose from Docker's
+official package repository, prepares GPU/input access, downloads the selected
+branch's configuration and udev rules, pulls the server and all configured app
+images, and starts Wolf. The final check waits for a successful Wolf API response.
+
+== Run
+
+From a checkout of this branch:
+
+[source,bash]
+----
+# Preview first: no package, disk, Docker or persistent configuration changes.
+bash scripts/setup.sh --dry-run
+
+# Install interactively.
+sudo bash scripts/setup.sh
+----
+
+Once these scripts have been published on `auto-gpu-selection`, a fresh host can
+download the launcher without cloning the repository:
+
+[source,bash]
+----
+curl -fL https://raw.githubusercontent.com/Greaper88/wolf/auto-gpu-selection/scripts/setup.sh -o setup-wolf.sh
+less setup-wolf.sh
+sudo bash setup-wolf.sh
+----
+
+The launcher uses Python 3.9 or later, with the distribution's `python3-tomli`
+package if Python does not yet include `tomllib`. It installs those prerequisites
+when needed for installation; preview requires them already installed. RHEL 8/9
+use the distribution's Python 3.11 package when the default Python is too old.
+The standalone launcher downloads the installer into a temporary directory.
+Internet access to GitHub, Docker, GHCR, and the distro repositories is required;
+NVIDIA builds also download the matching user-space driver from NVIDIA.
+
+== Release channel
+
+[cols="1,2,2",options="header"]
+|===
+|Choice |Configuration branch |Wolf and Wolf UI tag
+|Stable |`auto-gpu-selection` |`latest`
+|Testing (beta) |`dev-gpu-selection` |`gpu-selection-dev`
+|===
+
+Here, Stable means this fork's primary release channel. The repository's branch
+named `stable` is reserved for upstream updates and is not this menu choice.
+Both choices use `ghcr.io/greaper88/wolf` and `ghcr.io/greaper88/wolf-ui`.
+Application images come from the chosen branch's default config. Configuration
+downloads use a single resolved commit, recorded in `setup-plan.json`; image
+tags follow their release channel and are not claimed to be immutable commit pins.
+Wolf UI is pulled explicitly, because it is an app container started by Wolf.
+
+Use `--channel stable` or `--channel testing` to preselect the channel.
+For development, `--source-dir /absolute/path/to/wolf` reads configuration and
+rules from that checkout, which must be on the selected channel's branch.
+This flag does not build a local Wolf image; published channel images are still used.
+Normal installation always fetches configuration from GitHub.
+
+== Supported hosts
+
+The installer currently targets *x86_64*, matching this fork's published images
+and NVIDIA driver-container recipe. Supported repository mappings are:
+
+* Ubuntu 22.04, 24.04 and 26.04;
+* Debian 12 and 13;
+* Fedora 43 and 44;
+* CentOS Stream 9 and 10;
+* RHEL 8, 9 and 10.
+
+Ubuntu-based Linux Mint/Pop!_OS with a recognized `UBUNTU_CODENAME`, and Rocky/Alma
+8–10, require confirmation before using the corresponding parent repository.
+Docker does not officially support those derivatives. Unknown, obsolete, or
+inconsistent releases stop instead of guessing a nearby repository version.
+Update the tested release map as Docker changes its supported releases.
+
+The installer follows Docker's repository instructions for
+https://docs.docker.com/engine/install/ubuntu/[Ubuntu],
+https://docs.docker.com/engine/install/debian/[Debian],
+https://docs.docker.com/engine/install/fedora/[Fedora],
+https://docs.docker.com/engine/install/centos/[CentOS], and
+https://docs.docker.com/engine/install/rhel/[RHEL].
+It asks before removing conflicting Docker/Podman packages and reuses a compatible
+existing official Docker repository. Existing Docker CE packages are not upgraded
+just because the installer runs. Existing containers, volumes, and Docker data
+are not deleted. Docker Desktop, rootless Docker, user namespace remapping,
+non-systemd hosts, WSL and provisioning inside a container are outside this workflow.
+
+On enforcing SELinux hosts, `label=disable` is applied to the Wolf service and
+the configured app containers so they can use the required host sockets and
+devices. Host SELinux enforcement is not disabled. New app entries added later
+need equivalent access settings. The installer does not change the host firewall;
+Moonlight must be able to reach Wolf's ports on the trusted LAN.
+
+== GPU selection
+
+* AMD/Intel hosts use automatic GPU selection. Wolf still verifies hardware
+  encoder capability at startup; finding a render node is not an encoding test.
+* NVIDIA-only hosts use the legacy manual NVIDIA path. On mixed AMD/Intel and
+  NVIDIA hosts, the installer asks whether to enable NVIDIA. Declining adds
+  *every detected NVIDIA PCI identity* to Compose's `WOLF_GPU_BLACKLIST`, including
+  NVIDIA cards without a loaded driver.
+* Enabling NVIDIA selects a single NVIDIA render/encode GPU and turns off the
+  automatic selector. Multiple NVIDIA cards produce a selection menu. A stable
+  PCI render-node link is preferred where available, and the matching CUDA UUID
+  prevents NVENC from defaulting to a different physical card.
+* NVIDIA requires a working proprietary host driver >= 530.30.02 and
+  `nvidia-drm.modeset=1`. Install the distro's host driver and reboot first if
+  either is missing. The installer builds *user-space driver libraries*, not
+  kernel drivers. It does not change Secure Boot or bootloader settings.
+* The driver image is built against the loaded kernel driver's exact version,
+  then used to populate an external, versioned Docker volume. All existing
+  NVIDIA character devices are detected instead of assuming that every host has
+  `nvidia0` and exactly two capability devices.
+
+Automatic NVIDIA/NVENC balancing is not implemented in this branch. The manual
+NVIDIA path and distro installations need hardware/VM validation; the installer
+does not turn them into tested automatic GPU support. After changing host NVIDIA
+drivers, rebuild the driver image/volume for the new version and update Compose's
+volume name and `NVIDIA_DRIVER_VOLUME_NAME` before restarting Wolf. Never delete
+a volume still used by running app containers.
+
+== Paths and shared libraries
+
+Default paths are `/opt/wolf` for Compose/setup records, `/etc/wolf` for app data,
+and `/etc/wolf/cfg` for configuration. Custom setup displays disks, partitions,
+models, serials, mount points, and mounted filesystem capacity/used/free space.
+Usage inside an unmounted filesystem is unknown until it is mounted. Custom
+setup allows choosing the Compose directory, persistent program data and per-user
+app homes, configuration directory, and app UID/GID (default `1000:1000`).
+Docker's image cache remains in its existing Docker data root.
+
+Both default and custom setup independently ask about:
+
+* A shared *SteamLibrary*, exposed at `/SteamLibrary` in configured Docker apps.
+  Steam also receives its `steamapps` subfolder at
+  `/home/retro/.steam/debian-installation/steamapps`, so the default Steam library
+  uses the shared game files while user homes stay separate.
+* A shared *ROM folder*, exposed at `/ROMs`.
+* A shared *installer library*, exposed at `/Installers`.
+
+These are mounts in each app runner in `config.toml`, including desktop apps.
+Mounting them only in the parent Wolf container would not expose them to games.
+Applications installed through Wolf UI later must include equivalent mounts in
+their new runner definitions. Select `/ROMs` in the emulator's own library setup,
+and open `/Installers` inside the desired app to run an installer.
+
+Paths must be absolute and contain only letters, digits, slashes, underscores,
+hyphens and dots. This restriction accommodates Wolf's current startup script
+as well as Docker bind syntax and systemd paths. Libraries must not overlap the
+program data or configuration directories. New directories receive the selected
+app UID/GID. Existing directory ownership is preserved; inaccessible existing
+libraries prompt before recursive ACL grants. Default ACLs support new files.
+Parent-directory traversal and existing files' permissions may still need manual
+adjustment for libraries created under another account.
+
+NTFS libraries use mount-time UID/GID ownership instead of Linux ACL changes.
+When selecting NTFS storage, the suggested app-data and configuration paths
+stay on the Linux filesystem at `/srv/wolf`; shared-library paths use the selected
+NTFS mount. App homes, private configuration and setup records cannot be placed
+on that NTFS mount with this ownership model. NTFS is particularly unsuitable
+for Proton prefixes, which may require names and semantics that Windows does
+not support. Use a Linux filesystem for a Steam library that must also hold
+working Proton prefixes.
+
+== Optional drive and mdadm setup
+
+Custom setup offers:
+
+. Keep existing storage and choose directories on its mounted filesystems.
+. Mount an unused XFS, F2FS, ext4, NTFS or Btrfs filesystem without formatting it.
+. Format a blank disk with the selected filesystem.
+. Create an mdadm RAID0, RAID1, RAID5, RAID6 or RAID10 array from *user-selected
+  whole drives*, including drives that already contain filesystems/partitions.
+  Member counts are checked and the resulting array uses the selected filesystem.
+
+Both formatting options present this menu, with the first entry selected by default:
+
+[cols="2,1",options="header"]
+|===
+|Choice |Filesystem
+|Default / hard drive |XFS
+|Flash / SSD friendly |F2FS
+|Classic Linux |ext4
+|Windows compatible (not recommended) |NTFS
+|===
+
+The chosen filesystem is saved in the setup plan and used for formatting, mounting
+and the persistent `fstab` entry. Existing filesystems keep their current format.
+Filesystem tools are installed and kernel mount support is checked *before* any
+drive is erased. If a distro lacks the selected packages or kernel support,
+setup stops so the user can enable the appropriate distro repository/support or
+choose another format. It never silently substitutes ext4.
+
+Standalone NTFS disks receive a GPT partition table with one Microsoft Basic
+Data partition. NTFS is mounted through `ntfs-3g`, using the selected app UID/GID
+and Windows-compatible filename rules. Fedora/EL also need the `ntfsprogs`
+package for formatting. NTFS on mdadm is available, but *Windows cannot directly
+assemble an mdadm array*: the NTFS format alone does not make that array portable
+to Windows. See the https://manpages.debian.org/bookworm/ntfs-3g/ntfs-3g.8.en.html[NTFS-3G manual]
+for ownership and filename behavior.
+
+The array option intentionally erases the selected drives. The installer shows
+their model, serial, size, partitions and filesystem IDs, then requires typing
+`ERASE /dev/first /dev/second ...` with the exact selected devices. The ordinary
+setup confirmation cannot authorize disk erasure. Mounted filesystems (including
+the system disk), swap, read-only devices, active LVM/encryption/RAID mappings,
+kernel holders, and open raw devices are refused. Drives still referenced in
+`fstab` or `crypttab` must have those old entries explicitly removed before they
+can be repurposed. No forced unmount, array stop, or destructive `--force` is used.
+Inactive signatures and partition tables are removed only after confirmation.
+
+Device identities, partitions and usage are checked again immediately before
+changes. Mount targets must be empty. Mounts use filesystem UUIDs in backed-up
+`fstab`; duplicate UUIDs are rejected. Newly created arrays get an `ARRAY` entry
+in the distro's mdadm config, with an initramfs refresh when its tooling exists.
+Array initialization can continue in the background; inspect `/proc/mdstat`.
+RAID0 has no redundancy, and no RAID level substitutes for backups.
+
+The systemd service requires all configured data mounts before launch. Compose
+leaves container restart policy disabled; systemd owns restart and boot ordering,
+preventing Docker from starting Wolf before its library disks mount.
+
+== Manage and recover
+
+[source,bash]
+----
+sudo systemctl status wolf-setup
+sudo journalctl -u wolf-setup -f
+sudo systemctl restart wolf-setup
+sudo systemctl stop wolf-setup
+----
+
+`/opt/wolf/setup-plan.json` records the channel, config revision, selected paths,
+GPU mode, image list and drive plan (or the custom Compose directory equivalent).
+Compose is stored as JSON in `docker-compose.yml`; JSON is valid YAML for Compose.
+Wolf configuration remains ordinary TOML. Pair the host in Moonlight once the
+installer reports a responding API.
+
+This is a fresh-install workflow, not a migration or update wizard. Existing
+`config.toml`, Compose deployment files, or an existing installer service are
+preserved and cause setup to stop. Existing running Wolf containers also stop a
+new installation. To update an installed server, pull its server and app images,
+then restart its service; do not rerun setup over paired clients and custom apps.
+
+On failure, stop and inspect the last error and saved files before retrying.
+Completed package/disk operations are not rolled back. If an array was created
+before a later failure, reuse its filesystem through the existing-filesystem
+option; do not recreate or reformat it. If deployment files were already written,
+complete/recover that deployment rather than choosing the erase option again.
+
+== Validation
+
+[source,bash]
+----
+bash -n scripts/setup.sh
+python3 -m unittest discover -s scripts/tests -v
+----
+
+Tests use synthetic OS/GPU/disk inventories and intercepted commands. They cover
+channel consistency, app mounts, TOML round trips, Compose settings, filesystem
+choices, mount/ownership settings, refused erasure, drive-state changes and
+partition-signature ordering. They do not format
+real disks, install packages, start a Docker daemon, or certify hardware streaming.

@@ -1,4 +1,5 @@
 * User guide
+** xref:user:setup-installer.adoc[]
 ** xref:user:quickstart.adoc[]
 ** xref:user:configuration.adoc[]
 ** xref:user:wolf-ui.adoc[]

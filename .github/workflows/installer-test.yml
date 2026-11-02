@@ -1,0 +1,18 @@
+name: Test setup installer
+on:
+  push:
+    paths: ['scripts/setup*', 'scripts/tests/**', 'src/moonlight-server/state/default/config.v7.toml', '.github/workflows/installer-test.yml']
+  pull_request:
+    paths: ['scripts/setup*', 'scripts/tests/**', 'src/moonlight-server/state/default/config.v7.toml', '.github/workflows/installer-test.yml']
+permissions:
+  contents: read
+jobs:
+  installer:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: bash -n scripts/setup.sh
+      - run: python3 -m unittest discover -s scripts/tests -v

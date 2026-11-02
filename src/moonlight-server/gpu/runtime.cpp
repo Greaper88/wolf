@@ -93,16 +93,19 @@ Runtime::LaunchResult Runtime::retain(const std::string &app_id, const Launch &p
           false,
           {}};
 }
-std::string Runtime::resume(const Launch &launch) {
-  return launch.reservation->resume(options_, [&] {
-    auto devices = inventory_();
-    for (auto &device : devices) {
-      auto cached = cache_.lookup(device, generation_());
-      device.hardware_encoder = cached && cached->status == CapabilityCache::Status::ready &&
-                                cached->revision == launch.capabilities.revision;
-    }
-    return devices;
-  });
+std::string Runtime::resume(const Launch &launch, const Launch *replacing) {
+  return launch.reservation->resume(
+      options_,
+      [&] {
+        auto devices = inventory_();
+        for (auto &device : devices) {
+          auto cached = cache_.lookup(device, generation_());
+          device.hardware_encoder = cached && cached->status == CapabilityCache::Status::ready &&
+                                    cached->revision == launch.capabilities.revision;
+        }
+        return devices;
+      },
+      replacing ? replacing->reservation.get() : nullptr);
 }
 bool Runtime::supports(Codec codec) const {
   if (!options_.enabled())

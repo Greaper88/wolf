@@ -510,11 +510,11 @@ void UnixSocketServer::endpoint_LobbyCreate(const wolf::api::HTTPRequest &req, s
     auto lobby_id = state::gen_uuid();
     std::shared_ptr<const events::GpuStreamTarget> target;
     if (state_->app_state->gpu_runtime) {
-      if (!event->source_session_id || event->multi_user) {
+      if (!event->source_session_id) {
         send_http(socket,
                   400,
                   rfl::json::write(GenericErrorResponse{
-                      .error = "Automatic GPU apps require an updated Wolf UI and a single-user launch"}));
+                      .error = "Automatic GPU apps require an updated Wolf UI with a source session"}));
         return;
       }
       auto source = state::get_session_by_id(state_->app_state->running_sessions->load(), *event->source_session_id);
@@ -525,6 +525,14 @@ void UnixSocketServer::endpoint_LobbyCreate(const wolf::api::HTTPRequest &req, s
       for (const auto &existing : *state_->app_state->lobbies->load()) {
         if (existing.gpu_target && existing.started_by_profile_id == event->profile_id.get() &&
             existing.runner_state_folder == event->runner_state_folder) {
+          if (existing.multi_user != event->multi_user) {
+            send_http(socket,
+                      409,
+                      rfl::json::write(GenericErrorResponse{
+                          .error = "This app is already running in a different sharing mode. Stop it "
+                                   "before changing modes; unsaved progress may be lost."}));
+            return;
+          }
           send_http(socket, 200, rfl::json::write(LobbyCreateResponse{.lobby_id = existing.id}));
           return;
         }

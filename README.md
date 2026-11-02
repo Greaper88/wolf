@@ -1,5 +1,10 @@
 # Automatic GPU selection fork
 
+New host setup: run `sudo bash scripts/setup.sh` from this checkout for the guided
+installer, or use `bash scripts/setup.sh --dry-run` to preview. It offers Stable
+and Testing (beta) channels, GPU setup, shared libraries, and optional drive/RAID
+provisioning. See the [setup guide](docs/modules/user/pages/setup-installer.adoc).
+
 This fork automatically detects, selects, rejects, and balances assignments across GPUs
 in a multi-GPU system. `auto-gpu-selection` is the primary branch for the tested AMD/Mesa implementation.
 
@@ -40,7 +45,9 @@ is retained for upstream updates. Use both images from the same channel.
   Automatic NVIDIA/NVENC selection and load balancing are not yet implemented in this fork.
 - Running and paused apps remain pinned to their assigned GPU.
   Load balancing applies when assigning new sessions.
-- Simultaneous multi-user lobby sharing is not supported with automatic GPU selection.
+- Co-op lobbies stay on the app's GPU. Compatible viewers share an encoder;
+  different stream settings need another encoder with available capacity on that GPU.
+  All lobby encoders stop when the last viewer leaves; persistent apps remain running.
 
 # games-on-whales/wolf
 

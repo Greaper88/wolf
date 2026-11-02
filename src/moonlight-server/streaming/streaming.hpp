@@ -12,6 +12,7 @@
 #include <immer/box.hpp>
 #include <memory>
 #include <moonlight/fec.hpp>
+#include <streaming/shared_video.hpp>
 
 namespace streaming {
 
@@ -29,6 +30,28 @@ struct WaylandDisplayReady {
    */
   gstreamer::gst_element_ptr wayland_plugin;
 };
+
+// Matching is conservative: compare the complete encoding chain and negotiated video settings.
+// Client packetization/FEC and endpoints are deliberately outside the shared portion.
+std::string format_video_pipeline(immer::box<events::VideoSession> video,
+                                  const std::string &client_ip,
+                                  unsigned short client_port,
+                                  const std::string &producer);
+struct SharedVideoDescription {
+  std::string key;
+  std::string encoder;
+  std::string viewer;
+};
+std::optional<SharedVideoDescription> shared_video_description(const events::VideoSession &video,
+                                                               const std::string &producer);
+struct SharedVideoResult {
+  std::shared_ptr<SharedVideoEncoder> encoder;
+  std::string error;
+};
+SharedVideoResult prepare_shared_video(const events::VideoSession &settings,
+                                       const events::GpuStreamTarget &lobby,
+                                       const events::GpuStreamTarget &current,
+                                       const std::shared_ptr<wolf::gpu::Runtime> &runtime);
 
 void start_video_producer(const std::string &session_id,
                           const std::string &buffer_format,

@@ -10,6 +10,7 @@
 #include <immer/array.hpp>
 #include <immer/box.hpp>
 #include <memory>
+#include <state/config.hpp>
 #include <streaming/streaming.hpp>
 #include <thread>
 
@@ -397,32 +398,10 @@ static GstPadProbeReturn encoder_buffer(GstPad *, GstPadProbeInfo *, gpointer da
   return GST_PAD_PROBE_OK;
 }
 
-static void stream_video_once(immer::box<events::VideoSession> video_session,
-                              const std::shared_ptr<events::EventBusType> &event_bus,
-                              std::string client_ip,
-                              unsigned short client_port,
-                              std::shared_ptr<immer::atom<gst_video_context::gst_context_ptr>> video_context,
-                              std::shared_ptr<udp::socket> video_socket,
-                              std::array<uint32_t, 2> &sequence,
-                              const std::string &producer,
-                              const std::function<bool()> &interrupted) {
-  auto launch = video_session->gpu_launch.get();
-  if (launch && !launch->reservation->valid())
-    return;
-  auto activity = launch ? std::make_shared<EncoderActivity>(launch->reservation) : nullptr;
-  if (activity && !activity->epoch)
-    return; // A retained app must pass resume admission; duplicate streams cannot steal its encoder.
-  auto expected_end = std::make_shared<std::atomic_bool>(false);
-  auto pause_watch = event_bus->register_handler<immer::box<events::PauseStreamEvent>>(
-      [expected_end, id = video_session->session_id](const immer::box<events::PauseStreamEvent> &ev) {
-        if (ev->session_id == id)
-          expected_end->store(true);
-      });
-  auto stop_watch = event_bus->register_handler<immer::box<events::StopStreamEvent>>(
-      [expected_end, id = video_session->session_id](const immer::box<events::StopStreamEvent> &ev) {
-        if (ev->session_id == id)
-          expected_end->store(true);
-      });
+std::string format_video_pipeline(immer::box<events::VideoSession> video_session,
+                                  const std::string &client_ip,
+                                  unsigned short client_port,
+                                  const std::string &producer) {
   auto [color_range, color_space] = get_color_params(video_session);
 
   auto pipeline = fmt::format(
@@ -447,6 +426,211 @@ static void stream_video_once(immer::box<events::VideoSession> video_session,
     if (auto pos = pipeline.find(source); pos != std::string::npos)
       pipeline.replace(pos, source.size(), "listen-to=" + producer + "_video");
   }
+  return pipeline;
+}
+
+std::optional<SharedVideoDescription> shared_video_description(const events::VideoSession &settings,
+                                                               const std::string &producer) {
+  const auto pay = settings.gst_pipeline.find("rtpmoonlightpay_video");
+  if (pay == std::string::npos || producer.empty() || settings.display_mode.refreshRate <= 0)
+    return {};
+  const auto encoder_template = settings.gst_pipeline.substr(0, pay);
+  // Nonstandard pipelines with client-specific encoder properties use a dedicated encoder.
+  for (auto placeholder : {"{client_ip}",
+                           "{client_port}",
+                           "{host_port}",
+                           "{payload_size}",
+                           "{fec_percentage}",
+                           "{min_required_fec_packets}"})
+    if (encoder_template.find(placeholder) != std::string::npos)
+      return {};
+  auto canonical = settings;
+  canonical.session_id = 0;
+  auto pipeline = format_video_pipeline(immer::box<events::VideoSession>(canonical), "0.0.0.0", 0, producer);
+  auto boundary = pipeline.rfind('!', pipeline.find("rtpmoonlightpay_video"));
+  auto source_end = pipeline.find('!');
+  if (boundary == std::string::npos || source_end == std::string::npos || source_end >= boundary ||
+      pipeline.find_first_not_of(" \n\t") != pipeline.find("interpipesrc "))
+    return {};
+  auto encoder = pipeline.substr(0, boundary);
+  if (encoder.substr(0, source_end).find("name=interpipesrc_0_video") == std::string::npos)
+    return {}; // A custom interpipe identity cannot safely be reused across encoder groups.
+  // Rate conversion only repeats/drops raw buffers; it keeps their GPU memory and the app's display mode.
+  // An explicit capsfilter can precede another caps expression (the VA zero-copy
+  // source starts with DMA-BUF caps). Two adjacent shorthand caps cannot be parsed.
+  encoder.insert(source_end + 1,
+                 fmt::format(" videorate skip-to-first=true ! capsfilter caps=\"video/x-raw(ANY),framerate={}/1\" !",
+                             settings.display_mode.refreshRate));
+  auto key = fmt::format("{}:{}:{}:{}:{}:{}:{}:{}\n{}",
+                         settings.render_node,
+                         settings.display_mode.width,
+                         settings.display_mode.height,
+                         settings.display_mode.refreshRate,
+                         settings.bitrate_kbps,
+                         settings.slices_per_frame,
+                         static_cast<int>(settings.color_range),
+                         static_cast<int>(settings.color_space),
+                         encoder);
+  return SharedVideoDescription{
+      .key = key,
+      .encoder = encoder + " ! appsink name=wolf_encoded_sink sync=false async=false",
+      .viewer = "appsrc name=wolf_encoded_source is-live=true format=time block=false max-buffers=2 max-bytes=0 ! " +
+                pipeline.substr(boundary + 1)};
+}
+
+SharedVideoResult prepare_shared_video(const events::VideoSession &settings,
+                                       const events::GpuStreamTarget &lobby,
+                                       const events::GpuStreamTarget &current,
+                                       const std::shared_ptr<wolf::gpu::Runtime> &runtime) {
+  auto description = shared_video_description(settings, lobby.producer);
+  if (!description || !lobby.shared_encoders)
+    return {}; // Custom pipelines keep their existing per-viewer path.
+  std::string error;
+  bool created = false;
+  auto encoder = lobby.shared_encoders->acquire(description->key, [&]() -> std::shared_ptr<SharedVideoEncoder> {
+    const auto encoder_id = state::gen_uuid();
+    auto held = runtime->retain("encoder:" + encoder_id, *lobby.launch);
+    if (!held.launch) {
+      error = held.error;
+      return {};
+    }
+    // A dedicated launcher encoder retires before this replacement starts. Shared encoders may
+    // still serve other viewers and must never be subtracted from admission.
+    auto replacing = !current.shared_encoder && current.launch->device.id == held.launch->device.id ? current.launch
+                                                                                                    : nullptr;
+    error = runtime->resume(*held.launch, replacing.get());
+    if (!error.empty())
+      return {};
+    // Interpipe identifies listeners by element name across pipelines. Canonical names are
+    // only for matching; separately running encoder groups need distinct listener identities.
+    auto unique_description = *description;
+    const std::string source_name = "name=interpipesrc_0_video";
+    if (auto pos = unique_description.encoder.find(source_name); pos != std::string::npos)
+      unique_description.encoder.replace(pos, source_name.size(), "name=interpipesrc_" + encoder_id + "_video");
+    logs::log(logs::info, "[LOBBY] Reserving a shared encoder on {} for {}", settings.render_node, lobby.producer);
+    created = true;
+    return std::make_shared<SharedVideoEncoder>(
+        held.launch,
+        [description = std::move(unique_description),
+         launch = held.launch,
+         parent = lobby.launch,
+         context = lobby.context,
+         replacing](SharedVideoEncoder &shared, std::stop_token stop) {
+          // Another matching viewer can arrive before the original viewer's route finishes switching.
+          const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+          while (replacing && replacing->reservation->encoding() && !stop.stop_requested()) {
+            if (std::chrono::steady_clock::now() >= deadline)
+              return;
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+          }
+          if (stop.stop_requested() || !parent->reservation->valid())
+            return;
+          auto activity = std::make_shared<EncoderActivity>(launch->reservation);
+          if (!activity->epoch)
+            return;
+          auto context_data = std::make_shared<NeedContextData>(
+              NeedContextData{.device_path = launch->device.render_node, .gst_context = context});
+          gst_element_ptr running;
+          run_pipeline(
+              description.encoder,
+              [&](auto pipeline) {
+                running = pipeline;
+                auto bus = gst_pipeline_get_bus(GST_PIPELINE(pipeline.get()));
+                gst_bus_set_sync_handler(bus, bus_sync_handler, context_data.get(), nullptr);
+                gst_object_unref(bus);
+                // Repeat codec headers at every IDR, including viewers joining an existing encoder.
+                auto iterator = gst_bin_iterate_recurse(GST_BIN(pipeline.get()));
+                GValue value = G_VALUE_INIT;
+                while (gst_iterator_next(iterator, &value) == GST_ITERATOR_OK) {
+                  auto element = GST_ELEMENT(g_value_get_object(&value));
+                  auto factory = gst_element_get_factory(element);
+                  auto name = factory ? std::string(GST_OBJECT_NAME(factory)) : std::string{};
+                  if (name == "interpipesrc") {
+                    // restart-ts clears timestamps on the shared incoming GstBuffer.
+                    // compensate-ts makes its header writable before rebasing, so
+                    // simultaneous encoders cannot change each other's timestamps.
+                    // Only metadata is copied; DMA-BUF memory remains shared.
+                    g_object_set(element, "format", GST_FORMAT_TIME, nullptr);
+                    gst_util_set_object_arg(G_OBJECT(element), "stream-sync", "compensate-ts");
+                  }
+                  if (name == "h264parse" || name == "h265parse")
+                    g_object_set(element, "config-interval", -1, nullptr);
+                  g_value_reset(&value);
+                }
+                if (G_IS_VALUE(&value))
+                  g_value_unset(&value);
+                gst_iterator_free(iterator);
+                auto sink = gst_bin_get_by_name(GST_BIN(pipeline.get()), "wolf_encoded_sink");
+                auto pad = gst_element_get_static_pad(sink, "sink");
+                gst_pad_add_probe(pad,
+                                  GST_PAD_PROBE_TYPE_BUFFER,
+                                  encoder_buffer,
+                                  new std::shared_ptr<EncoderActivity>(activity),
+                                  [](gpointer p) { delete static_cast<std::shared_ptr<EncoderActivity> *>(p); });
+                gst_object_unref(pad);
+                GstAppSinkCallbacks callbacks{};
+                callbacks.new_sample = [](GstAppSink *sink, gpointer data) {
+                  EncodedSample sample(gst_app_sink_pull_sample(sink), gst_sample_unref);
+                  if (!sample)
+                    return GST_FLOW_EOS;
+                  static_cast<SharedVideoEncoder *>(data)->publish(sample);
+                  return GST_FLOW_OK;
+                };
+                gst_app_sink_set_callbacks(GST_APP_SINK(sink), &callbacks, &shared, nullptr);
+                gst_object_unref(sink);
+                return immer::array<immer::box<events::EventBusHandlers>>{};
+              },
+              true,
+              {},
+              [&] {
+                if (stop.stop_requested() || !parent->reservation->valid())
+                  return true;
+                if (running && shared.take_keyframe_request())
+                  send_message(running.get(),
+                               gst_structure_new("GstForceKeyUnit", "all-headers", G_TYPE_BOOLEAN, TRUE, nullptr));
+                return false;
+              });
+        });
+  });
+  if (encoder && !created)
+    logs::log(logs::info, "[LOBBY] Reusing a compatible encoder on {} for {}", settings.render_node, lobby.producer);
+  return {encoder, error};
+}
+
+static void stream_video_once(immer::box<events::VideoSession> video_session,
+                              const std::shared_ptr<events::EventBusType> &event_bus,
+                              std::string client_ip,
+                              unsigned short client_port,
+                              std::shared_ptr<immer::atom<gst_video_context::gst_context_ptr>> video_context,
+                              std::shared_ptr<udp::socket> video_socket,
+                              std::array<uint32_t, 2> &sequence,
+                              const std::string &producer,
+                              const std::function<bool()> &interrupted,
+                              const std::shared_ptr<SharedVideoEncoder> &shared = {}) {
+  auto launch = video_session->gpu_launch.get();
+  if (launch && !launch->reservation->valid())
+    return;
+  auto activity = launch && !shared ? std::make_shared<EncoderActivity>(launch->reservation) : nullptr;
+  if (activity && !activity->epoch)
+    return; // A retained app must pass resume admission; duplicate streams cannot steal its encoder.
+  auto expected_end = std::make_shared<std::atomic_bool>(false);
+  auto pause_watch = event_bus->register_handler<immer::box<events::PauseStreamEvent>>(
+      [expected_end, id = video_session->session_id](const immer::box<events::PauseStreamEvent> &ev) {
+        if (ev->session_id == id)
+          expected_end->store(true);
+      });
+  auto stop_watch = event_bus->register_handler<immer::box<events::StopStreamEvent>>(
+      [expected_end, id = video_session->session_id](const immer::box<events::StopStreamEvent> &ev) {
+        if (ev->session_id == id)
+          expected_end->store(true);
+      });
+  auto pipeline = format_video_pipeline(video_session, client_ip, client_port, producer);
+  if (shared) {
+    // Preserve this viewer's transport settings. Only the encoder half was canonicalized for matching.
+    auto boundary = pipeline.rfind('!', pipeline.find("rtpmoonlightpay_video"));
+    pipeline = "appsrc name=wolf_encoded_source is-live=true format=time block=false max-buffers=2 max-bytes=0 ! " +
+               pipeline.substr(boundary + 1);
+  }
   logs::log(logs::debug, "Starting video pipeline: \n{}", pipeline);
 
   bool enable_pacing = utils::get_env("WOLF_ENABLE_VIDEO_PACING", "TRUE") == std::string("TRUE");
@@ -461,10 +645,11 @@ static void stream_video_once(immer::box<events::VideoSession> video_session,
       }});
   std::shared_ptr<NeedContextData> ctx_data_ptr = std::make_shared<NeedContextData>(
       NeedContextData{.device_path = video_session->render_node, .gst_context = video_context});
+  std::jthread feed;
   run_pipeline(
       pipeline,
-      [video_session, event_bus, udp_sink, ctx_data_ptr, activity, &sequence](auto pipeline) {
-        if (activity) {
+      [video_session, event_bus, udp_sink, ctx_data_ptr, activity, shared, &feed, &sequence](auto pipeline) {
+        if (activity || shared) {
           auto pay = gst_bin_get_by_name(GST_BIN(pipeline.get()), "moonlight_pay");
           if (!pay)
             throw std::runtime_error("Verified session pipeline is missing moonlight_pay");
@@ -475,12 +660,36 @@ static void stream_video_once(immer::box<events::VideoSession> video_session,
           gst_object_unref(pay);
           if (!pad)
             throw std::runtime_error("Verified session pipeline has no encoded input pad");
-          gst_pad_add_probe(pad,
-                            GST_PAD_PROBE_TYPE_BUFFER,
-                            encoder_buffer,
-                            new std::shared_ptr<EncoderActivity>(activity),
-                            [](gpointer p) { delete static_cast<std::shared_ptr<EncoderActivity> *>(p); });
+          if (activity)
+            gst_pad_add_probe(pad,
+                              GST_PAD_PROBE_TYPE_BUFFER,
+                              encoder_buffer,
+                              new std::shared_ptr<EncoderActivity>(activity),
+                              [](gpointer p) { delete static_cast<std::shared_ptr<EncoderActivity> *>(p); });
           gst_object_unref(pad);
+        }
+        if (shared) {
+          auto source =
+              gst_element_ptr(gst_bin_get_by_name(GST_BIN(pipeline.get()), "wolf_encoded_source"), gst_object_unref);
+          auto viewer = shared->subscribe();
+          feed = std::jthread([shared, source, viewer](std::stop_token stop) {
+            bool congested = false;
+            while (!stop.stop_requested() && shared->healthy()) {
+              if (gst_app_src_get_current_level_buffers(GST_APP_SRC(source.get())) >= 2) {
+                viewer->reset();
+                congested = true;
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                continue;
+              }
+              if (congested) {
+                shared->request_keyframe();
+                congested = false;
+              }
+              if (auto sample = viewer->pop(std::chrono::milliseconds(20)))
+                if (gst_app_src_push_sample(GST_APP_SRC(source.get()), sample.get()) != GST_FLOW_OK)
+                  break;
+            }
+          });
         }
         if (auto app_sink_el = gst_bin_get_by_name(GST_BIN(pipeline.get()), "wolf_udp_sink")) {
           logs::log(logs::debug, "Setting up wolf_udp_sink");
@@ -499,8 +708,13 @@ static void stream_video_once(immer::box<events::VideoSession> video_session,
          * in order to force the encoder to produce a new IDR packet
          */
         auto idr_handler = event_bus->register_handler<immer::box<events::IDRRequestEvent>>(
-            [sess_id = video_session->session_id, pipeline](const immer::box<events::IDRRequestEvent> &ctrl_ev) {
+            [sess_id = video_session->session_id, pipeline, shared](
+                const immer::box<events::IDRRequestEvent> &ctrl_ev) {
               if (ctrl_ev->session_id == sess_id) {
+                if (shared) {
+                  shared->request_keyframe();
+                  return;
+                }
                 logs::log(logs::debug, "[GSTREAMER] Forcing IDR");
                 // Force IDR event, see: https://github.com/centricular/gstwebrtc-demos/issues/186
                 // https://gstreamer.freedesktop.org/documentation/additional/design/keyframe-force.html?gi-language=c
@@ -569,13 +783,16 @@ static void stream_video_once(immer::box<events::VideoSession> video_session,
       },
       launch != nullptr,
       [&](auto pipeline) {
+        feed.request_stop();
+        if (feed.joinable())
+          feed.join();
         if (auto pay = gst_bin_get_by_name(GST_BIN(pipeline.get()), "moonlight_pay")) {
           auto packetizer = gst_rtp_moonlight_pay_video(pay);
           sequence = {packetizer->cur_seq_number, packetizer->frame_num};
           gst_object_unref(pay);
         }
       },
-      interrupted);
+      [&] { return interrupted() || (shared && !shared->healthy()); });
   // Replacing an existing encoder is not admission of another stream. Keep its slot
   // while switching producers on this exact reservation, even if the app now loads the GPU.
   // A disconnect, failed stream, or move to another GPU still releases encoder demand.
@@ -586,8 +803,10 @@ static void stream_video_once(immer::box<events::VideoSession> video_session,
   pause_watch.unregister();
   stop_watch.unregister();
   if (launch && launch->reservation->valid() && !expected_end->load() && !interrupted()) {
-    launch->reservation->fail("GPU encoder could not start or continue; it may be too busy. Wait and retry, "
-                              "or force-close the app and restart it (unsaved data may be lost).");
+    auto route = video_session->gpu_route.get();
+    auto failure = shared && route ? route->home->launch : launch;
+    failure->reservation->fail("GPU encoder could not start or continue; it may be too busy. Wait and retry, "
+                               "or force-close the app and restart it (unsaved data may be lost).");
     event_bus->fire_event(
         immer::box<events::PauseStreamEvent>(events::PauseStreamEvent{.session_id = video_session->session_id}));
   }
@@ -622,12 +841,14 @@ void start_streaming_video(immer::box<events::VideoSession> initial,
     std::shared_ptr<events::GpuStreamRoute> route;
     ~RouteActivity() {
       route->streaming.store(false);
-      route->target.load()->launch->reservation->pause();
+      auto target = route->target.load();
+      if (!target->shared_encoder)
+        target->launch->reservation->pause();
     }
   } activity{route};
   while (!stopped->load() && route->home->launch->reservation->valid()) {
     auto target = route->target.load();
-    auto error = route->runtime->resume(*target->launch);
+    auto error = target->shared_encoder ? std::string{} : route->runtime->resume(*target->launch);
     if (!error.empty()) {
       target->launch->reservation->fail(error);
       event_bus->fire_event(immer::box<events::PauseStreamEvent>{events::PauseStreamEvent{initial->session_id}});
@@ -647,7 +868,8 @@ void start_streaming_video(immer::box<events::VideoSession> initial,
                       socket,
                       sequence,
                       target->producer,
-                      interrupted);
+                      interrupted,
+                      target->shared_encoder);
     if (!interrupted())
       break;
   }
