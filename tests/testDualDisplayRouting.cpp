@@ -2,6 +2,7 @@
 #include <catch2/catch_test_macros.hpp>
 #include <control/input_handler.hpp>
 #include <map>
+#include <rest/dual-app.hpp>
 #include <sessions/handlers.hpp>
 #include <state/config.hpp>
 #include <state/sessions.hpp>
@@ -165,6 +166,7 @@ TEST_CASE("Dual monitor absolute input retains its canvas offset", "[dual-displa
 // The real runtime receives a synthetic cached probe, and Wayland input wrappers
 // retain an inert plugin handle. Production event handlers own every transition.
 struct RoutingFixture {
+  state::PairedClient picker_client{.client_cert = "picker-test-client"};
   std::shared_ptr<events::EventBusType> bus = std::make_shared<events::EventBusType>();
   wolf::gpu::Device device{
       .id = "dual-test-gpu", .render_node = "/test/renderD128", .driver = "amdgpu", .accessible = true};
@@ -197,7 +199,7 @@ struct RoutingFixture {
     }
   }
 
-  explicit RoutingFixture(const std::string &mode = "dual_app") {
+  explicit RoutingFixture(const std::string &mode = "dual_app", bool picker = false) {
     runtime = std::make_shared<wolf::gpu::Runtime>(
         wolf::gpu::Options{},
         [gpu = device] { return std::vector{gpu}; },
@@ -213,6 +215,7 @@ struct RoutingFixture {
       return cached && cached->status == wolf::gpu::CapabilityCache::Status::ready;
     }));
     state::Config config{};
+    config.profiles = std::make_shared<immer::atom<state::ProfilesList>>();
     config.gpu_video.default_source = "interpipesrc listen-to={session_id}_video";
     config.gpu_video.default_sink = "rtpmoonlightpay_video name=moonlight_pay ! fakesink";
     config.gpu_video.h264_encoders.push_back({.plugin_name = "va", .encoder_pipeline = "vah264enc ! h264parse"});
@@ -222,13 +225,15 @@ struct RoutingFixture {
                         .lobbies = std::make_shared<immer::atom<immer::vector<events::Lobby>>>(),
                         .running_sessions = std::make_shared<immer::atom<immer::vector<events::StreamSession>>>(),
                         .gpu_runtime = runtime});
-    session.session_id = 7;
+    session.session_id = picker ? state::get_client_id(picker_client) : 7;
     session.event_bus = bus;
     session.app = std::make_shared<events::App>(
         events::App{.base = {.title = "Routing fixture", .id = "fixture-launcher", .support_hdr = false},
                     .gpu_auto_select = true});
     session.display_mode = {.width = 640, .height = 480, .refreshRate = 60};
+    session.audio_channel_count = 2;
     session.dual_display = std::make_shared<events::DualDisplayState>();
+    session.dual_display->picker_token = "picker-epoch-one";
     session.dual_display->config = moonlight::dual_display::parse({{"gd_version", "1"},
                                                                    {"gd_mode", mode},
                                                                    {"gd_layout", "vertical"},
@@ -247,6 +252,7 @@ struct RoutingFixture {
     settle_encoders();
     session.dual_display->negotiated = true;
     session.dual_display->streaming = true;
+    session.connected->store(true);
     app_state->running_sessions->update([&](auto sessions) { return sessions.push_back(session); });
     handlers = sessions::setup_lobbies_handlers(app_state, "/tmp", {});
   }
@@ -256,13 +262,15 @@ struct RoutingFixture {
       reservation->end_encoder(epoch);
   }
 
-  events::Lobby app(const std::string &id, bool shared = false, const std::string &owner = "alice") {
+  events::Lobby
+  app(const std::string &id, bool shared = false, const std::string &owner = "alice", const std::string &folder = {}) {
     const auto held = runtime->retain("app:" + id, *session.gpu_route->home->launch);
     REQUIRE(held.launch);
     const auto target = state::gpu_target(*app_state, held.launch, id);
     events::Lobby lobby{.id = id,
                         .name = id,
                         .started_by_profile_id = owner,
+                        .runner_state_folder = folder,
                         .gpu_target = target,
                         .multi_user = shared,
                         .stop_when_everyone_leaves = false};
@@ -503,5 +511,316 @@ TEST_CASE("Dual video rate filtering parses capture caps and preserves memory fe
       REQUIRE(capture_filters == 1);
       REQUIRE(rate_filters == (dual ? 1 : 0));
     }
+  }
+}
+
+namespace {
+struct PickerFixture : RoutingFixture {
+  PickerFixture() : RoutingFixture("dual_app", true) {
+    immer::vector<immer::box<events::App>> apps;
+    for (const auto &name : {"First", "Second", "New"}) {
+      auto app_runner = state::get_runner(
+          wolf::config::AppDocker{.name = name, .image = "private-image-secret", .env = {"PRIVATE_ENV_SECRET=value"}},
+          bus);
+      apps = apps.push_back({events::App{.base = {.title = name, .id = name}, .runner = app_runner}});
+    }
+    app_state->config->profiles->update([&](auto profiles) {
+      return profiles
+          .push_back(
+              {events::Profile{.id = "alice",
+                               .name = "Alice",
+                               .pin = std::vector<short>{1, 2, 3, 4},
+                               .apps = std::make_shared<immer::atom<immer::vector<immer::box<events::App>>>>(apps)}})
+          .push_back(
+              {events::Profile{.id = std::string(events::MOONLIGHT_PROFILE_ID),
+                               .name = "Launcher",
+                               .apps = std::make_shared<immer::atom<immer::vector<immer::box<events::App>>>>(apps)}});
+    });
+  }
+
+  wolf::app_picker::Reply call(wolf::app_picker::Operation op, const std::string &body = {}) {
+    return wolf::app_picker::handle(op, picker_client, app_state, body);
+  }
+
+  wolf::app_picker::AssignRequest assignment(const std::string &app, int display = 0) {
+    return {.version = 1,
+            .session_token = session.dual_display->picker_token,
+            .display_id = display,
+            .expected_assignment = session.dual_display->routing.load()->slots[display].lobby_id.value_or("launcher"),
+            .profile_id = "alice",
+            .app_id = app,
+            .profile_pin = std::vector<short>{1, 2, 3, 4}};
+  }
+
+  // Keep production join/leave handlers and substitute only external app startup.
+  // The real CreateLobbyEvent remains the factory's observable contract.
+  void replace_startup() {
+    handlers = handlers | ranges::views::drop(1) | ranges::to<immer::vector<immer::box<events::EventBusHandlers>>>();
+  }
+
+  void publish(const events::CreateLobbyEvent &event) {
+    events::Lobby lobby{.id = event.id,
+                        .name = event.name,
+                        .started_by_profile_id = event.profile_id,
+                        .runner_state_folder = event.runner_state_folder,
+                        .gpu_target = event.gpu_target.get(),
+                        .multi_user = event.multi_user,
+                        .pin = event.pin,
+                        .stop_when_everyone_leaves = event.stop_when_everyone_leaves,
+                        .runner = event.runner};
+    lobby.wayland_display->store(virtual_display::create_wayland_display({}, "picker-ready"));
+    app_state->lobbies->update([&](auto lobbies) { return lobbies.push_back(lobby); });
+  }
+
+  void replace_lobby(const events::Lobby &replacement) {
+    app_state->lobbies->update([&](const auto &lobbies) {
+      return lobbies | ranges::views::transform([&](const events::Lobby &current) {
+               return current.id == replacement.id ? replacement : current;
+             }) |
+             ranges::to<immer::vector<events::Lobby>>();
+    });
+  }
+};
+} // namespace
+
+TEST_CASE("Native app picker scopes catalog and access to the paired ready session", "[dual-display][picker]") {
+  using namespace wolf::app_picker;
+  PickerFixture fixture;
+  const auto initial = fixture.call(Operation::state);
+  REQUIRE(initial.body.success);
+  REQUIRE(initial.body.state->profiles.size() == 1);
+  CHECK(initial.body.state->profiles[0].id == "alice");
+  CHECK(initial.body.state->profiles[0].pin_required);
+  CHECK(initial.body.state->displays[1].width == 320);
+  CHECK(initial.body.state->displays[1].fps == 30);
+  CatalogRequest catalog{.version = 1, .session_token = "picker-epoch-one", .profile_id = "alice"};
+  CHECK(fixture.call(Operation::catalog, rfl::json::write(catalog)).body.code == "pin_required");
+  catalog.profile_pin = std::vector<short>{9};
+  CHECK(fixture.call(Operation::catalog, rfl::json::write(catalog)).body.code == "invalid_pin");
+  catalog.profile_pin = std::vector<short>{1, 2, 3, 4};
+  const auto apps = fixture.call(Operation::catalog, rfl::json::write(catalog));
+  REQUIRE(apps.body.success);
+  REQUIRE(apps.body.apps->size() == 3);
+  const auto json = rfl::json::write(apps.body);
+  CHECK(json.find("PRIVATE_ENV_SECRET") == std::string::npos);
+  CHECK(json.find("private-image-secret") == std::string::npos);
+  CHECK(json.find("profile-data/") == std::string::npos);
+  CHECK(json.find("\"profile_pin\"") == std::string::npos);
+  CHECK(json.find("\"runner\"") == std::string::npos);
+  catalog.profile_id = std::string(events::MOONLIGHT_PROFILE_ID);
+  CHECK(fixture.call(Operation::catalog, rfl::json::write(catalog)).body.code == "not_found");
+  const auto other =
+      handle(Operation::state, state::PairedClient{.client_cert = "other-paired-client"}, fixture.app_state);
+  CHECK_FALSE(other.body.success);
+  auto request = fixture.assignment("Not saved");
+  CHECK(fixture.call(Operation::assign, rfl::json::write(request)).body.code == "not_found");
+  CHECK(fixture.call(Operation::assign, "{\"runner\":{}}").body.code == "invalid_request");
+  auto extra = rfl::json::write(fixture.assignment("First"));
+  extra.insert(1, "\"session_id\":\"another-client\",");
+  CHECK(fixture.call(Operation::assign, extra).body.code == "invalid_request");
+  for (const auto mode : {"off", "controls", "dual_monitor"}) {
+    fixture.session.dual_display->config.mode = mode;
+    CHECK(fixture.call(Operation::state).body.code == "unsupported");
+  }
+  fixture.session.dual_display->config.mode = "dual_app";
+  fixture.session.dual_display->negotiated = false;
+  CHECK(fixture.call(Operation::state).body.code == "unavailable");
+}
+
+TEST_CASE("Native assignments share Wolf-UI lobbies and preserve the other display", "[dual-display][picker]") {
+  using namespace wolf::app_picker;
+  PickerFixture fixture;
+  auto first = fixture.app("ui-first", false, "alice", "profile-data/alice/First");
+  auto second = fixture.app("ui-second", false, "alice", "profile-data/alice/Second");
+  REQUIRE(fixture.call(Operation::assign, rfl::json::write(fixture.assignment("First", 0))).body.success);
+  fixture.settle_encoders();
+  const auto primary = fixture.session.dual_display->routing.load()->slots[0].target;
+  const auto assigned = fixture.call(Operation::assign, rfl::json::write(fixture.assignment("Second", 1)));
+  REQUIRE(assigned.body.success);
+  fixture.settle_encoders();
+  REQUIRE(assigned.body.state->displays[0].assignment_id == "ui-first");
+  CHECK(assigned.body.state->displays[0].app_id == "First");
+  CHECK(assigned.body.state->displays[1].app_name == "ui-second");
+  CHECK(fixture.session.dual_display->routing.load()->slots[0].target == primary);
+  CHECK(first.connected_sessions->load()->size() == 1);
+  CHECK(second.connected_sessions->load()->size() == 1);
+  CatalogRequest catalog{.version = 1,
+                         .session_token = "picker-epoch-one",
+                         .profile_id = "alice",
+                         .profile_pin = std::vector<short>{1, 2, 3, 4}};
+  auto apps = fixture.call(Operation::catalog, rfl::json::write(catalog));
+  REQUIRE(apps.body.apps);
+  CHECK(apps.body.apps->at(1).running);
+  CHECK(apps.body.apps->at(1).assigned_display == 1);
+  auto conflict = fixture.assignment("First", 1);
+  CHECK(fixture.call(Operation::assign, rfl::json::write(conflict)).body.code == "conflict");
+  conflict = fixture.assignment("First", 0);
+  conflict.expected_assignment = "launcher";
+  CHECK(fixture.call(Operation::assign, rfl::json::write(conflict)).body.code == "conflict");
+  ClearRequest clear{.version = 1, .session_token = "stale-epoch", .display_id = 1, .expected_assignment = "ui-second"};
+  CHECK(fixture.call(Operation::clear, rfl::json::write(clear)).body.code == "session_changed");
+  clear.session_token = "picker-epoch-one";
+  REQUIRE(fixture.call(Operation::clear, rfl::json::write(clear)).body.success);
+  fixture.settle_encoders();
+  CHECK(fixture.session.dual_display->routing.load()->slots[0].target == primary);
+  CHECK_FALSE(fixture.session.dual_display->routing.load()->slots[1].lobby_id);
+  CHECK(second.connected_sessions->load()->empty());
+  CHECK(fixture.app_state->lobbies->load()->size() == 2);
+  CHECK(second.gpu_target->launch->reservation->valid());
+}
+
+TEST_CASE("Native app factory starts only the saved persistent private app", "[dual-display][picker]") {
+  using namespace wolf::app_picker;
+  PickerFixture fixture;
+  fixture.replace_startup();
+  auto observer = fixture.bus->register_handler<immer::box<events::CreateLobbyEvent>>(
+      [&](const immer::box<events::CreateLobbyEvent> &event) {
+        CHECK(event->profile_id == "alice");
+        CHECK(event->name == "New");
+        CHECK(event->runner_state_folder == "profile-data/alice/New");
+        CHECK_FALSE(event->multi_user);
+        CHECK_FALSE(event->stop_when_everyone_leaves);
+        CHECK(event->video_settings.width == 320);
+        CHECK(event->video_settings.height == 240);
+        CHECK(event->video_settings.refresh_rate == 30);
+        CHECK(event->audio_settings.channel_count == 2);
+        CHECK(event->client_settings.run_uid == fixture.session.client_settings->run_uid);
+        const auto runner = rfl::get<wolf::config::AppDocker>(event->runner->serialize().variant());
+        CHECK(runner.name == "New");
+        CHECK(runner.image == "private-image-secret");
+        fixture.publish(*event);
+        event->on_setup_over.get()->set_value(true);
+      });
+  const auto result = fixture.call(Operation::assign, rfl::json::write(fixture.assignment("New", 1)));
+  REQUIRE(result.body.success);
+  CHECK(result.body.state->displays[1].app_id == "New");
+  CHECK_FALSE(fixture.session.dual_display->routing.load()->slots[0].lobby_id);
+  observer.unregister();
+}
+
+TEST_CASE("Native picker respects running app access and failed join keeps video routes", "[dual-display][picker]") {
+  using namespace wolf::app_picker;
+  PickerFixture fixture;
+  auto first = fixture.app("first", false, "alice", "profile-data/alice/First");
+  auto second = fixture.app("second", false, "alice", "profile-data/alice/Second");
+  auto blocked = fixture.app("new", false, "alice", "profile-data/alice/New");
+  first.pin = std::vector<short>{5, 6};
+  fixture.replace_lobby(first);
+  auto request = fixture.assignment("First", 0);
+  CHECK(fixture.call(Operation::assign, rfl::json::write(request)).body.code == "lobby_pin_required");
+  request.lobby_pin = std::vector<short>{9};
+  CHECK(fixture.call(Operation::assign, rfl::json::write(request)).body.code == "invalid_lobby_pin");
+  request.lobby_pin = std::vector<short>{5, 6};
+  REQUIRE(fixture.call(Operation::assign, rfl::json::write(request)).body.success);
+  fixture.settle_encoders();
+  REQUIRE(fixture.call(Operation::assign, rfl::json::write(fixture.assignment("Second", 1))).body.success);
+  fixture.settle_encoders();
+  const auto original = fixture.session.dual_display->routing.load();
+  blocked.connected_sessions->update([](auto viewers) { return viewers.push_back({"another-device"}); });
+  request = fixture.assignment("New", 1);
+  CHECK(fixture.call(Operation::assign, rfl::json::write(request)).body.code == "busy");
+  const auto catalog = fixture.call(Operation::catalog,
+                                    rfl::json::write(CatalogRequest{.version = 1,
+                                                                    .session_token = "picker-epoch-one",
+                                                                    .profile_id = "alice",
+                                                                    .profile_pin = std::vector<short>{1, 2, 3, 4}}));
+  REQUIRE(catalog.body.apps);
+  CHECK_FALSE(catalog.body.apps->at(2).available);
+  blocked.connected_sessions->update([](auto) { return immer::vector<immer::box<std::string>>{}; });
+  // A closing app fails the production JoinLobbyEvent before publishing a new
+  // route; the native endpoint must leave both encoded tracks assigned as-is.
+  blocked.gpu_target->launch->reservation->cancel();
+  CHECK(fixture.call(Operation::assign, rfl::json::write(request)).body.code == "failed");
+  const auto after = fixture.session.dual_display->routing.load();
+  CHECK(after->slots[0].target == original->slots[0].target);
+  CHECK(after->slots[1].target == original->slots[1].target);
+  CHECK(first.connected_sessions->load()->size() == 1);
+  CHECK(second.connected_sessions->load()->size() == 1);
+}
+
+TEST_CASE("Failed or obsolete native app startup preserves both previous assignments", "[dual-display][picker]") {
+  using namespace wolf::app_picker;
+  for (const auto change : {"failure", "epoch", "target"}) {
+    CAPTURE(change);
+    PickerFixture fixture;
+    fixture.replace_startup();
+    auto first = fixture.app("first", false, "alice", "profile-data/alice/First");
+    auto second = fixture.app("second", false, "alice", "profile-data/alice/Second");
+    REQUIRE(fixture.join("first", 0).empty());
+    REQUIRE(fixture.join("second", 1).empty());
+    const auto original = fixture.session.dual_display->routing.load();
+    auto request = fixture.assignment("New", 1);
+    std::promise<immer::box<events::CreateLobbyEvent>> creating;
+    auto notified = creating.get_future();
+    auto observer = fixture.bus->register_handler<immer::box<events::CreateLobbyEvent>>(
+        [&](const immer::box<events::CreateLobbyEvent> &event) {
+          fixture.publish(*event);
+          creating.set_value(event);
+        });
+    auto response =
+        std::async(std::launch::async, [&] { return fixture.call(Operation::assign, rfl::json::write(request)); });
+    REQUIRE(notified.wait_for(1s) == std::future_status::ready);
+    auto event = notified.get();
+    {
+      std::lock_guard transition(*fixture.app_state->gpu_transitions);
+      std::lock_guard picker(fixture.session.dual_display->picker_transitions);
+      if (std::string(change) == "epoch") {
+        fixture.session.dual_display->picker_token = "new-reconnected-epoch";
+      } else if (std::string(change) == "target") {
+        // Wolf-UI can change the selected slot while the compositor starts.
+        fixture.leave("second");
+      }
+    }
+    event->on_setup_over.get()->set_value(std::string(change) != "failure");
+    REQUIRE(response.wait_for(1s) == std::future_status::ready);
+    const auto result = response.get();
+    CHECK_FALSE(result.body.success);
+    CHECK(result.body.code == (std::string(change) == "failure" ? "failed"
+                               : std::string(change) == "epoch" ? "session_changed"
+                                                                : "conflict"));
+    const auto after = fixture.session.dual_display->routing.load();
+    CHECK(after->slots[0].target == original->slots[0].target);
+    if (std::string(change) != "target")
+      CHECK(after->slots[1].target == original->slots[1].target);
+    else
+      CHECK_FALSE(after->slots[1].lobby_id);
+    CHECK(first.connected_sessions->load()->size() == 1);
+    observer.unregister();
+  }
+}
+
+TEST_CASE("Native picker waits for an existing Wolf-UI app to finish setup", "[dual-display][picker]") {
+  using namespace wolf::app_picker;
+  for (const bool stopped : {false, true}) {
+    CAPTURE(stopped);
+    PickerFixture fixture;
+    auto first = fixture.app("first", false, "alice", "profile-data/alice/First");
+    auto pending = fixture.app("ui-starting", false, "alice", "profile-data/alice/New");
+    REQUIRE(fixture.join("first", 0).empty());
+    const auto primary = fixture.session.dual_display->routing.load()->slots[0].target;
+    pending.wayland_display->store(nullptr);
+    auto request = fixture.assignment("New", 1);
+    auto response =
+        std::async(std::launch::async, [&] { return fixture.call(Operation::assign, rfl::json::write(request)); });
+    REQUIRE(response.wait_for(30ms) == std::future_status::timeout);
+    {
+      // Acquiring these while the request waits proves startup does not block
+      // Wolf-UI transitions or a reconnect's epoch change.
+      std::lock_guard transition(*fixture.app_state->gpu_transitions);
+      std::lock_guard picker(fixture.session.dual_display->picker_transitions);
+      if (stopped)
+        pending.gpu_target->launch->reservation->cancel();
+      else
+        pending.wayland_display->store(virtual_display::create_wayland_display({}, "ui-setup-ready"));
+    }
+    REQUIRE(response.wait_for(1s) == std::future_status::ready);
+    const auto result = response.get();
+    CHECK(result.body.success == !stopped);
+    CHECK(fixture.session.dual_display->routing.load()->slots[0].target == primary);
+    CHECK(fixture.app_state->lobbies->load()->size() == 2);
+    if (stopped)
+      CHECK_FALSE(fixture.session.dual_display->routing.load()->slots[1].lobby_id);
+    else
+      CHECK(fixture.session.dual_display->routing.load()->slots[1].lobby_id == pending.id);
   }
 }

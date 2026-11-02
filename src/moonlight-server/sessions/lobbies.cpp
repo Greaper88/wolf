@@ -327,9 +327,6 @@ setup_lobbies_handlers(const immer::box<state::AppState> &app_state,
                 }
                 auto wl_state =
                     virtual_display::create_wayland_display(ready.wayland_plugin, ready.wayland_socket_name);
-                // Set the wayland display
-                lobby->wayland_display->store(wl_state);
-
                 if (!wait_for_wayland_socket(runtime_dir, ready.wayland_socket_name)) {
                   logs::log(logs::error,
                             "[LOBBY] Wayland socket {} was not ready, aborting runner startup",
@@ -345,6 +342,9 @@ setup_lobbies_handlers(const immer::box<state::AppState> &app_state,
                   logs::log(logs::debug, "Host app state folder: {}, creating paths", full_path.string());
                   std::filesystem::create_directories(full_path);
 
+                  // A concurrent picker can reuse this lobby. Publish its
+                  // input/display handle only after the runtime setup succeeds.
+                  lobby->wayland_display->store(wl_state);
                   std::thread([=]() {
                     if (lobby->gpu_target && !lobby->gpu_target->launch->reservation->valid())
                       return;

@@ -143,6 +143,13 @@ See `docs/modules/dev/pages/how-it-works.adoc` for the full picture.
 
 ## Runtime configuration (env vars)
 
+Live deployments must use the deployment's saved Compose YAML and recreate the
+affected services through Compose. Keep image references and overrides in that
+configuration so the intended deployment survives restarts; do not deploy through
+ad hoc replacement containers or image retagging alone. Verify the running image
+against the saved Compose configuration after applying a change. Wolf-managed app
+image references also belong in the persistent Wolf configuration.
+
 Behavior is driven by `WOLF_*` env vars read via `utils::get_env` (full working set in `wolf.cpp` and
 `.devcontainer/devcontainer.json`): `WOLF_CFG_FILE`, `WOLF_PRIVATE_KEY_FILE`/`WOLF_PRIVATE_CERT_FILE`,
 `WOLF_LOG_LEVEL`, `WOLF_DOCKER_SOCKET`, `WOLF_RENDER_NODE`/`WOLF_ENCODER_NODE` (GPU DRI nodes),

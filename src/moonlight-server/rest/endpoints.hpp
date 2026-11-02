@@ -109,6 +109,8 @@ void serverinfo(const std::shared_ptr<typename SimpleWeb::Server<T>::Response> &
   if (dual_monitor_enabled())
     modes += ",dual_monitor";
   xml.put("root.GrimmDisplayModes", modes);
+  if (dual_video_enabled())
+    xml.put("root.GrimmDualAppApiVersion", 1);
   send_xml<T>(response, SimpleWeb::StatusCode::success_ok, xml);
 }
 
@@ -441,6 +443,7 @@ auto create_run_session(const SimpleWeb::CaseInsensitiveMultimap &headers,
   if (display_config.version) {
     base_session->dual_display = std::make_shared<events::DualDisplayState>();
     base_session->dual_display->config = std::move(display_config);
+    base_session->dual_display->picker_token = state::gen_uuid();
   }
   return std::move(base_session);
 }
@@ -545,6 +548,8 @@ void resume(const std::shared_ptr<typename SimpleWeb::Server<SimpleWeb::HTTPS>::
         new_session->dual_display = old_dual;
         old_dual->generation.fetch_add(1);
         old_dual->negotiated.store(false);
+        std::lock_guard picker(old_dual->picker_transitions);
+        old_dual->picker_token = state::gen_uuid();
       } else if (next_dual && next_dual->config.dual()) {
         throw std::invalid_argument("Stop the single-display session before enabling dual video");
       }

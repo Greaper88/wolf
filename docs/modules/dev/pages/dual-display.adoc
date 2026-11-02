@@ -3,8 +3,7 @@
 The `feature/dual-display-modes` development branches implement a negotiated
 Grimm Display v1 extension. Enable the Wolf test server with
 `WOLF_ENABLE_DUAL_DISPLAY=TRUE`; the default is disabled. Existing clients retain
-their normal single-video protocol. This branch has not been deployed to the
-maintainer's running services.
+their normal single-video protocol.
 
 == Modes
 
@@ -119,6 +118,32 @@ for dual-app sessions. Dual-monitor apps retain the full monitor descriptor and
 do not target a single slot. The server owns producer switching and launcher
 relocation. A return-to-Wolf-UI shortcut detaches the focused app slot rather than
 terminating the app on the other display. Session disconnect detaches both slots.
+
+== Native in-stream app picker
+
+With dual video enabled, `serverinfo` advertises `GrimmDualAppApiVersion=1`.
+Paired HTTPS clients in a ready `dual_app` stream can use these JSON endpoints:
+
+* `GET /grimm/dual-app/state`: profiles and the two authoritative display assignments.
+* `POST /grimm/dual-app/catalog`: saved apps for `profile_id`, with optional `profile_pin`.
+* `POST /grimm/dual-app/assign`: select saved `profile_id` and `app_id` for `display_id`.
+* `POST /grimm/dual-app/clear`: return the selected display to the launcher.
+
+POST requests require `version:1` and the opaque `session_token` returned by state.
+Assign and clear also require `expected_assignment`, either `"launcher"` or the
+current lobby ID for that display. Reconnects invalidate tokens; concurrent
+Wolf-UI changes invalidate that display's precondition. Refresh state after either
+`session_changed` or `conflict`. Optional `lobby_pin` applies when reusing a locked app.
+Responses use `{success,version,state}` or `{success:false,version,code,error}`;
+catalog additionally returns `apps`. PINs, runner configuration and host paths
+are never returned. Profile PINs are checked by Wolf before catalog access or start.
+
+The client certificate selects its own stream. Caller-supplied session IDs,
+commands and runner definitions are rejected. Native assignment reuses Wolf-UI's
+private persistent Docker apps and state-folder identity. Shared apps remain
+under Wolf-UI's existing sharing controls. Startup waits release transition locks
+and recheck the stream token and target assignment before joining; failures keep
+the previous video routes. Both interfaces observe the same lobbies and slots.
 
 == Verification
 

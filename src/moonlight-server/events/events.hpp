@@ -22,6 +22,7 @@
 #include <moonlight/control.hpp>
 #include <moonlight/data-structures.hpp>
 #include <moonlight/dual-display.hpp>
+#include <mutex>
 #include <rfl.hpp>
 #include <rfl/json.hpp>
 #include <state/serialised_config.hpp>
@@ -513,6 +514,10 @@ struct DualDisplayState {
   std::atomic<int> input_display{0};
   std::atomic<std::uint64_t> generation{0};
   std::atomic<std::uint64_t> streaming_generation{0};
+  // Separate from encoder generations: control reconnects invalidate picker
+  // requests without restarting the video workers. Guard token and commits.
+  std::recursive_mutex picker_transitions;
+  std::string picker_token;
 };
 
 struct StreamSession {

@@ -2,6 +2,7 @@
 #include <events/events.hpp>
 #include <immer/atom.hpp>
 #include <immer/map_transient.hpp>
+#include <rest/dual-app.hpp>
 #include <rest/endpoints.hpp>
 
 namespace HTTPServers {
@@ -177,6 +178,29 @@ void startServer(HttpsServer *server, const immer::box<state::AppState> state, i
       reply_unauthorized(req, resp);
     }
   };
+
+  // Paired HTTPS chooses the session; request JSON never authorizes a client.
+  for (const auto &[path, method, operation] :
+       {std::tuple{"^/grimm/dual-app/state$", "GET", wolf::app_picker::Operation::state},
+        std::tuple{"^/grimm/dual-app/catalog$", "POST", wolf::app_picker::Operation::catalog},
+        std::tuple{"^/grimm/dual-app/assign$", "POST", wolf::app_picker::Operation::assign},
+        std::tuple{"^/grimm/dual-app/clear$", "POST", wolf::app_picker::Operation::clear}}) {
+    server->resource[path][method] = [&state, operation](auto resp, auto req) {
+      if (const auto client = get_client_if_paired(state, req)) {
+        try {
+          wolf::app_picker::send(resp, wolf::app_picker::handle(operation, *client, state, req->content.string()));
+        } catch (const std::exception &) {
+          // PIN-bearing bodies and internal runner errors stay private.
+          wolf::app_picker::send(
+              resp,
+              {503, {.success = false, .code = "failed", .error = "Wolf could not complete this app picker request."}});
+        }
+      } else {
+        wolf::app_picker::send(resp,
+                               {401, {.success = false, .code = "unavailable", .error = "The client is not paired."}});
+      }
+    };
+  }
 
   server->start([](unsigned short port) { logs::log(logs::info, "HTTPS server listening on port: {} ", port); });
 }
